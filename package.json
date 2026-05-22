@@ -1,0 +1,40 @@
+{
+  "name": "@ngpcraft/mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for NgpCraft — gives any MCP-compatible LLM hardware-validated NGPC knowledge, API lookup, C lint/smoke-run, asset conversion, and project scaffolding.",
+  "type": "module",
+  "bin": {
+    "ngpcraft-mcp": "src/server.js"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "build-index": "node scripts/build_index.js",
+    "extract-api": "node scripts/extract_api.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "pngjs": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "ngpc",
+    "neogeo-pocket-color",
+    "homebrew",
+    "retro",
+    "llm-tools",
+    "ngpcraft"
+  ],
+  "files": [
+    "src/",
+    "vendor/",
+    "corpus/",
+    "README.md",
+    "LICENSE"
+  ]
+}

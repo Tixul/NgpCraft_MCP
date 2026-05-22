@@ -1,0 +1,189 @@
+{
+  "$schema_version": "1",
+  "description": "Canonical ASM patterns verified on NGPC hardware. Use these instead of textbook TLCS-900 sequences — textbook ones often hit silicon bugs. Source: CC900 disassembly cross-checks (Windcup) + validated NgpCraft template code.",
+  "patterns": [
+    {
+      "name": "function_prologue_safe",
+      "context": "t900cc.py output (ngpc-safe, not CC900-equivalent)",
+      "asm": [
+        "link XIY, 0          ; N=0 only; N>=5 is broken on silicon",
+        "add XSP, -N          ; allocate locals (PERF-LAG-2: replaces N/2 × push WA)"
+      ],
+      "notes": [
+        "Use link XIY,0 max. For larger frames, do `link XIY,0` then `add XSP,-N` to allocate.",
+        "add XSP, -N uses DF C8 imm32 encoding — same family as add XSP,N post-call (safe)."
+      ]
+    },
+    {
+      "name": "function_prologue_cc900",
+      "context": "CC900 reference (what Windcup does)",
+      "asm": [
+        "push XIZ",
+        "; locals live in XIZ sub-regs (QIZH=low byte, IZH=mid, IZL=hi) directly",
+        "; address-taken locals: dec N, XSP / inc N, XSP instead of link"
+      ],
+      "notes": [
+        "CC900 never uses link/unlk. This is the target ABI for PERF-LAG-5 refactor.",
+        "Locals mapped to XIZ sub-regs = ~3-5× fewer stack ops than push WA approach."
+      ]
+    },
+    {
+      "name": "function_epilogue_safe",
+      "context": "t900cc.py output",
+      "asm": [
+        "unlk XIY",
+        "ret"
+      ]
+    },
+    {
+      "name": "vblank_wait",
+      "context": "busy-wait ~200 iters — safe replacement for loops hitting D0/CB",
+      "asm": [
+        "ld WA, 200",
+        "loop:",
+        "push WA",
+        "ld WA, 1",
+        "push WA",
+        "pop HL",
+        "pop WA",
+        "sub A, L         ; CF A1",
+        "sbc W, H         ; CE B0",
+        "or A, W          ; C8 E1 (test zero)",
+        "jr NZ, loop",
+        "ret"
+      ],
+      "notes": [
+        "Uses HL-family routing to avoid CB family and D0 prefix.",
+        "Validated bisect_j8z14 (2026-03-23)."
+      ]
+    },
+    {
+      "name": "shift_runtime_safe",
+      "context": "runtime srl/sll with DA prefix — needs zero-guard",
+      "asm": [
+        "; shift A by L bits (L in HL low byte)",
+        "ld A, L          ; A = count",
+        "or A, L          ; CF E1: A|L = count; sets Z iff count==0",
+        "jr Z, skip_shift",
+        "srl A, XDE       ; safe now",
+        "skip_shift:"
+      ],
+      "notes": [
+        "DA prefix shift with count=0 zeros the destination (not a no-op). Always guard."
+      ]
+    },
+    {
+      "name": "shift_immediate_safe",
+      "context": "compile-time constant shift — use D8 prefix form",
+      "asm": [
+        "extz XWA         ; widen to 32-bit",
+        "sll N, XWA       ; D8 prefix (safe)"
+      ],
+      "notes": [
+        "D0 EE form (sll N,WA) is broken. D8 widened form is safe."
+      ]
+    },
+    {
+      "name": "reg16_copy_via_stack",
+      "context": "R16 pair copy — never use D1 88 (= 4-byte or BC,(mem))",
+      "asm": [
+        "push XBC",
+        "pop XWA          ; XBC → XWA"
+      ]
+    },
+    {
+      "name": "enable_interrupts_vblank",
+      "context": "Mandatory init sequence for any ASM/C program that uses joypad",
+      "asm": [
+        "; Install VBlank ISR pointer at 0x6FCC",
+        "ld XIY, _vbl_isr",
+        "push XIY",
+        "pop HL",
+        "ldw (0x6FCC), HL",
+        "pop HL           ; high word of XIY",
+        "ldw (0x6FCE), HL",
+        "; Enable interrupts",
+        "ei 0             ; NEVER write plain `ei` — that assembles to EI 7 = DI"
+      ],
+      "notes": [
+        "Without ei 0: no VBlank → BIOS never updates pad reg at 0x6F82 → buttons dead.",
+        "Validated bisect_j8z15 (2026-03-23)."
+      ]
+    },
+    {
+      "name": "isr_vblank_return",
+      "context": "ISR must reti, not ret",
+      "asm": [
+        "_vbl_isr:",
+        "  ; ... work ...",
+        "  reti           ; NOT ret — ret corrupts CPU/BIOS state"
+      ],
+      "notes": [
+        "Validated Jalon 15 (2026-03-24): using ret hangs after the first VBlank."
+      ]
+    },
+    {
+      "name": "block_copy_ldirw",
+      "context": "ngpc_memcpy_w — LDIRW uses XIY (src) / XIX (dst) on NGPC",
+      "asm": [
+        "push XIY               ; save",
+        "  push XHL",
+        "  pop XIY              ; XIY = src",
+        "  push XDE",
+        "  pop XIX              ; XIX = dst",
+        "  ldirw                ; BC-word block copy",
+        "pop XIY                ; restore"
+      ],
+      "notes": [
+        "Textbook TLCS-900 says XDE/XHL — wrong on NGPC. Use XIY/XIX.",
+        "Validated Jalon 19 (2026-03-25)."
+      ]
+    },
+    {
+      "name": "dmac_load_safe",
+      "context": "DMA source/dest register load from XWA",
+      "asm": [
+        "extz xwa                ; widen 16→32",
+        "ldcl dmacN, xwa         ; D8 32-bit form (E8 2E cr encoded)"
+      ],
+      "notes": [
+        "Never use `ldcw dmacN, wa` — that's D0 prefix, broken on silicon.",
+        "t900as.py Fix #26 corrected the zz encoding to produce E8 2E cr."
+      ]
+    },
+    {
+      "name": "inc_wa_safe",
+      "context": "WA increment without D0 prefix",
+      "asm": [
+        "ld BC, 1",
+        "add A, C",
+        "adc W, B           ; note: W>0 triggers adc W,B bug — use only for small WA values"
+      ],
+      "notes": [
+        "For larger values prefer a loop keeping W=0 (count ≤ 255)."
+      ]
+    },
+    {
+      "name": "cpl_wa_safe",
+      "context": "WA complement (~WA) without D0 prefix",
+      "asm": [
+        "push WA",
+        "ld WA, 65535",
+        "pop HL",
+        "xor A, L",
+        "xor W, H"
+      ]
+    },
+    {
+      "name": "neg_wa_safe",
+      "context": "WA negation (-WA) without D0 prefix",
+      "asm": [
+        "push WA",
+        "ld WA, 0",
+        "pop HL",
+        "sub A, L",
+        "sbc W, H"
+      ]
+    }
+  ]
+}

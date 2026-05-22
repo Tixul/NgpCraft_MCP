@@ -1,0 +1,156 @@
+{
+  "database_version": "2026-05-22.v5",
+  "changelog": [
+    "2026-05-22.v5: `cpu.d8_df_register_to_register` now carries a targeted safe exact-pair exception for `D8 83` (`add XHL, XWA` / cc900 `add HL,WA`). Toolchain v2 verified-findings note marks this exact encoding safe-in-practice and used by CC900; the matcher stays conservative for the rest of the D8..DF r+r family.",
+    "2026-05-20.v4: `cpu.d0_d7_non_immediate` matcher: removed safe_second_ranges [200, 207] (0xC8..0xCF). HW crash 2026-05-20 on stargunner_j16_C4_phase4_BROKEN_HW_20260520.ngc confirmed `D0 + ALU-imm sub-op` is silicon-broken, despite the previous matcher version marking it safe. CC900 emits 0 instances of `<alu> WA, imm` in f_code, corroborating. See `hw_validation_history` in that entry.",
+    "2026-04-22.v3: prior version (see git history for full content)."
+  ],
+  "entries": [
+    {
+      "quirk_id": "cpu.d0_d7_non_immediate",
+      "category": "broken-opcode-family",
+      "confidence": "documented",
+      "summary": "D0..D7 word-register prefix is broken on real NGPC silicon outside documented immediate-safe forms.",
+      "note": "This instruction uses the D0..D7 word-register prefix family in a form that local hardware references mark as broken on real NGPC silicon. The current reference model keeps documented immediate-safe forms executable, but stops on the remaining D0..D7 cases instead of inventing a post-state.",
+      "execution_stop_status": "silicon-broken",
+      "sources": [
+        {
+          "document": "../NgpCraft_toolchain/DISASM_CROSSCHECK.md",
+          "section": "D0..D7 prefix family",
+          "quote": "D0 prefix (all sub-ops) broken on real NGPC silicon; D1..D7 standalone SAFE (CC900 uses them in production). The earlier blanket 'D0..D7 all broken' diagnosis was too broad."
+        },
+        {
+          "document": "../NgpCraft_toolchain/T900_DENSE_REF.md",
+          "section": "broken opcodes",
+          "quote": "D0..D7 non-immediate forms lock up on hardware; documented immediate-safe forms (ld r,imm, ALU-imm, ld r,#3, multu/muls r,imm) remain executable."
+        },
+        {
+          "document": "../NgpCraft_Disasm/MANUAL.md",
+          "section": "silicon-broken opcode families",
+          "quote": "D0..D7 prefix outside the documented immediate-safe exception set is treated as silicon-broken on real NGPC."
+        }
+      ],
+      "matcher": {
+        "kind": "prefixed_range_non_immediate",
+        "prefix_start": 208,
+        "prefix_end": 215,
+        "safe_second_values": [
+          3,
+          8,
+          9
+        ],
+        "safe_second_ranges": [
+          [
+            168,
+            175
+          ]
+        ]
+      },
+      "hw_validation_history": [
+        {
+          "date": "2026-05-20",
+          "rom": "stargunner_j16_C4_phase4_BROKEN_HW_20260520.ngc",
+          "outcome": "crash-on-real-NGPC",
+          "note": "Chantier 4 P-4 peephole emitted `add WA, imm16` (encoding `D0 C8 lo hi`, prefix 0xD0 + ALU-imm sub-op 0xC8). Console crashed directly at boot. The previous matcher version included `safe_second_ranges: [[200, 207]]` (0xC8..0xCF) marking ALU-imm sub-ops as safe, but the DISASM_CROSSCHECK.md source quote (line 15 of this entry) was correct: 'D0 prefix (all sub-ops) broken on real NGPC silicon'. Cross-check confirmed: CC900's `a_stargunner_j16.ngc` emits 0 instances of `<alu> WA, imm` in f_code — the official compiler has avoided this family for 25+ years. Matcher updated 2026-05-20 to remove [200, 207]. D1..D7 + ALU-imm theoretically might still work (CC900 uses standalone D1..D7 in production per the same quote), but no production t900cc output exercises them; the conservative `safe_second_ranges` keeps only the `[168, 175]` compact-imm3 range which is documented safe."
+        }
+      ]
+    },
+    {
+      "quirk_id": "cpu.d8_df_register_to_register",
+      "category": "broken-opcode-family",
+      "confidence": "documented",
+      "summary": "D8..DF working-bank prefix hangs the CPU on register-to-register ALU sub-ops; documented immediate families and the CP r+r exception stay executable, with a targeted safe exception for the observed CC900 form `D8 83`.",
+      "note": "This instruction uses the D8..DF working-bank prefix family in a register-to-register form that USER_MANUAL_EN.md §12.1 marks as silicon-broken on real NGPC. Reference execution stops here instead of inventing a post-state. Safe forms kept executable: any sub-op in 0x00..0x7F (inc/dec/scc, non-r+r loads, extz/exts, multu/muls imm, ldc, cpl/neg); the compact immediate load family 0xA8..0xAF; the ALU-immediate family 0xC8..0xCF; the cp r, imm3 family 0xD8..0xDF; the shift/rotate with imm count family 0xE8..0xEF; the CP r+r exception 0xF0..0xF7; the shift-by-A family 0xF8..0xFF which is covered by a separate not-yet-implemented quirk for the count=0 edge case; and the exact observed pair `D8 83` (`add XHL, XWA` / cc900 `add HL,WA`) which toolchain v2 verified-findings marks safe-in-practice.",
+      "execution_stop_status": "silicon-broken",
+      "sources": [
+        {
+          "document": "../NgpCraft_toolchain/USER_MANUAL_EN.md",
+          "section": "Section 12.1 Bug #1 - r+r 16/32-bit Operations (D0..D7 prefix, sub-op >= 0x80)",
+          "quote": "Register-to-register 16-bit (D0..D7) and 32-bit (D8..DF) operations with sub-opcodes 0x80..0xFF hang the CPU on real NGPC hardware. Rule: byte r+r (C8..CF) and all immediates are safe. Word/long r+r = broken. Exception: cp XWA, XHL (D8 F3) is safe as CP has no sub-op >= 0x80. Examples: ld XWA, XDE (D8 82) = BROKEN; cp XWA, XHL (D8 F3) = OK."
+        },
+        {
+          "document": "../NgpCraft_toolchain/T900_DENSE_REF.md",
+          "section": "broken opcodes",
+          "quote": "D8..DF working-bank prefix hangs the CPU on r+r ALU sub-ops; immediate forms stay safe and CP r+r is the documented exception."
+        },
+        {
+          "document": "../NgpCraft_toolchain/DISASM_CROSSCHECK.md",
+          "section": "Section 2 - D8..DF prefix family",
+          "quote": "D8..DF (working bank) is OK in the direct hardware evidence available locally, but the only concrete test is `d8 61` (inc 0x1, WA, sub-op 0x61) which sits in the safe zone; the document does not exercise any r+r sub-op ≥ 0x80 and therefore does not contradict the USER_MANUAL rule."
+        },
+        {
+          "document": "../NgpCraft_toolchain/NgpCraft_Toolchain_v2/docs/08_VERIFIED_FINDINGS.md",
+          "section": "D8 83 = add XHL,XWA (alu reg-reg) → SAFE, CC900 l'utilise",
+          "quote": "CC900 émet `add HL,WA` → assemblé en `D8 83` (instruction 2-byte unique)."
+        }
+      ],
+      "matcher": {
+        "kind": "prefixed_range_non_immediate",
+        "prefix_start": 216,
+        "prefix_end": 223,
+        "safe_second_values": [],
+        "safe_exact_pairs": [
+          [
+            216,
+            131
+          ]
+        ],
+        "safe_second_ranges": [
+          [
+            0,
+            127
+          ],
+          [
+            168,
+            175
+          ],
+          [
+            200,
+            207
+          ],
+          [
+            216,
+            223
+          ],
+          [
+            232,
+            239
+          ],
+          [
+            240,
+            255
+          ]
+        ]
+      }
+    },
+    {
+      "quirk_id": "cpu.link_xiy_large_frame",
+      "category": "broken-opcode-form",
+      "confidence": "documented",
+      "summary": "LINK XIY with a large frame is broken on real NGPC silicon.",
+      "note": "This LINK XIY form is documented as broken on NGPC silicon once the frame size reaches 5 or more. Reference execution stops here instead of pretending the stack-frame side effects are valid.",
+      "execution_stop_status": "silicon-broken",
+      "sources": [
+        {
+          "document": "../NgpCraft_toolchain/DEVLOG.md",
+          "section": "Jalon 8 silicon bugs",
+          "quote": "link XIY, N with N>=5 BROKEN on silicon. Absolute limit N<=4. Bisect z10(N=8)/z11(N=6)/z12(N=5) all KO. Fix: link XIY,4 max."
+        },
+        {
+          "document": "../NgpCraft_toolchain/T900_DENSE_REF.md",
+          "section": "LINK XIY",
+          "quote": "LINK XIY with a large frame size is documented broken on NGPC silicon; t900cc caps the frame to N<=4 in generated prologues."
+        },
+        {
+          "document": "../NgpCraft_toolchain/DECISIONS.md",
+          "section": "prologue shape",
+          "quote": "Reference prologue uses link XIY, 0 (N=0 safe); larger N values trip the NGPC silicon LINK XIY bug."
+        }
+      ],
+      "matcher": {
+        "kind": "warning_contains",
+        "pattern": "!BROKEN LINK XIY"
+      }
+    }
+  ]
+}

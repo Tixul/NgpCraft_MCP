@@ -1,0 +1,408 @@
+{
+  "$schema_version": "1",
+  "description": "Curated silicon/hardware bugs found on real NGPC hardware while developing the NgpCraft toolchain. Each entry has been validated on flash cart. Use ngpc_bug_check tool to query.",
+  "bugs": [
+    {
+      "id": "D0_PREFIX_BROKEN",
+      "opcode_pattern": "D0",
+      "title": "TLCS-900 D0 prefix (any sub-op) broken on NGPC silicon",
+      "category": "cpu_silicon",
+      "severity": "crash",
+      "symptoms": [
+        "Hang / watchdog reset",
+        "Corrupt register values"
+      ],
+      "affected_instructions": [
+        "cpl WA (D0 06)",
+        "neg WA (D0 07)",
+        "sll N,WA (D0 EE)",
+        "inc WA (D0 61) — any inc on D0 pattern",
+        "ldcw dmacN,wa",
+        "Any word-size op using R16 index 0x00 in the D0 space"
+      ],
+      "fixes": [
+        {
+          "op": "cpl WA",
+          "replacement": "push WA; ld WA,65535; pop HL; xor A,L; xor W,H"
+        },
+        {
+          "op": "neg WA",
+          "replacement": "push WA; ld WA,0; pop HL; sub A,L; sbc W,H"
+        },
+        {
+          "op": "sll N,WA",
+          "replacement": "extz XWA; sll N, XWA (D8 prefix safe)"
+        },
+        {
+          "op": "inc WA",
+          "replacement": "ld BC,1; add A,C; adc W,B"
+        },
+        {
+          "op": "ldcw dmacN,wa",
+          "replacement": "extz xwa; ldcl dmacN, xwa (D8 32-bit form)"
+        }
+      ],
+      "notes": [
+        "D1..D7 standalone are SAFE (CC900 uses them in production).",
+        "Initial diagnostic 'D0..D7 all broken' was too broad. Only D0 prefix is cursed."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "hello_j7, j10, j11 (2026-03-22 → 2026-03-24)"
+    },
+    {
+      "id": "ADC_W_B_W_GT_0",
+      "opcode_pattern": "CA 90",
+      "title": "adc W,B fails when W > 0",
+      "category": "cpu_silicon",
+      "severity": "wrong_result",
+      "symptoms": [
+        "Carry/overflow not propagated",
+        "Silent wrong high-byte result"
+      ],
+      "fixes": [
+        {
+          "op": "adc W,B (count > 255)",
+          "replacement": "Loop with W=0 so count ≤ 255, or avoid adc on W altogether"
+        }
+      ],
+      "notes": [
+        "With W=0 the add degenerates; values above 255 need a loop-based accumulation."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Jalon 8 bisect (2026-03-22)"
+    },
+    {
+      "id": "CB_FAMILY_BROKEN",
+      "opcode_pattern": "CB xx",
+      "title": "TLCS-900 CB-prefix byte ALU (C-source) broken on NGPC silicon",
+      "category": "cpu_silicon",
+      "severity": "crash",
+      "symptoms": [
+        "Infinite loop / hang"
+      ],
+      "affected_instructions": [
+        "add A,C  (CB 81) — confirmed",
+        "Likely: any byte-ALU op with prefix 0xCB (= R8[3] = C as source register)"
+      ],
+      "fixes": [
+        {
+          "op": "add A,C (CB 81)",
+          "replacement": "add A,L (CF 81) — routes through HL (R8[7] = L)"
+        },
+        {
+          "op": "any CB-prefixed byte ALU",
+          "replacement": "Use CF prefix (L source) instead of CB (C source)"
+        }
+      ],
+      "notes": [
+        "Only `CB 81` is hardware-validated; the broader CB family is by inference.",
+        "Other byte-ALU prefixes (C8 W-source, C9 A-source, CA B-source, CC D-source, CD E-source, CE H-source, CF L-source) are confirmed safe — CC900 production code uses them.",
+        "ngpc_disasm.py flags any 0xCB prefix as `!BROKEN CB family`."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "bisect_j8z13 (2026-03-22)"
+    },
+    {
+      "id": "LINK_XIY_N_GE_5",
+      "opcode_pattern": "link XIY, N (N>=5)",
+      "title": "link XIY with frame size N >= 5 broken on silicon",
+      "category": "cpu_silicon",
+      "severity": "crash",
+      "symptoms": [
+        "Stack corruption after prologue",
+        "Parameters read from wrong offset",
+        "Hang on function entry"
+      ],
+      "fixes": [
+        {
+          "op": "link XIY, N for N >= 5",
+          "replacement": "Use link XIY, 0 (max safe), allocate locals via N/2 × push WA after the link"
+        }
+      ],
+      "notes": [
+        "N=0..4 work. N>=5 breaks. Hard silicon limit — not a prefix problem.",
+        "t900cc.py prologue emits link XIY,0 + N/2 × push WA to stay safe."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "bisect z10(N=8)/z11(N=6)/z12(N=5) all KO, z9(N=4) OK"
+    },
+    {
+      "id": "PUSH_XSP_POSTDECREMENT",
+      "opcode_pattern": "push XSP",
+      "title": "push XSP post-decrements before push — XIY offset wrong",
+      "category": "cpu_abi",
+      "severity": "wrong_result",
+      "symptoms": [
+        "Function parameters read from wrong address",
+        "Crashes shortly after prologue when params are used"
+      ],
+      "fixes": [
+        {
+          "op": "push XIY; push XSP; pop XIY (classic frame setup)",
+          "replacement": "link XIY, 0 / unlk XIY (N=0 is safe, see LINK_XIY_N_GE_5)"
+        }
+      ],
+      "notes": [
+        "push XSP does post-decrement — XIY ends up at S-8 instead of S-4, all params off by 4."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Jalon 9 prologue redesign (2026-03-23)"
+    },
+    {
+      "id": "LDIRW_XIY_XIX_NOT_XDE_XHL",
+      "opcode_pattern": "LDIRW / LDIW",
+      "title": "LDIRW/LDIW on NGPC use XIY (src) and XIX (dst), NOT XDE/XHL",
+      "category": "cpu_abi",
+      "severity": "wrong_result",
+      "symptoms": [
+        "Block copy writes to random memory",
+        "Source read from wrong address"
+      ],
+      "fixes": [
+        {
+          "op": "block copy via LDIRW",
+          "replacement": "push XIY → push XHL; pop XIY → push XDE; pop XIX → ldirw → pop XIY"
+        }
+      ],
+      "notes": [
+        "Spec sheets say XDE/XHL — on silicon it's XIY/XIX. Save and restore XIY.",
+        "ngpc_memcpy_w in template uses this exact pattern."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Jalon 19 (2026-03-25)"
+    },
+    {
+      "id": "DA_PREFIX_COUNT_ZERO",
+      "opcode_pattern": "DA",
+      "title": "DA-prefix shift with count=0 zeros the destination (not a no-op)",
+      "category": "cpu_silicon",
+      "severity": "wrong_result",
+      "symptoms": [
+        "Runtime shift by 0 silently clears the value",
+        "Very hard to debug — looks like random data loss"
+      ],
+      "affected_instructions": [
+        "srl A, XDE (where XDE=0)",
+        "sll A, XDE (where XDE=0)"
+      ],
+      "fixes": [
+        {
+          "op": "runtime shift",
+          "replacement": "Zero-guard before shift: `or A, L` (CF E1 safe), jr Z to skip shift if count==0"
+        }
+      ],
+      "notes": [
+        "Guard uses A|L = count so Z is set iff count is 0. Does not clobber W or XDE."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Jalon 11 (2026-03-24)"
+    },
+    {
+      "id": "EI_WITHOUT_OPERAND_IS_DI",
+      "opcode_pattern": "ei (no operand)",
+      "title": "t900as.py: `ei` without operand assembles to EI 7 which is effectively DI",
+      "category": "toolchain_assembler",
+      "severity": "silent_bug",
+      "symptoms": [
+        "Joypad dead (no VBlank → BIOS never updates pad register)",
+        "No interrupt fires despite 'ei' being written"
+      ],
+      "fixes": [
+        {
+          "op": "ei",
+          "replacement": "Always write `ei 0` explicitly to enable interrupts"
+        }
+      ],
+      "notes": [
+        "di opcode is 06 07. ei 0 is the correct enable. `ei` alone = EI 7 = DI — classic NGPC footgun."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "bisect_j8z15 (2026-03-23)"
+    },
+    {
+      "id": "DB_88_NOT_LD_WA_BC",
+      "opcode_pattern": "DB 88",
+      "title": "`db 0xD1, 0x88` is NOT `ld WA,BC` — it's 4-byte `or BC,(mem)`",
+      "category": "toolchain_assembler",
+      "severity": "wrong_code",
+      "symptoms": [
+        "Unexpected memory reads",
+        "Following instructions mis-decoded (bytes consumed as address)"
+      ],
+      "fixes": [
+        {
+          "op": "copy XBC → XWA",
+          "replacement": "push XBC; pop XWA"
+        }
+      ],
+      "notes": [
+        "Ghidra confirms D1 88 is a 4-byte opcode consuming the next 2 bytes as address.",
+        "Always use push/pop to copy register pairs."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "t900as.py review (2026-03-25)"
+    },
+    {
+      "id": "CONST_PTR_IS_NOT_CONST_VAL",
+      "opcode_pattern": "C: const T *ptr",
+      "title": "t900cc.py: `const T *ptr` is not the same as `const T val` — ROM predicate must exclude PtrType",
+      "category": "toolchain_compiler",
+      "severity": "wrong_code",
+      "symptoms": [
+        "Pointer (RAM target) gets placed in ROM",
+        "Writes via the pointer silently fail"
+      ],
+      "fixes": [
+        {
+          "op": "ROM eligibility check",
+          "replacement": "Exclude PtrType from the is-ROMable predicate, even if the pointee type is const"
+        }
+      ],
+      "notes": [
+        "Example: `const u8 *s_bgm_note_table[]` — the array of pointers lives in RAM, only the bytes pointed to are const."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Fix #22 (2026-03-30)"
+    },
+    {
+      "id": "ENCODE_LDC_ZZ_VALUES",
+      "opcode_pattern": "ldc[w|l] dmacN, r",
+      "title": "t900as.py encode_ldc() emitted wrong zz register-size values",
+      "category": "toolchain_assembler",
+      "severity": "wrong_code",
+      "symptoms": [
+        "DMA registers never actually programmed",
+        "DMA transfers never fire or fire from wrong address"
+      ],
+      "fixes": [
+        {
+          "op": "ldc R16 encoding",
+          "replacement": "zz 0x08 → 0x10 (avoid D0 prefix)"
+        },
+        {
+          "op": "ldc R32 encoding",
+          "replacement": "zz 0x10 → 0x20 (E8 long word, not D8 word)"
+        }
+      ],
+      "notes": [
+        "ldcl dmasN,xwa now generates E8 2E cr matching CC900. Critical for DMA from ROM."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Fix #26 (2026-04-01)"
+    },
+    {
+      "id": "CC900_NO_LINK_UNLK",
+      "opcode_pattern": "ABI",
+      "title": "CC900 ABI never emits link/unlk — uses XIZ sub-regs for locals",
+      "category": "abi_reference",
+      "severity": "perf",
+      "symptoms": [
+        "Generated code with link/unlk is ~10× more stack ops than CC900",
+        "Structural lag on hardware (confirmed cause of StarGunner lag)"
+      ],
+      "fixes": [
+        {
+          "op": "local variable storage",
+          "replacement": "Map C locals to XIZ sub-registers (QIZH/IZH/IZL) + push/pop XIZ at function boundary"
+        },
+        {
+          "op": "address-taken locals",
+          "replacement": "dec N,XSP / inc N,XSP (not link/unlk)"
+        }
+      ],
+      "notes": [
+        "Confirmed via bisect_cc900 (2026-03-22) reverse analysis.",
+        "t900cc.py currently uses link XIY,0 + push WA — safe but ~3-5× slower than CC900.",
+        "PERF-LAG-5 (XIZ ABI) is the listed fix path."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "DISASM_CROSSCHECK.md Section 12"
+    },
+    {
+      "id": "GLOBALS_ZERO_INIT_TO_DATA",
+      "opcode_pattern": "C: T g = 0;",
+      "title": "t900cc.py: global `= 0` went to DATA section with ROM address instead of BSS",
+      "category": "toolchain_compiler",
+      "severity": "wrong_code",
+      "symptoms": [
+        "Global never updates (reads constant ROM pattern)",
+        "Volatile counters frozen"
+      ],
+      "fixes": [
+        {
+          "op": "Const(0) initializer",
+          "replacement": "Route Const(0) to bss_vars, not data_vars (applies to globals AND static locals)"
+        }
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Jalon 11 globals fix (2026-03-24)"
+    },
+    {
+      "id": "POWER_BUTTON_BIOS_HANDLED",
+      "opcode_pattern": "MP_SHUTDOWN_REQ",
+      "title": "Power button shutdown is intercepted by BIOS — user program cannot observe it",
+      "category": "bios_behavior",
+      "severity": "info",
+      "symptoms": [
+        "Stub ngpc_shutdown=ret still shuts down on power button",
+        "MP_SHUTDOWN_REQ bit never readable by user code"
+      ],
+      "notes": [
+        "Per SysWork.txt + SysPro.txt: 'shutdown is initiated, system is shutdown before the user can evaluate the bit'.",
+        "Stub affects only TIME_SHUTDOWN_REQ (10-min idle) and BAT_SHUTDOWN_REQ (low battery) — NOT the power button.",
+        "Behavior is correct by design, not a bug — don't try to 'fix' it."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Jalon 13 (2026-03-24)"
+    },
+    {
+      "id": "CC900_S8_OR_NESTED_DECL",
+      "opcode_pattern": "Toshiba cc900 only",
+      "title": "Toshiba cc900: crash on `s8 != s8 || s8 != s8` and on a (still-imprecise) nested-decl pattern",
+      "category": "toolchain_compiler",
+      "severity": "crash_host_compiler",
+      "symptoms": [
+        "Toshiba cc900 internal error on specific patterns",
+        "Does NOT affect t900cc.py — only the original Toshiba compiler"
+      ],
+      "fixes": [
+        {
+          "op": "s8 != s8 || s8 != s8",
+          "replacement": "Split into separate if statements or cast to int"
+        },
+        {
+          "op": "nested-block decl pattern (precise reproducer not captured)",
+          "replacement": "If you hit a cc900 internal error inside a nested block, try moving the declaration to the function top and assigning inside the block"
+        }
+      ],
+      "notes": [
+        "S8 OR chain is well-attested and lintable (HW-3c).",
+        "The 'nested decl' part of this bug entry is too vague — likely refers to mixed declarations and statements (C99 extension), but we don't have a precise failing snippet. The HW-3d lint was added then removed because pure depth-based detection false-positived on valid C89 (decls at top of inner blocks like for-body). To re-enable a lint, capture an exact failing snippet on cc900 and narrow the detection."
+      ],
+      "validated_on_hw": false,
+      "validation_ref": "feedback_cc900_s8_or_bug.md"
+    },
+    {
+      "id": "STACK_OVERFLOW_LARGE_BSS_LOCAL",
+      "opcode_pattern": "static u8 arr[N] inside function",
+      "title": "Large static-like locals must be moved to file-scope BSS (stack too small)",
+      "category": "memory_layout",
+      "severity": "crash",
+      "symptoms": [
+        "Stack overflow → random corruption",
+        "Works on emulator, crashes on real hw with full DMA tables"
+      ],
+      "fixes": [
+        {
+          "op": "large (>256 byte) arrays",
+          "replacement": "Move to file-scope static — they go to BSS and don't cost stack"
+        }
+      ],
+      "notes": [
+        "Example: s_bg_dma_phase_x[32][76] = 2432 bytes. Stack was 210 → 2643 bytes after moving. Fix #23."
+      ],
+      "validated_on_hw": true,
+      "validation_ref": "Fix #23 DMA (2026-03-31)"
+    }
+  ]
+}
