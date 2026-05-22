@@ -10,9 +10,6 @@ Install once, and every Claude Code / Cursor / Claude Desktop session gains the 
 
 Writing NGPC code with an LLM today without context = hallucinated C99 constructs the compiler rejects, broken silicon opcodes (D0 prefix, CB family), wrong ABI, forgotten `NGP_FAR` on ROM data, etc. The user ends up debugging on real hardware what should have been caught before code was written.
 
-This MCP server wraps **two years of curated NGPC knowledge** (the `NGPC_RAG` repo — docs, disasm cross-checks, validated patterns, bug DB) into a standard protocol so any LLM can access it on demand — in chunks, without saturating its context window.
-
-Reference proof-point: the user's StarGunner shmup — a full playable NGPC homebrew with menus, music, SFX, enemy waves — was ~25% one-shot by GPT just from reading this doc corpus. This MCP makes that knowledge queryable, structured, and re-usable across every project.
 
 ---
 
@@ -216,4 +213,4 @@ MIT. Vendored snapshots retain their original licenses (see `vendor/*/LICENSE`).
 | **NgpCraft Learn** | Bilingual FR/EN course site |
 | **NgpCraft MCP** | ← this project — LLM knowledge + validation layer |
 
-The MCP is the glue that makes AI assistance for NGPC actually work. The others are the ingredients.
+
