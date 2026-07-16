@@ -8,7 +8,7 @@ Install once, and every Claude Code / Cursor / Claude Desktop session gains the 
 
 ## Why this exists
 
-Writing NGPC code with an LLM today without context = hallucinated C99 constructs the compiler rejects, broken silicon opcodes (D0 prefix, CB family), wrong ABI, forgotten `NGP_FAR` on ROM data, etc. The user ends up debugging on real hardware what should have been caught before code was written.
+Writing NGPC code with an LLM today without context = hallucinated C99 constructs the compiler rejects, toolchain mis-encodes (a `D0` prefix wrongly emitted for a register op) and broken silicon opcodes (`add A,C` = `CB 81` C-source ALU), wrong ABI, forgotten `NGP_FAR` on ROM data, etc. The user ends up debugging on real hardware what should have been caught before code was written.
 
 
 ---
@@ -191,7 +191,7 @@ NgpCraft_MCP/
 
 ## Hardware validation claim
 
-Every entry in `src/data/bugs_silicon.json` cites the validation reference (jalon / bisect / date). These are not speculative — they were reproduced on a real NGPC flash cart during the NgpCraft toolchain development. The curated set captures findings that would otherwise only live in long-form dev logs.
+Every entry in `src/data/bugs_silicon.json` cites the validation reference (jalon / bisect / date). These are not speculative — they were reproduced on a real NGPC flash cart during the NgpCraft toolchain development (WIP). The curated set captures findings that would otherwise only live in long-form dev logs.
 
 ---
 

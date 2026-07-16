@@ -673,7 +673,9 @@ def _try_execute_load_immediate(
             value=raw[2],
         )
 
-    if raw[0] in range(0xD0, 0xD8) and len(raw) == 4 and raw[1] == 0x03:
+    # D0..D7 and D8..DF are both WORD register-direct prefixes (16-bit imm,
+    # 4-byte total). HW-confirmed 2026-07-03: D8..DF is word, NOT long.
+    if raw[0] in range(0xD0, 0xE0) and len(raw) == 4 and raw[1] == 0x03:
         return _execute_register_immediate(
             before_cpu=before_cpu,
             before_memory=before_memory,
@@ -683,7 +685,7 @@ def _try_execute_load_immediate(
             value=int.from_bytes(raw[2:4], "little"),
         )
 
-    if raw[0] in tuple(range(0xD8, 0xE0)) + tuple(range(0xE8, 0xF0)) and len(raw) == 6 and raw[1] == 0x03:
+    if raw[0] in range(0xE8, 0xF0) and len(raw) == 6 and raw[1] == 0x03:
         return _execute_register_immediate(
             before_cpu=before_cpu,
             before_memory=before_memory,
@@ -695,7 +697,8 @@ def _try_execute_load_immediate(
 
     # ld r, #3 — compact 2-byte small-immediate load (catalog: C8+zz+r : A8+#3).
     # The 3-bit immediate value (0..7) is embedded in the lower bits of the second byte.
-    # C8..CF = byte register, D0..D7 = word register, D8..DF = long register.
+    # C8..CF = byte register, D0..D7 = word register, D8..DF = word register
+    # (16-bit, HW-confirmed 2026-07-03 — NOT long), E8..EF = long register.
     if len(raw) == 2 and 0xA8 <= raw[1] <= 0xAF:
         info = _prefixed_register_execute_info(raw[0])
         if info is not None:
@@ -9840,7 +9843,8 @@ def _prefixed_register_execute_info(first_opcode: int) -> tuple[str, int] | None
     if 0xD0 <= first_opcode <= 0xD7:
         return ("word", first_opcode & 0x07)
     if 0xD8 <= first_opcode <= 0xDF:
-        return ("long", first_opcode & 0x07)
+        # HW-confirmed 2026-07-03: D8..DF is WORD (16-bit), not long.
+        return ("word", first_opcode & 0x07)
     if 0xE8 <= first_opcode <= 0xEF:
         return ("long", first_opcode & 0x07)
     return None

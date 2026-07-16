@@ -455,7 +455,10 @@ def _prefixed_register_info(first_opcode: int) -> tuple[str, str, str | None] | 
             "!BROKEN D0..D7 ALU word-register prefix on NGPC silicon",
         )
     if 0xD8 <= first_opcode <= 0xDF:
-        return ("long", R32[first_opcode & 0x07], None)
+        # HW-confirmed 2026-07-03: D8..DF is the WORD (16-bit) register-direct
+        # prefix (ngdis getzz(0xD8)=1=word), NOT long. `D8 89` = `ld BC, WA`
+        # (word copy, dest high16 preserved), not `ld XBC, XWA`.
+        return ("word", R16[first_opcode & 0x07], None)
     if 0xE8 <= first_opcode <= 0xEF:
         return ("long", R32[first_opcode & 0x07], None)
     return None

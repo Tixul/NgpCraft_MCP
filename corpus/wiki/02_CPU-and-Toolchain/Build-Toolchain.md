@@ -549,11 +549,12 @@ real NGPC silicon. Known broken opcodes explicitly avoided by codegen:
 
 | Opcode pattern | Status | Workaround |
 |----------------|--------|------------|
-| `D0 prefix` (all sub-ops: cpl WA, neg WA, sll N WA, sra ...) | **Broken silicon** | Use D8 prefix (`extz XWA` then 32-bit op) or HL-based alternative |
+| `D0` prefix emitted for word register ops (cpl WA, neg WA, sll N WA, sra ...) | **Mis-decode, not silicon** — `D0..D7` is the WORD MEMORY family; word reg-direct is `D8..DF`. Emitting D0 for a word-register op makes the CPU decode it as a memory access (historic "crash"). Codegen must not emit D0 for register ops. | Use D8 prefix (word reg-direct) or `extz XWA` + E8 (32-bit) or HL-based alternative |
 | `adc W, B` with W > 0 (`CA 90`) | **Broken** | Loop count capped at 255 (W stays 0) |
-| `add A, C` (`CB 81`) + full CB family | **Broken** | Use `add A, L` (`CF 81`) via HL |
+| `add A, C` (`CB 81`) + C-source arith/logic ALU sub-ops (`CB 0x80..0xFF`) | **Broken** | Use `add A, L` (`CF 81`) via HL |
+| `div/mul A, C` (`CB 0x40..0x5F`, e.g. `div A,C` = `CB 51`) | **Safe** — HW-cleared 2026-07-08 (hw_test_bytediv); the CB break is sub-op-specific, byte mul/div is not affected | No workaround needed |
 | `link XIY, N` with N >= 5 | **Broken** | Frame capped at N <= 4, extra locals accessed via separate stack arithmetic |
-| `inc WA` (`D0 61`) | **Broken** | `ld BC, 1; add A, C; adc W, B` (uses C safe, not B) |
+| `inc WA` (`D0 61`) | **Mis-encode, not silicon** — `D0` is a memory-addressing byte; `inc WA` reg-direct is `D8 61`. Codegen must not emit the `D0` form. | `ld BC, 1; add A, C; adc W, B`, or emit the reg-direct `D8 61` |
 | `srl/sll A, XDE` with A=0 | **Zeroes XDE** (not no-op) | `or A, L` guard (`CF E1`) before shift |
 | `D1..D7` standalone | **Safe** | Confirmed in CC900 production code |
 | `LD R32, imm32` (`0x40+R`) | **Safe** | Used for all 32-bit literal loads (function pointers etc.) |

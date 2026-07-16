@@ -7130,7 +7130,9 @@ class CodeGen:
 
         # Compute new value
         # NOTE: inc/dec WA (D0 61/D0 69) is broken on NGPC hardware (bisect_j7d confirmed).
-        #       add A,C (CB 81) = famille CB CASSÉE sur silicium NGPC (bisect_j8z13).
+        #       add A,C (CB 81) = C-source arith/logic ALU CASSÉ sur silicium NGPC (bisect_j8z13).
+        #       NUANCE: le break CB est sub-op-specific — byte mul/div C-source
+        #       (CB 0x40..0x5F, ex. div A,C = CB 51) est SAFE (hw_test_bytediv 2026-07-08).
         #       Fix: utiliser HL — add A,L (CF 81) + adc W,H (CE B0) sont SAFE.
         #       delta=1  -> ld HL, 1      (H=0, L=1)
         #       delta=-1 -> ld HL, 65535  (H=0xFF, L=0xFF = -1 en u16)

@@ -103,6 +103,21 @@ Defined in `ngpc_hw.h` as `BIOS_*` constants.
 | `BIOS_ALARMDOWNSET` | 11 | Set a wake-up alarm (console off) | Table 0xFFFE00 |
 | `BIOS_FLASHPROTECT` | 13 | Protect flash blocks | Table 0xFFFE00 |
 | `BIOS_GEMODESET` | 14 | Switch K1GE/K2GE mode | Table 0xFFFE00 |
+| `BIOS_COMINIT` | 16 (0x10) | Serial link-cable: init (8N1, CTS/RTS, 19200 bps) | Table 0xFFFE00 |
+| `BIOS_COMSENDSTART` | 17 (0x11) | Serial: start / flush TX ring to the wire | Table 0xFFFE00 |
+| `BIOS_COMRECIVESTART` | 18 (0x12) | Serial: enable reception (both consoles ON) | Table 0xFFFE00 |
+| `BIOS_COMCREATEDATA` | 19 (0x13) | Serial: push 1 byte to TX ring (rb3) | Table 0xFFFE00 |
+| `BIOS_COMGETDATA` | 20 (0x14) | Serial: pop 1 byte from RX ring (rb3) | Table 0xFFFE00 |
+| `BIOS_COMONRTS` | 21 (0x15) | Serial: RTS low = allow peer (port 0xB2 bit0) | Table 0xFFFE00 |
+| `BIOS_COMOFFRTS` | 22 (0x16) | Serial: RTS high = block peer | Table 0xFFFE00 |
+| `BIOS_COMSENDSTATUS` | 23 (0x17) | Serial: TX status (flags\|count) | Table 0xFFFE00 |
+| `BIOS_COMRECIVESTATUS` | 24 (0x18) | Serial: RX status (flags\|count), clears errors | Table 0xFFFE00 |
+| `BIOS_COMCREATEBUFDATA` | 25 (0x19) | Serial: block TX (xhl3=ptr, rb3=size) | Table 0xFFFE00 |
+| `BIOS_COMGETBUFDATA` | 26 (0x1A) | Serial: block RX (xhl3=ptr, rb3=size) | Table 0xFFFE00 |
+
+> **Serial vectors `0x10`-`0x1A` (16-26)** were absent from every public `ngpc.h`;
+> recovered from the BIOS dump and each routine disassembled to confirm it. See the
+> dedicated Serial / Link Cable section below.
 
 ---
 
@@ -295,11 +310,68 @@ additional services not available via direct BIOS vectors.
 
 ---
 
+## 10. Serial / Link Cable (COM BIOS)
+
+The link-cable port is **serial channel 0 (SC0)** of the TLCS-900, driven entirely
+through 11 BIOS vectors (`0x10`-`0x1A`). Line config (set by `BIOS_COMINIT`):
+**UART 8N1, CTS/RTS hardware handshake, 19200 bps**. The BIOS owns two 64-byte ring
+buffers and the TX/RX interrupts; you only call the vectors.
+
+> These 11 vector numbers are **absent from every public `ngpc.h`** — recovered from
+> the BIOS dump (table @ `0xFFFE00`) and each routine disassembled to confirm its
+> identity. A full write-up + ready-to-use C stub (`serial.c/.h`, `com.inc`) lives in
+> the NGPC_RAG research tree under `04_MY_PROJECTS/serial_link/`.
+
+### 10.1 Vector roles (all verified on the BIOS)
+| Vector | # | Role | I/O |
+|--------|---|------|-----|
+| COMINIT | 0x10 | init SC0 (SC0MOD=0x49, SC0CR=0x00, BR0CR=0x05) + install TX/RX ISR | - |
+| COMSENDSTART | 0x11 | kick TX: first ring byte -> SC0BUF (0x50) | - |
+| COMRECIVESTART | 0x12 | enable RX (SC0MOD\|=0x20) + RTS low | - |
+| COMCREATEDATA | 0x13 | push 1 byte to TX ring | in rb3 / out ra3 |
+| COMGETDATA | 0x14 | pop 1 byte from RX ring | out rb3 / ra3 |
+| COMONRTS | 0x15 | RTS low (allow peer) - port 0xB2 bit0 | - |
+| COMOFFRTS | 0x16 | RTS high (block peer) | - |
+| COMSENDSTATUS | 0x17 | TX status word | out rwa3 |
+| COMRECIVESTATUS | 0x18 | RX status word (clears error flags) | out rwa3 |
+| COMCREATEBUFDATA | 0x19 | block TX | in xhl3=ptr, rb3=size / out rb3=left |
+| COMGETBUFDATA | 0x1A | block RX | in xhl3=ptr, rb3=size / out rb3=left |
+
+### 10.2 Return codes & status bits (verified at disasm)
+- `COMCREATEDATA` -> ra3 = `0x00` OK / `0xFF` TX ring full.
+- `COMGETDATA` -> ra3 = `0x00` OK / `0x01` RX ring empty.
+- Status word (rwa3): bits 0-7 = byte count; bit 8 = buffer-over; bits 9/10/11 =
+  framing/parity/overrun (RX only) -> masks `0x0100 / 0x0200 / 0x0400 / 0x0800`.
+
+### 10.3 Rules
+1. `COMINIT` first; `COMRECIVESTART` only when **both** consoles are powered on.
+2. Wrap long ops (V-blank) with `COMOFFRTS` ... `COMONRTS`.
+3. Use the table (`SYSTEM_CALL`), **never `swi 1`**, for the COM vectors.
+4. Serial TX/RX interrupts (`0x6FE4` / `0x6FE8`) are owned by the BIOS — do not hook them.
+
+### 10.4 Minimal use
+```c
+com_init(); com_recv_start();              /* both consoles ON */
+for (;;) {
+    while (com_create_data(b) == COM_BUF_OVER) ;
+    com_send_start();
+    if (com_rx_ok(com_recv_status()))
+        while (com_get_data(&rx) == COM_BUF_OK) { /* use rx */ }
+    com_rts_off(); WaitVsync(); com_rts_on();
+}
+```
+
+> ABI note (cc900): C runtime runs in **bank 3**, so the BIOS return `ra3` is already
+> the C return register `WA`; args arrive on the stack (`xsp+4`, `xsp+8`).
+
+---
+
 ## Quick Reference
 
 | Item | Value | Notes |
 |------|-------|-------|
 | BIOS vector table | `0xFFFE00` | 32-bit pointers, index * 4 |
+| Serial COM vectors | `0x10`-`0x1A` | link cable, 8N1/CTS-RTS/19200 — see section 10 |
 | SHUTDOWN | vector 0 | SWI 1, ra3=3 |
 | CLOCKGEARSET | vector 1 | Table call, rb3=divisor |
 | RTCGET | vector 2 | Table call, xhl3=NgpcTime* |

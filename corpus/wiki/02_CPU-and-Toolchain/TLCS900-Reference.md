@@ -1126,16 +1126,31 @@ inverted. NGPC uses the TLCS-900/L1 model -> decrement BEFORE save.
 ```
 Formula : first_byte = 0xC8 + zz + r
   zz = 0x00  byte size   -> range 0xC8..0xCF  (r=0..7)
-  zz = 0x08  word size   -> range 0xD0..0xD7  (r=0..7)
-  zz = 0x10  long size   -> range 0xD8..0xDF  (r=0..7)
+  zz = 0x10  word size   -> range 0xD8..0xDF  (r=0..7)  [word register-direct — safe, HW-confirmed 16-bit]
+  zz = 0x20  long size   -> range 0xE8..0xEF  (r=0..7)
+
+  Note: 0xD0..0xD7 is NOT a register-direct word prefix. HW-confirmed 2026-07-03,
+  D0..D7 is the WORD MEMORY family (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`).
+  Earlier revisions treated D0..D7 as a "word alias, silicon-broken" reg-direct
+  form; that was a MIS-DECODE, not a silicon bug. The toolchain used to emit D0
+  intending a word register-immediate op, but the CPU decodes D0 as a memory mode
+  — hence the historic "crash". Word register-direct is D8..DF; the disassembler
+  code re-decode of the D0..D7 memory family is in progress.
+
+  HW-confirmed 2026-07-03 (real NGPC + ngdis getzz): the size field is bits[5:4],
+  so getzz(0xD8)=1=word and getzz(0xE8)=2=long. D8..DF is a WORD (16-bit)
+  register-direct prefix, NOT long. `D8 89` = `ld BC, WA` (word copy, dest
+  high16 preserved), while `E8 89` = `ld XBC, XWA` (long). The genuine 32-bit
+  prefix is E8..EF.
 
 Registers r (index = r in 0..7):
   byte  : W=0  A=1  B=2  C=3  D=4  E=5  H=6  L=7
-  word  : WA=0 BC=1 DE=2 HL=3 IX=4 IY=5 IZ=6 SP=7
-  long  : XWA=0 XBC=1 XDE=2 XHL=3 XIX=4 XIY=5 XIZ=6 XSP=7
+  word  : WA=0 BC=1 DE=2 HL=3 IX=4 IY=5 IZ=6 SP=7   (register-direct = D8..DF)
+  long  : XWA=0 XBC=1 XDE=2 XHL=3 XIX=4 XIY=5 XIZ=6 XSP=7   (E8..EF)
 
-Example : HL (word, index=3) -> zz=0x08 -> 0xC8+0x08+3 = 0xD3
+Example : HL (word, index=3) -> zz=0x10 -> 0xC8+0x10+3 = 0xDB  (safe word prefix)
 Example : A  (byte, index=1) -> zz=0x00 -> 0xC8+0x00+1 = 0xC9
+Example : XWA(long, index=0) -> zz=0x20 -> 0xC8+0x20+0 = 0xE8
 ```
 
 ### Second byte: sub-opcode (after C8+zz+r)
@@ -1326,10 +1341,13 @@ Examples (zz = word): XWA -> `0x90`, XBC -> `0x91`, XIY -> `0x95`,
 XWA+d8 -> `0x98`, **XIY+d8 -> `0x9D`** (most relevant for XIY-relative locals),
 XSP+d8 -> `0x9F`, abs16 -> `0xD1`.
 
-> **Critical disambiguation:** `0xD0..0xD5` are word memory-form prefixes
-> **when followed by a memory-form sub-op** (0x20..0x2F, 0x80..0xEF). This is a
-> DIFFERENT family from `0xD0..0xD7` R-direct (silicon-broken, sub-ops 0xC8..0xFF —
-> see §30). They are distinguished by the sub-op range.
+> **Critical disambiguation:** `0xD0..0xD7` is the WORD MEMORY family — all of it.
+> HW-confirmed 2026-07-03: there is NO word register-direct form at `0xD0..0xD7`.
+> The "R-direct, silicon-broken" reading of `D0..D7` (sub-ops 0xC8..0xFF) was a
+> MIS-DECODE, not a silicon bug: the toolchain emitted D0 intending a word
+> register-immediate op, but the CPU decodes D0 as a memory addressing mode.
+> Word register-direct lives at `0xD8..0xDF` (see §30/§33). Disassembler
+> re-decode of the full `D0..D7` memory family is in progress.
 
 ### 35.2 Sub-opcode (2nd byte) — `R` = low 3 bits = register index
 
@@ -1382,7 +1400,9 @@ db 0x9D, d_local, 0x50   ; LDW (XIY+d_local),WA
 `db 0x9D, d_local, 0x61` (INCW 1, (XIY+d_local)) -> -9 to -10 B/site.
 
 > **Silicon safety:** the ALU memory-form family (`80..AF` + ALU sub-ops) is NOT in the
-> broken-opcode set (unlike the R-direct family `D0..D7`). Flags S/Z/V/H/C/N are updated
+> broken-opcode set. (The historic "broken `D0..D7` R-direct family" was a
+> mis-decode: `D0..D7` is itself a WORD MEMORY family, not a register-direct
+> prefix — word reg-direct is `D8..DF`.) Flags S/Z/V/H/C/N are updated
 > the same as the equivalent byte-split sequence. The memory-form ALU first-bytes
 > (0x99/0x91/0x88/0x89) appear frequently in disassembled commercial ROMs.
 

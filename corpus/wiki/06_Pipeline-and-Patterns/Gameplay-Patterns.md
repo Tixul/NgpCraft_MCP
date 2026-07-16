@@ -364,7 +364,15 @@ struct Entity {
 
 **Forward motion:** advance `camera_z` by player speed each frame, scroll SCR1
 Y register at the same rate. Horizon layer (SCR2) scrolls at a fraction of
-road speed for parallax depth cue. See [Effects and Raster](../03_Graphics/Effects-and-Raster.md) §8.6.
+road speed for parallax depth cue.
+See [Effects and Raster](../03_Graphics/Effects-and-Raster.md) §8.5.
+
+**Road curve / widening (the BG side of the illusion):** beyond the sprite depth system above,
+the ground/scenery is warped by a **per-scanline horizontal line-scroll** of both scroll planes
+(Timer-0 HBlank ISR, or MicroDMA — ~0 CPU/line). Each visible scanline reads its own SCR1_X/SCR2_X
+from a 152-entry double-buffered table; a quadratic curve generator fills the next frame's table.
+This is what makes the rails fan out / converge. Full mechanism:
+[Effects and Raster](../03_Graphics/Effects-and-Raster.md) §8.1–8.3 and §8.6.
 
 ### 5.6 Adventure / Overworld
 
@@ -486,6 +494,33 @@ and wrap at the end of the pool. O(1) allocation with no free-slot scan. Ideal f
 short-lived, high-churn objects (bullets, particles) where overwriting the oldest live
 slot on wrap is acceptable.
 
+### 6.6 Despawn Discipline — Killing an Entity Does Not Free Its Sprite
+
+A generic entity pool separates *logic* from *rendering*: the pool tracks an
+`active`/`alive` flag, and a separate draw pass turns live entities into sprites. A
+minimal `kill` is therefore just:
+
+```c
+#define entity_kill(e)  ((e)->active = 0)   /* logic only — touches NO sprite */
+```
+
+This is correct **only if** the render side has a matching discipline. On its own,
+`active = 0` stops the entity from being *updated and drawn*, but its last OAM slot
+keeps drawing the dead object and stays allocated — an invisible-to-logic "zombie"
+that leaks the 64-slot budget (see [Sprites-and-OAM §10](../03_Graphics/Sprites-and-OAM.md),
+*OAM slot leak*). Whenever you free an entity you must **also** release its sprite,
+via one of two disciplines:
+
+- **Owned slot + hide on kill:** each entity holds a fixed OAM slot (or slot range);
+  `kill` hides it (`ngpc_sprite_hide` / `ngpc_soam_hide`) as well as clearing the flag.
+- **Clear-then-redraw:** hide the whole used OAM range at the top of each frame, then
+  re-emit only live entities. Dead ones are simply never drawn — nothing to hide.
+
+The trap is shipping a pool where `kill` flips the flag, the draw loop skips inactive
+entities, and *neither* side ever hides the slot. It looks correct — dead entities
+vanish from logic — but sprites accumulate until spawns silently fail. If your entity
+module's `kill` is logic-only, document which discipline the game side must provide.
+
 ---
 
 ## Quick Reference
@@ -510,6 +545,7 @@ slot on wrap is acceptable.
 | State dispatch | `sll 3,index; ld XBC,(table+index); call T,XBC` — O(1) |
 | "This" pointer | Entity base in XIZ, handler fn ptr at +0x00 |
 | Ring-buffer alloc | Advance + wrap pointer, O(1), no free-slot scan |
+| Despawn discipline | `kill` must free the sprite too (hide slot OR clear-then-redraw), else OAM leak |
 
 ---
 

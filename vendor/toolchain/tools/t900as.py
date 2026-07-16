@@ -365,10 +365,14 @@ def encode_mem_abs16_inc_dec(mnem: str, size: int, addr16: int, count: int) -> b
 # Source: Toshiba TLCS-900/L1 Datasheet (900L1 Instruction Lists 1-10/10)
 # ---------------------------------------------------------------------------
 
-# zz offsets for the C8+zz+r prefix
-_ZZ_BYTE = 0x00   # C8..CF
-_ZZ_WORD = 0x08   # D0..D7
-_ZZ_LONG = 0x10   # D8..DF
+# zz offsets for the C8+zz+r prefix.
+# HW-confirmed 2026-07-03 (matches encode_ldc() Fix #26/#27 below and
+# bugs_silicon.json): word register-direct = D8..DF (zz=0x10), long = E8..EF
+# (zz=0x20). D0..D7 (zz=0x08) is a word alias that is BROKEN on NGPC silicon,
+# so word registers are emitted with the safe D8 prefix, not D0.
+_ZZ_BYTE = 0x00   # C8..CF (byte, R8)
+_ZZ_WORD = 0x10   # D8..DF (word, R16)  — safe form (D0..D7 word alias is broken)
+_ZZ_LONG = 0x20   # E8..EF (long, R32)
 
 # combined R-tables for lookup
 _ALL_REGS = {}

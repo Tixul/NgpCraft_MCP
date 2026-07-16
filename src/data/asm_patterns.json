@@ -144,10 +144,11 @@
       "context": "DMA source/dest register load from XWA",
       "asm": [
         "extz xwa                ; widen 16→32",
-        "ldcl dmacN, xwa         ; D8 32-bit form (E8 2E cr encoded)"
+        "ldcl dmacN, xwa         ; E8 long (32-bit) form — E8 2E cr encoded"
       ],
       "notes": [
-        "Never use `ldcw dmacN, wa` — that's D0 prefix, broken on silicon.",
+        "For a 32-bit DMAS/DMAD register use ldcl (E8 prefix); `ldcw` is the D8 word (16-bit) prefix and would truncate the address. The old broken form was ldcw via the D0 prefix.",
+        "HW-confirmed 2026-07-03: D8..DF = word (16-bit), E8..EF = long (32-bit).",
         "t900as.py Fix #26 corrected the zz encoding to produce E8 2E cr."
       ]
     },

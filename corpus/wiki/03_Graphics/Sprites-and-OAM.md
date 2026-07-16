@@ -136,9 +136,28 @@ predictable, no allocation overhead.
 #define SLOT_HUD      36   /* slots 36-63 (HUD, score, icons) */
 ```
 
+**Despawn discipline (mandatory).** With fixed slots, killing an object's *logic*
+does not touch its OAM slot. The slot keeps its last tile/flags/position and stays
+on screen until you explicitly hide it. Every despawn path must call
+`ngpc_sprite_hide(slot)` (or `ngpc_soam_hide(slot)` in shadow-OAM builds):
+
+```c
+void enemy_kill(u8 i) {
+    enemy[i].alive = 0;
+    ngpc_sprite_hide((u8)(SLOT_ENEMIES + i * 2));      /* free BOTH OAM slots */
+    ngpc_sprite_hide((u8)(SLOT_ENEMIES + i * 2 + 1));
+}
+```
+
+Forget this and the sprite becomes a "zombie": invisible to your game logic but
+still occupying an OAM slot (see §10, *"Sprites vanish while fewer than 64 are
+on screen"*). The alternative is the clear-then-redraw discipline of §3.3.
+
 ### 3.3 Pool strategy
 
-For variable-count objects, maintain a bitmask and allocate slots dynamically:
+For variable-count objects, maintain a bitmask and allocate slots dynamically.
+A pool needs a matching **free** that both releases the bit **and** hides the slot —
+releasing the bit alone leaves a visible zombie:
 
 ```c
 static u16 s_spr_mask = 0; /* bit N = slot N is taken */
@@ -155,7 +174,26 @@ s8 spr_alloc(u8 count) {
     }
     return -1; /* no space */
 }
+
+void spr_free(u8 slot, u8 count) {
+    u8 k;
+    for (k = 0; k < count; k++) {
+        s_spr_mask &= (u16)~(1u << (slot + k));
+        ngpc_sprite_hide((u8)(slot + k));   /* hide, or the slot stays on screen */
+    }
+}
 ```
+
+> **Two safe disciplines — pick one, never neither:**
+> 1. **Fixed slot / pool + explicit hide on despawn** (above): the object owns its
+>    slot and hides it when it dies.
+> 2. **Clear-then-redraw:** call `ngpc_sprite_hide_all()` (or a range clear) at the
+>    top of every frame, then re-emit only live objects. A killed object simply
+>    isn't re-emitted, so its slot was already cleared — nothing leaks.
+>
+> The shadow-OAM tail-clear (§4, §5) is discipline 2 applied to the used range only.
+> The common failure is doing *neither*: kill only flips an `alive` flag, and the
+> draw loop skips dead objects without ever hiding their slot → zombies accumulate.
 
 ### 3.4 Sprite multiplexing (sprmux) — ABANDONED
 
@@ -766,6 +804,27 @@ ngpc_gfx_set_palette(GFX_SCR1, 0u,
 - Root cause: sprite slots not explicitly cleared on state exit.
 - Fix: call `ngpc_soam_hide_all()` or `ngpc_sprite_hide_all()` in every `_init()`
   before setting up the new state's sprites.
+
+**Sprites vanish while fewer than 64 are on screen (OAM slot leak)**
+- Symptom: new sprites fail to appear — enemies, bullets, or pickups stop spawning —
+  even though you can visibly count far fewer than 64 on screen (e.g. "it caps out at
+  ~45"). Often paired with a one-frame flicker when a slot is reused.
+- Root cause: **killing an entity does not free its OAM slot.** A despawn that only
+  clears a logic flag (`e->alive = 0`, `e->active = 0`) or drops the entity from an
+  update list leaves its last-written OAM entry in `0x8800` untouched. The slot is
+  still "occupied" as far as the hardware and any allocator are concerned: it keeps
+  drawing the dead object's old tile at its old position. These invisible-to-logic
+  "zombie" slots accumulate until the pool is full — so you exhaust the 64-slot budget
+  with only a handful of *live* objects actually visible.
+- Distinguishing it from the per-scanline limit: the per-scanline cap (`HW_STATUS &
+  0x80`, "Character Over", §4) drops sprites that *overlap on the same line* and they
+  reappear when they separate. A slot leak is permanent and independent of position —
+  the count only ever goes up. Dump OAM (`ngpc_emu_oam_info`) and compare occupied
+  slots against the number of entities your logic thinks are alive; a large gap = leak.
+- Fix: enforce one of the two despawn disciplines in §3.2/§3.3 — either hide the slot
+  on every kill path (`ngpc_sprite_hide` / `ngpc_soam_hide`), or clear-then-redraw each
+  frame so dead objects are simply never re-emitted. Never let a kill flip a flag
+  without also releasing the slot.
 
 **"Bullet time" / frame lag with many sprites and projectiles**
 - Symptom: game slows down noticeably when several sprites and bullets are active.

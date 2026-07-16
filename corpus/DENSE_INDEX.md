@@ -53,9 +53,15 @@ Caller-saved `XWA/XBC/XDE/XHL`; callee-saved `XIX/XIY`. All ROM pointers must be
 (`NGP_FAR`/`__far`). C89 only: no float/double, no `long long`, decls at block start.
 Memory-form ALU family `0x80|zz|mem` (compact compound-assign; see TLCS-900/H Reference).
 
-**Silicon-broken opcodes (codegen must avoid):** `D0`-prefix sub-ops; `adc W,B` with W>0;
-`CB` family (`add A,C`); `link XIY,N` with N>=5; `inc/dec WA`; `srl A,XDE` with A=0
-(zeroes XDE). `ldirw` on NGPC uses XIY(src)/XIX(dst), not XDE/XHL.
+**Codegen must avoid** — toolchain mis-encode (NOT silicon): emitting a `D0`-prefix
+byte for a word register op (`D0..D7` is the WORD MEMORY family; use `D8` word reg-direct
+/ `E8` long). **Silicon-broken:** `adc W,B` with W>0; `CB` C-source arith/logic ALU (`add A,C`=`CB 81`; NOT byte mul/div `CB 40..5F`, HW-safe 2026-07-08);
+`link XIY,N` with N>=5; `srl A,XDE` with A=0 (zeroes XDE); `D8..DF` shift-by-A
+(`0xF8..0xFF`) and the `0xB8..0xBF` gap. (Note: `D8..DF` `ld`/add/adc/sub/sbc/
+and/xor/or/cp AND mul/muls/div/divs r+r (`0x40..0x5F`, e.g. `div WA,BC`=`D9 50`)
+word forms are HW-confirmed working — not broken; mul/div cleared by
+`hw_test_muldiv` 2026-07-06.) `ldirw` on NGPC
+uses XIY(src)/XIX(dst), not XDE/XHL.
 
 ## Input (joypad `0x6F82`, active-high)
 

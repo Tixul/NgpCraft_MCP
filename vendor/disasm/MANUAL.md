@@ -180,17 +180,25 @@ Instructions that are **known to crash or hang on NGPC silicon** are annotated w
 0x200100: D0 61    inc   8, WA    ; !BROKEN D0..D7 ALU (word-reg prefix)
 ```
 
+> **D0..D7 note (HW-confirmed 2026-07-03):** the `!BROKEN D0..D7` warning above is a
+> *mis-decode*, not a silicon bug. `0xD0..0xD7` is the **WORD MEMORY** addressing
+> family (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`); word register-direct is
+> `D8..DF`. The historic crashes came from the toolchain emitting a D0 byte for a
+> word-register op, which the CPU then decodes as a memory access. The disassembler
+> re-decode of the D0..D7 memory family is **in progress**, so it still prints the
+> legacy `!BROKEN` warning for now.
+
 ### Known broken opcodes on NGPC silicon
 
 | Opcode(s) | Issue | Suggested fix |
 |-----------|-------|---------------|
-| `D0 xx` | D0 prefix (all sub-ops) — hangs watchdog | Use D8 (R32) family, e.g. `extz xwa; sll N, xwa` instead of `sll N, wa` |
-| `D1..D7 xx` (ALU sub-ops) | Word-register ALU — broken (but D1/D2-D5 as abs-address loads are **safe**) | Switch to byte (C8..CF) or lword (D8..DF / E8..EF) source |
-| `CB xx` | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs | Route through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe |
+| `D0 xx` emitted for a word register op | **Mis-decode, not silicon.** `D0..D7` = WORD MEMORY family; word reg-direct is `D8..DF`. Emitting D0 for a register op makes the CPU decode a memory access. | Never emit D0 for a register op — use D8 (word reg-direct) or `extz xwa; sll N, xwa` (E8 long) |
+| `D1..D7 xx` | WORD MEMORY forms (D1/D2-D5 as abs-address loads are **safe** and used by CC900) | Nothing to fix — these are memory ops, not a broken register-ALU prefix |
+| `CB xx` (arith/logic ALU) | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs. **Sub-op-specific:** byte mul/div (CB 0x40..0x5F, e.g. `div A, C` = CB 51) is HW-cleared SAFE (hw_test_bytediv 2026-07-08) and is NOT flagged | Route through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe |
 | `LINK XIY, N` where N≥5 | Stack frame too large — corrupts SP | Use `link XIY, 0` then `add XSP, -N` to allocate locals |
 | `adc W, B` when W > 0 | High-byte add produces wrong result silently | Keep W=0 (count ≤ 255) or split the add manually |
 
-> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires only on prefix `0xCB` specifically; the surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
+> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires on prefix `0xCB` for its arith/logic ALU sub-ops (0x80..0xFF) only; the byte mul/div reg-reg pocket (CB `0x40..0x5F`) is HW-cleared safe (hw_test_bytediv 2026-07-08) and no longer warns, and the surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
 
 > **About the `adc W, B` warning:** static disassembly cannot know the runtime value of `W`. The flag is unconditional — the reader is expected to verify intent. A safe `adc W, B` with `W==0` will still be flagged.
 

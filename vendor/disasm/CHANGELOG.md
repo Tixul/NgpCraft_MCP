@@ -1,5 +1,25 @@
 # Changelog — ngpc_disasm
 
+> **Note:** `vendor/*` is a dist mirror. Durable edits belong upstream — this
+> entry records a correction applied to the mirror; propagate it to the source repo.
+
+## 2026-07-08
+
+### Fixed
+
+- **CB broken-opcode flag is now sub-op-specific — byte mul/div no longer
+  mis-flagged.** The decoder previously flagged **any** `0xCB` prefix as
+  `!BROKEN CB family`. Real-hardware test `hw_test_bytediv` (2026-07-08) proved
+  the C-source byte **mul/muls/div/divs** reg-reg pocket (`CB` sub-op
+  `0x40..0x5F`, e.g. `CB 51 = div A, C`: WA=0x1F64 / C=0x64 → WA=0x2450,
+  quotient 0x50, remainder 0x24) executes correctly and is **not** silicon-broken.
+  `decode_zz_r` now suppresses the warning when `b == 0xCB and 0x40 <= sub-op <=
+  0x5F`; the arith/logic ALU sub-ops (`add A, C = CB 81`, etc.) remain flagged.
+  This parallels the WORD mul/div clearing (`D8..DF`, hw_test_muldiv 2026-07-06).
+  `_zz_regs` docstring/comments, `MANUAL.md`, `DEVLOG.md`, and bug-DB entry
+  `CB_FAMILY_BROKEN` (`bugs_silicon.json`) updated to the nuance.
+  The `add A, C` (`CB 81`) broken flag is unchanged.
+
 ## 2026-04-20
 
 Audit pass focused on closing the gap between what the README/MANUAL claim and

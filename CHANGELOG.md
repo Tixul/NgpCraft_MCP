@@ -1,5 +1,59 @@
 # Changelog — @ngpcraft/mcp
 
+## 2026-07-16 — corpus: OAM despawn discipline + "static plane vs raster split" for HUDs
+
+Documents two footguns that surfaced from a real user's shmup build.
+
+- **OAM slot leak on despawn.** A pool where `kill` only clears a logic flag
+  (`active = 0`) never frees the entity's OAM slot, so invisible-to-logic "zombie"
+  sprites accumulate and exhaust the 64-slot budget — new spawns silently fail while
+  far fewer than 64 sprites are visible. Added the failure mode, how to tell it apart
+  from the per-scanline limit (`ngpc_emu_oam_info` slot-vs-live gap), and the two safe
+  disciplines (owned-slot + hide-on-kill, or clear-then-redraw) to
+  `corpus/wiki/03_Graphics/Sprites-and-OAM.md` (§3.2, §3.3, §10) and
+  `corpus/wiki/06_Pipeline-and-Patterns/Gameplay-Patterns.md` (new §6.6).
+- **HUD "pop" while scrolling.** Added a decision block at the head of the HUD raster
+  pattern (`Effects-and-Raster.md` §6.6): before reaching for a raster split, put the
+  HUD on the plane you *don't* scroll (SCR2 static, SCR1 scrolls). Zero interrupts,
+  cannot stutter. The split is only needed when *both* planes must scroll. Also warns
+  against the per-tile "bake N vertical variants and swap" workaround, which wastes
+  tile RAM and reintroduces the pop.
+- **Timer0 HBlank IRQ activation recipe.** `Effects-and-Raster.md` new §6.5b shows the
+  full `SWI 1 BIOS_INTLVSET` sequence to enable a Timer0/HBlank IRQ. Previously the doc
+  only *referenced* it ("`ngpc_raster_init()` does the SWI"); anyone hand-rolling their
+  own `__interrupt` handler had no copy-pasteable recipe and hit the #1 silent-failure
+  gotcha (writing INTET does nothing; the ISR never fires — invisible on NeoPop).
+
+## 2026-07-06 — quirks_db re-synced (D8..DF mul/div `r+r` HW-cleared)
+
+`vendor/emulator/core/quirks_db.json` re-synced to the emulator source of truth.
+A flashed HW test (`hw_test_muldiv`) on real NGPC proved the `D8..DF` word
+`mul/muls/div/divs` r+r pocket (`0x40..0x5F`) EXECUTES cleanly and correctly —
+`div WA,BC` (`D9 50`): XWA=0x000003E8 / BC=0x000A → XWA=0x00000064 (quotient 100,
+remainder 0). It is **not** silicon-broken. `cpu.d8_df_register_to_register` now
+safe-lists `0x40..0x5F`, mirroring the `add r+r` clearing (2026-07-05, v10) and
+the `ld` copies (v7). In the `D8..DF` WORD prefix, only **shift-by-A**
+(`0xF8..0xFF`, separate quirk) and the `0xB8..0xBF` gap remain silicon-broken.
+Doc reference corrected in `corpus/DENSE_INDEX.md` (the earlier line below listing
+mul/div `0x40..0x5F` as "stay broken" reflects the pre-HW-test v10 belief and is
+superseded).
+
+## 2026-07-05 — quirks_db re-synced to v10 (D8..DF `add r+r` HW-cleared)
+
+`vendor/emulator/core/quirks_db.json` re-synced to `2026-07-05.v10`. A flashed
+HW test (`hw_test_addrr`) on real NGPC proved the `D8..DF` word arithmetic/logic
+r+r family (add/adc/sub/sbc/and/xor/or) EXECUTES cleanly — it is **not**
+silicon-broken. `cpu.d8_df_register_to_register` now safe-lists those sub-ops
+(only mul/div `0x40..0x5F` and shift-by-A `0xF8..0xFF` stay broken); the `ld`
+r+r copies were already cleared (v7). The USER_MANUAL §12.1 blanket
+"sub-op 0x80..0xFF hangs" rule is disproven. Doc references corrected across the
+corpus (`corpus/DENSE_INDEX.md`, `corpus/wiki/.../Build-Toolchain.md`, `README.md`).
+
+Historical note: earlier entries below that call `D8 8B` / D8..DF r+r
+"silicon-broken" reflect the pre-HW-test belief and are superseded — `D8..DF` is
+the 16-bit WORD prefix (the real 32-bit form is `E8..EF`), and its `ld`/arith/logic
+r+r forms execute on hardware.
+
 ## 2026-05-20 (later) — v0.8 inspector + visual + debugger surface
 
 ### `vendor/emulator/` re-synced (UI 0.6 + BIOS hand-off + opcode-coverage CLI)

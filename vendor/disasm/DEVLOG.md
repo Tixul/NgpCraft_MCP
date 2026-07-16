@@ -24,21 +24,24 @@ decode_one(data, pos, base_addr):
        elif mem <= 21:    → decode_zz_mem()  (C1/D1 abs16 load, (r32+d8) indirect)
 ```
 
-### Encodage zz dans la famille C8+zz+r (IMPORTANT — correction datasheet)
+### Encodage zz dans la famille C8+zz+r (IMPORTANT — corrigé HW 2026-07-03)
 
-La formule naïve `getzz = (b & 0x30) >> 4` donne des résultats FAUX
-pour la plage D8-DF (long). La vraie correspondance, d'après le datasheet Table 4-1, est :
+La formule `getzz = (b & 0x30) >> 4` (bits[5:4]) est CORRECTE. La vraie
+correspondance, confirmée sur vrai NGPC + ngdis masker.h getzz() le 2026-07-03,
+est :
 
-| Plage       | Offset/C8 | Registres | Status NGPC |
-|-------------|-----------|-----------|-------------|
-| 0xC8..0xCF  | +0x00     | R8        | SAFE        |
-| 0xD0..0xD7  | +0x08     | R16 (word)| **BROKEN**  |
-| 0xD8..0xDF  | +0x10     | R32 (long)| SAFE        |
-| 0xE8..0xEF  | E8+r      | R32 spéciaux (LINK/UNLK/EXTZ/EXTS) | SAFE |
+| Plage       | Offset/C8 | Registres  | Status NGPC |
+|-------------|-----------|------------|-------------|
+| 0xC8..0xCF  | +0x00     | R8 (byte)  | SAFE        |
+| 0xD0..0xD7  | +0x08     | R16 (word) | **BROKEN**  |
+| 0xD8..0xDF  | +0x10     | R16 (word) | SAFE        |
+| 0xE8..0xEF  | +0x20     | R32 (long) | SAFE (LINK/UNLK/EXTZ/EXTS + ALU R32) |
 
-**D8-DF = R32 (long), pas R16** : la formule `(b & 0x30) >> 4` retourne 1 (word)
-alors que le datasheet indique R32. Notre disassembleur utilise `(b - 0xC8) // 8`
-pour extraire le bon zz dans cette plage, conformément au datasheet.
+**D8-DF = R16 (word), PAS R32** : `getzz(0xD8)=1=word` est exact ; l'ancienne
+révision qui forçait `(b - 0xC8) // 8` pour classer D8-DF en R32/long était
+FAUSSE. `D8 89` = `ld BC, WA` (copie 16 bits, high16 préservé), et le vrai
+préfixe long (R32) est E8-EF : `E8 89` = `ld XBC, XWA`. Preuve HW : `D8 89`
+XWA=0x11223344, XBC=0xAAAAAAAA → XBC=0xAAAA3344 (high16 intact).
 
 **D0-D7 BROKEN sur silicium NGPC** : le hardware exécute n'importe quoi.
 On les détecte et on ajoute un warning `; !BROKEN`.
@@ -81,8 +84,8 @@ On les détecte et on ajoute un warning `; !BROKEN`.
 | 0xD1 lo hi op   | decode_zz_mem   | LD R16, (abs16) — SAFE |
 | 0xC8-0xCF       | decode_zz_r     | C8+byte+r prefix (R8 ALU) |
 | 0xD0-0xD7       | decode_zz_r     | C8+word+r prefix (R16 ALU) **BROKEN** |
-| 0xD8-0xDF       | decode_zz_r     | C8+long+r prefix (R32 ALU) SAFE |
-| 0xE8-0xEF       | decode_zz_r     | E8+r: LINK/UNLK/EXTZ/EXTS + ALU R32 |
+| 0xD8-0xDF       | decode_zz_r     | C8+word+r prefix (R16 ALU) SAFE — word, not long (HW 2026-07-03) |
+| 0xE8-0xEF       | decode_zz_r     | E8+r: LINK/UNLK/EXTZ/EXTS + ALU R32 (long) |
 | 0xB0 0xF0+cc    | decode_B0_mem   | RET cc |
 | 0xF1 lo hi op   | decode_B0_mem   | LD/LDW (abs16), R/imm |
 | 0xF8-0xFF       | fixed           | SWI 0-7 |
@@ -188,7 +191,8 @@ On les détecte et on ajoute un warning `; !BROKEN`.
 |-------------------|-------------|--------|
 | D0 xx             | CPL WA, NEG WA, SLL WA, ... | BROKEN — hang watchdog |
 | D1..D7 (ALU ctx)  | word-reg ALU (BC,DE,HL,...) | BROKEN |
-| CB xx             | Toute la famille CB | BROKEN |
+| CB xx (ALU)       | add/adc/sub/sbc/and/xor/or A,C (sub-op 0x80..0xFF) | BROKEN |
+| CB 40..5F         | byte mul/muls/div/divs A,C (ex. CB 51 = div A,C) | SAFE (HW-cleared hw_test_bytediv 2026-07-08) |
 | link XIY, N≥5     | N = stack frame size | BROKEN si N >= 5 |
 | adc W, B avec W>0 | ADC high byte | BROKEN |
 

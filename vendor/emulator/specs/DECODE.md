@@ -104,9 +104,12 @@ Current quirk metadata exposure:
   execution support
 
 Important prefix note:
-- in ALU-register context, `D8..DF` are currently treated as 32-bit register forms
-- this matters for sequences such as `DF C8 <imm32>`, which decode as `ADD XSP, imm32`
-- this is intentionally aligned with the vetted local disassembler reference
+- HW-confirmed 2026-07-03: in ALU-register context, `D8..DF` are WORD (16-bit)
+  register forms (ngdis getzz(0xD8)=1=word), NOT 32-bit. The genuine 32-bit
+  (long) register prefix is `E8..EF` (getzz=2).
+- this matters for sequences such as `DB C8 <imm16>`, which decode as
+  `ADD SP, imm16` (word); the long form `EF C8 <imm32>` = `ADD XSP, imm32`
+- this is now aligned with the corrected local disassembler reference
 - the current `post-increment` register-code extraction is still narrow and evidence-driven around the official StarGunner bootstrap loop, not a full ARI_PI family claim
 
 Current CLI user:

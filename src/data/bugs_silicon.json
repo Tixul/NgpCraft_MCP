@@ -5,20 +5,21 @@
     {
       "id": "D0_PREFIX_BROKEN",
       "opcode_pattern": "D0",
-      "title": "TLCS-900 D0 prefix (any sub-op) broken on NGPC silicon",
+      "title": "TLCS-900 D0 prefix mis-emitted for word register ops — D0..D7 is the WORD MEMORY family, not a word register-direct prefix",
       "category": "cpu_silicon",
       "severity": "crash",
       "symptoms": [
         "Hang / watchdog reset",
         "Corrupt register values"
       ],
+      "root_cause": "MIS-DECODE, not a silicon fault (HW-confirmed 2026-07-03). 0xD0..0xD7 is a WORD MEMORY addressing family (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`). Word register-DIRECT is 0xD8..0xDF. The crashes below happened because the toolchain emitted a D0-prefixed byte intending a word register-immediate/ALU op, but the CPU decodes D0 as a memory access — so the operand bytes are consumed as an address and execution derails. The correct classification is toolchain mis-emission (avoid emitting D0 for register ops), not a broken opcode on silicon.",
       "affected_instructions": [
-        "cpl WA (D0 06)",
+        "cpl WA (D0 06) — toolchain intended reg-direct; CPU sees a D0 memory op",
         "neg WA (D0 07)",
         "sll N,WA (D0 EE)",
-        "inc WA (D0 61) — any inc on D0 pattern",
+        "inc WA (D0 61) — any inc emitted on the D0 pattern",
         "ldcw dmacN,wa",
-        "Any word-size op using R16 index 0x00 in the D0 space"
+        "Any word register op the toolchain wrongly encodes with a D0 prefix (should be D8 reg-direct / E8 long)"
       ],
       "fixes": [
         {
@@ -39,15 +40,17 @@
         },
         {
           "op": "ldcw dmacN,wa",
-          "replacement": "extz xwa; ldcl dmacN, xwa (D8 32-bit form)"
+          "replacement": "extz xwa; ldcl dmacN, xwa (E8 long/32-bit form; D8 is the word/16-bit prefix)"
         }
       ],
       "notes": [
-        "D1..D7 standalone are SAFE (CC900 uses them in production).",
-        "Initial diagnostic 'D0..D7 all broken' was too broad. Only D0 prefix is cursed."
+        "D1..D7 standalone are SAFE (CC900 uses them in production) — because they are WORD MEMORY forms, not register-direct.",
+        "HW-confirmed 2026-07-03: the whole D0..D7 range is the WORD MEMORY family; there is no word register-direct form there. Word reg-direct = D8..DF, long reg-direct = E8..EF.",
+        "The historic 'D0..D7 silicon-broken' label was a mis-decode/mis-emission, not a silicon defect. Fixes remain valid: never emit D0 for a word register op — use D8 (word) or E8 (long).",
+        "Disassembler re-decode of the D0..D7 memory family is in progress; the emitted `!BROKEN D0..D7` warnings reflect the current (pre-re-decode) state."
       ],
       "validated_on_hw": true,
-      "validation_ref": "hello_j7, j10, j11 (2026-03-22 → 2026-03-24)"
+      "validation_ref": "hello_j7, j10, j11 (2026-03-22 → 2026-03-24); reclassified as mis-decode 2026-07-03"
     },
     {
       "id": "ADC_W_B_W_GT_0",
@@ -74,15 +77,16 @@
     {
       "id": "CB_FAMILY_BROKEN",
       "opcode_pattern": "CB xx",
-      "title": "TLCS-900 CB-prefix byte ALU (C-source) broken on NGPC silicon",
+      "title": "TLCS-900 CB-prefix byte arith/logic ALU (C-source) broken on NGPC silicon — SUB-OP-SPECIFIC (byte mul/div safe)",
       "category": "cpu_silicon",
       "severity": "crash",
       "symptoms": [
         "Infinite loop / hang"
       ],
       "affected_instructions": [
-        "add A,C  (CB 81) — confirmed",
-        "Likely: any byte-ALU op with prefix 0xCB (= R8[3] = C as source register)"
+        "add A,C  (CB 81) — confirmed HW crash",
+        "C-source byte arith/logic ALU sub-ops (add/adc/sub/sbc/and/xor/or, 0x80..0xFF range) — broken by inference from CB 81",
+        "SAFE (NOT broken): C-source byte mul/muls/div/divs, reg-reg pocket CB sub-op 0x40..0x5F, e.g. `CB 51 = div A,C` — HW-cleared 2026-07-08 (hw_test_bytediv)"
       ],
       "fixes": [
         {
@@ -90,17 +94,18 @@
           "replacement": "add A,L (CF 81) — routes through HL (R8[7] = L)"
         },
         {
-          "op": "any CB-prefixed byte ALU",
+          "op": "CB-prefixed byte arith/logic ALU (sub-op 0x80..0xFF)",
           "replacement": "Use CF prefix (L source) instead of CB (C source)"
         }
       ],
       "notes": [
-        "Only `CB 81` is hardware-validated; the broader CB family is by inference.",
+        "SUB-OP-SPECIFIC: the CB (C-source) byte family is NOT broken as a whole. `CB 81 = add A,C` is a hardware-validated crash, but byte mul/muls/div/divs (CB reg-reg sub-op 0x40..0x5F) execute correctly on real NGPC — hw_test_bytediv 2026-07-08: `div A,C` (CB 51) with WA=0x1F64/C=0x64 -> WA=0x2450 (quotient 0x50, remainder 0x24). Parallels the WORD mul/div clearing (D8..DF, hw_test_muldiv 2026-07-06).",
+        "Only `CB 81` (and the arith/logic ALU sub-ops by inference) is broken; byte mul/div is confirmed safe and must NOT be flagged.",
         "Other byte-ALU prefixes (C8 W-source, C9 A-source, CA B-source, CC D-source, CD E-source, CE H-source, CF L-source) are confirmed safe — CC900 production code uses them.",
-        "ngpc_disasm.py flags any 0xCB prefix as `!BROKEN CB family`."
+        "ngpc_disasm.py flags 0xCB arith/logic ALU sub-ops as `!BROKEN`, but no longer flags the byte mul/div pocket (CB 0x40..0x5F)."
       ],
       "validated_on_hw": true,
-      "validation_ref": "bisect_j8z13 (2026-03-22)"
+      "validation_ref": "bisect_j8z13 (2026-03-22); byte mul/div cleared by hw_test_bytediv (2026-07-08)"
     },
     {
       "id": "LINK_XIY_N_GE_5",
