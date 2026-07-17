@@ -65,17 +65,22 @@ ngpc_raster_parallax(GFX_SCR1, layers, 3, camera_x);
 
 ### 1.3 HBlank Timing Constraints
 
-- The HBlank ISR must be **extremely fast** (~5 µs per scanline at 6.144 MHz ≈ 30 cycles).
+- The HBlank ISR must be **extremely fast**: the safe HBlank *write window* is
+  ~5 µs ≈ 30 cycles at 6.144 MHz. (That is the ISR budget, not the scanline period —
+  a full scanline is ~515 cycles / ~84 µs; see §6.2.)
 - Only write 1-2 registers per HBlank.
 - Timer0 is a shared resource — see §6.5 for conflict rules.
 
 ### 1.4 Polled raster (no IRQ) — emulator-robust fallback
 
-**Hardware-tested gotcha:** the Timer-0 HBlank **IRQ does not fire under NeoPop** (its Timer-0/HBlank
-interrupt emulation is incomplete). Even with the ISR installed at the correct vector
-(`HW_INT_TIM0` = `0x6FD4`) and Timer-0 configured, on NeoPop the ISR is never called → per-scanline
-effects silently do nothing (e.g. a pseudo-3D road stays perfectly straight while the frame loop
-otherwise runs fine).
+**Emulator caveat — NeoPop is not a reference.** NeoPop's Timer-0/HBlank interrupt
+emulation does **not** match hardware, and reports go both ways: the IRQ silently
+never firing (a pseudo-3D road stays perfectly straight while the frame loop runs
+fine), *and* firing **without** the BIOS `INTLVSET` that real hardware requires
+(§6.5b) — so a split that works in NeoPop can be dead on cartridge. Either way, do
+not trust NeoPop to reproduce Timer-0 raster behaviour; validate on real hardware or
+a cycle-accurate emulator. For emulator-only prototyping of the per-scanline *look*,
+drive it by polling the beam instead of by interrupt:
 
 **Fallback that works on any emulator that updates `RAS.V` (0x8009):** drive the per-scanline writes
 by **polling the beam position** from the main loop instead of from an ISR — no Timer-0, no vector:
@@ -310,18 +315,26 @@ the delta to the next split.
 | Precision | ±1 scanline | Per-scanline |
 | Max splits/frame | 8 (`RCHAIN_MAX_SPLITS`) | 152 (one per scanline) |
 
-### 6.2 Timer0 Sub-Scanline Values
+### 6.2 What TREG0 counts — HBlanks, not CPU cycles
 
-At 6.144 MHz, 1 scanline ≈ 6.5 µs ≈ 40 cycles. Some platformers perform **sub-scanline splits**
-(TREG0 < 40 = less than one full line). The TREG0 value = CPU cycles before the next IRQ.
+**With the clock source these modules use — `T01MOD` bits 1-0 = `00` = TI0 (the
+K2GE H-int) — `TREG0` counts HBlanks (scanlines): one tick per visible line.**
+`TREG0 = 1` fires every line; `TREG0 = 136` fires 136 lines after the arm point.
+This is the official Toshiba pattern (SDK `8Bit.txt`, *"H-int Setting"*: *"generates
+H-int every line; if it is to be generated every 4 lines, set TREG0 to 0x04"*).
 
-Values proven by reverse engineering of a commercial platformer:
+A full scanline lasts **~515 CPU cycles (~84 µs)** at 6.144 MHz — silicon-measured
+(515 cyc/line × 199 lines/frame ≈ 102 485 cyc/frame ≈ 59.95 Hz). Do **not** confuse
+this with the ~30-cycle HBlank *write window* (§1.3): 515 cycles is how long a line
+lasts; ~30 cycles is only how much of it is safe to spend inside the ISR.
 
-| TREG0 | Cycles | Duration |
-|-------|--------|----------|
-| `0x18` (24) | 24 | ~3.9 µs |
-| `0x39` (57) | 57 | ~9.3 µs |
-| `0x41` (65) | 65 | ~10.6 µs |
+> **On "sub-scanline" splits.** To fire faster than once per line you must switch
+> `T01MOD` off TI0 onto a *prescaled internal CPU clock* (φ/T1, T4 or T16) — a
+> different configuration from the one `ngpc_raster`/`ngpc_raster_chain` program.
+> Note the finest available step is φ/T1 = **128 CPU cycles ≈ 20.8 µs per tick**, so
+> genuine single-microsecond intervals are not reachable on NGPC. An earlier
+> "TREG0 = CPU-cycle" table here (24→3.9 µs, etc.) implied 1 tick = 1 CPU cycle,
+> which no Timer0 clock source produces; it was unverified and has been removed.
 
 ### 6.3 API
 
@@ -336,8 +349,8 @@ void ngpc_rchain_disarm(void);                             /* Stop Timer0 */
 ```c
 typedef struct {
     u8 line;    /* Scanline where this split takes effect */
-    s16 scr1x, scr1y;
-    s16 scr2x, scr2y;
+    u8 scr1x, scr1y;   /* SCR1 X/Y scroll offset written at this split */
+    u8 scr2x, scr2y;   /* SCR2 X/Y scroll offset */
 } RChainSplit;
 ```
 
@@ -412,6 +425,23 @@ HW_TRUN    |= 0x01u;          /* start Timer0                     */
   any custom Timer0/HBlank handler, not just raster.
 - For a single-band HUD split you normally do **not** want `TREG0 = 1` (every line) —
   see §6.6, which sets `TREG0` to the split scanline and fires the ISR once per frame.
+
+**Table vs `SWI 1` — same mechanism, not a contradiction.** `BIOS_INTLVSET` is listed
+in [BIOS.md](../01_Hardware/BIOS.md) as a "Table `0xFFFE00`" call. That is the same
+thing: `swi 1` *is* the table dispatcher — it computes `pc = [0xFFFE00 + rw3*4]`, so
+loading `rw3 = 4` reaches the identical INTLVSET routine. Use the `swi 1` form above.
+
+**This is not guesswork.** The register convention (`rw3 = 4`, `rb3 = level`,
+`rc3 = 2` = Timer0) is the official Toshiba SDK sequence (`8Bit.txt`, "H-int Setting")
+and is confirmed on real cartridges — e.g. Fatal Fury enables its H-blank IRQ at boot
+with exactly this `INTLVSET` call. As of the current template, `ngpc_raster_init()`
+and `ngpc_rchain_init()` perform this `swi 1` for you (validated on hardware).
+
+**Does the TI0/HBlank clock tick during VBlank?** No. The K2GE emits 152 H-int pulses
+per frame — one per visible line, plus a single pulse just before line 0 — and is
+silent across vertical blanking. So a `TREG0 = N` armed anywhere in VBlank still fires
+N lines into the *next* visible frame; the fire line does not drift with where in
+VBlank you arm (which is why the §6.6 `TREG0 = 136` recipe is robust).
 
 ### 6.6 Performance: Per-Scanline Cost and the One-Split HUD Pattern (HW-Validated)
 
@@ -823,11 +853,13 @@ for y in range(VP_Y, H):
     draw_road_span(y, VP_X - hw, VP_X + hw)
 ```
 
-**2. NeoPop does not fire the Timer-0 HBlank IRQ → use polled raster.** With the ISR installed at the
-correct vector (`HW_INT_TIM0` = `0x6FD4`) and Timer-0 configured, NeoPop still never calls it (its
-Timer-0/HBlank interrupt emulation is incomplete). The per-scanline table is then never applied — the
-road stays straight while the rest of the frame loop runs fine. Fix: drive the writes by polling
-`RAS.V` from the main loop (no IRQ) — see §1.4. Do **not** call `ngpc_raster_init()` in that mode.
+**2. In this NeoPop build the Timer-0 HBlank IRQ never fired → use polled raster.** With the ISR
+installed at the correct vector (`HW_INT_TIM0` = `0x6FD4`) and Timer-0 configured, this NeoPop build
+never called it, so the per-scanline table was never applied — the road stayed straight while the
+rest of the frame loop ran fine. (NeoPop is **not** a reference: its Timer-0/HBlank emulation is
+unreliable and other builds have been seen to fire the IRQ *without* the BIOS `INTLVSET` hardware
+requires — see §1.4 / §6.5b.) For emulator-only prototyping, drive the writes by polling `RAS.V` from
+the main loop (no IRQ) — see §1.4. Do **not** call `ngpc_raster_init()` in that mode.
 For a shipping build, use the Timer-0 IRQ or MicroDMA path and validate on a faithful emulator
 (Mednafen) / hardware (open question: does the IRQ path work on Mednafen?).
 
