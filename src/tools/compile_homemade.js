@@ -71,7 +71,7 @@ function summarizeStage(stage, r) {
 export const definition = {
   name: "ngpc_compile_homemade",
   description:
-    "Compile NGPC sources with the HOMEMADE NgpCraft toolchain (t900cc + t900as + t900ld + ngpc_romtool — the Python pipeline at NgpCraft_toolchain/tools/). Counterpart to ngpc_compile_official: no .exe dependency, no Makefile required. Provide one or more .c/.asm source files and a linker script (.lcf); the tool runs each stage and returns the produced ROM. Reports a per-stage build log (cc → as → ld → romtool).",
+    "⚠️ EXPERIMENTAL AND UNSTABLE — NOT A PRODUCTION COMPILER. This is a clean-room toolchain still under construction: it exists so a reader can SEE how a TLCS-900 C compiler, assembler and linker work end to end, not to build a ROM you intend to ship or flash. Expect mis-compiles, unimplemented constructs and silent wrong codegen. Never present its output as a working build, and never tell a user their code is broken because this rejected it. For a ROM that must actually run, use ngpc_compile_official (the Toshiba cc900/asm900/tulink chain). Compile NGPC sources with the HOMEMADE NgpCraft toolchain (t900cc + t900as + t900ld + ngpc_romtool — the Python pipeline at NgpCraft_toolchain/tools/). Counterpart to ngpc_compile_official: no .exe dependency, no Makefile required. Provide one or more .c/.asm source files and a linker script (.lcf); the tool runs each stage and returns the produced ROM. Reports a per-stage build log (cc → as → ld → romtool).",
   inputSchema: {
     type: "object",
     properties: {

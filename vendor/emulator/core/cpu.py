@@ -56,6 +56,22 @@ class StatusFlags:
 
 
 @dataclass(frozen=True)
+class Tlcs900ControlRegisters:
+    """Modeled TLCS-900/H control-register file subset.
+
+    The current emulator only needs the architecturally visible register file
+    shape so `LDC` can move values honestly between general registers and the
+    CPU control-register namespace. Unknown values remain `None`.
+    """
+
+    dmas: tuple[int | None, ...]
+    dmad: tuple[int | None, ...]
+    dmac: tuple[int | None, ...]
+    dmam: tuple[int | None, ...]
+    intnest: int | None
+
+
+@dataclass(frozen=True)
 class NgpcCpuState:
     """Current modeled CPU state.
 
@@ -80,6 +96,19 @@ class NgpcCpuState:
     iff_level: int | None = None
     rfp: int | None = None
     register_banks: tuple[BankedByteRegisters, ...] | None = None
+    alt_flags: StatusFlags | None = None
+    control_registers: Tlcs900ControlRegisters | None = None
+
+
+def create_unknown_control_registers() -> Tlcs900ControlRegisters:
+    """Return the current unknown TLCS-900/H control-register file shape."""
+    return Tlcs900ControlRegisters(
+        dmas=(None, None, None, None),
+        dmad=(None, None, None, None),
+        dmac=(None, None, None, None),
+        dmam=(None, None, None, None),
+        intnest=None,
+    )
 
 
 def create_bootstrap_cpu_state(entry_point: int) -> NgpcCpuState:
@@ -106,6 +135,8 @@ def create_bootstrap_cpu_state(entry_point: int) -> NgpcCpuState:
             "flags and active register bank remain unknown until verified."
         ),
         register_banks=None,
+        alt_flags=StatusFlags(sf=None, zf=None, vf=None, hf=None, cf=None, nf=None),
+        control_registers=create_unknown_control_registers(),
     )
 
 
@@ -133,6 +164,45 @@ SR_BIT_MAX = 11
 SR_BIT_IFF_SHIFT = 12
 SR_BIT_IFF_MASK = 0b111 << SR_BIT_IFF_SHIFT
 SR_BIT_SYSM = 15
+
+
+def encode_f_from_flags(flags: StatusFlags) -> int | None:
+    """Encode the low 8-bit F register from the modeled flag subset."""
+    if (
+        flags.cf is None
+        or flags.nf is None
+        or flags.vf is None
+        or flags.hf is None
+        or flags.zf is None
+        or flags.sf is None
+    ):
+        return None
+    value = 0
+    if flags.cf:
+        value |= 1 << SR_BIT_CF
+    if flags.nf:
+        value |= 1 << SR_BIT_NF
+    if flags.vf:
+        value |= 1 << SR_BIT_VF
+    if flags.hf:
+        value |= 1 << SR_BIT_HF
+    if flags.zf:
+        value |= 1 << SR_BIT_ZF
+    if flags.sf:
+        value |= 1 << SR_BIT_SF
+    return value & 0xFF
+
+
+def decode_f_to_flags(f_raw: int) -> StatusFlags:
+    """Decode the low 8-bit F register into the modeled flag subset."""
+    return StatusFlags(
+        sf=bool(f_raw & (1 << SR_BIT_SF)),
+        zf=bool(f_raw & (1 << SR_BIT_ZF)),
+        vf=bool(f_raw & (1 << SR_BIT_VF)),
+        hf=bool(f_raw & (1 << SR_BIT_HF)),
+        cf=bool(f_raw & (1 << SR_BIT_CF)),
+        nf=bool(f_raw & (1 << SR_BIT_NF)),
+    )
 
 
 def encode_sr_from_state(state: NgpcCpuState) -> int | None:

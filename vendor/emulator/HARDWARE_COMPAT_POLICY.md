@@ -1,5 +1,102 @@
 # NgpCraft Emulator - Hardware Compatibility Policy
 
+> ## ✅ RÉSOLU HW (2026-07-03) — le préfixe `D8..DF` est **WORD (16-bit)**, pas long
+>
+> **Tranché définitivement sur vraie NGPC.** Le doute ouvert le 2026-07-02 sur
+> la taille de la famille `D8..DF` est clos par un ROM de test flashé
+> (`04_MY_PROJECTS/hw_test_off`, toolchain officielle cc900) sur le hardware
+> de Wilfried :
+>
+> | Test flashé | Octets | Résultat HW | Verdict |
+> |---|---|---|---|
+> | `ld xbc, xwa` | `D8 89` | **AAAA3344** | copie **16-bit** (`ld BC, WA` : BC←WA, high de XBC intact) |
+> | `djnz xbc` | `D9 1C` | **0002FFFF** | décrément **16-bit** (`djnz BC` : BC 0x0000→0xFFFF, high intact) |
+>
+> **Conséquence — erreur systématique corrigée.** Le repo classait `D8..DF`
+> comme le préfixe **long (32-bit)**. C'était faux et jamais vérifié HW. La
+> vérité (ngdis `masker.h` `getzz(0xD8)=1`=word, confirmée par ces 2 mesures) :
+> - `C8..CF` = byte, `D0..D7` = word, **`D8..DF` = word**, **`E8..EF` = long**.
+> - Le repo collapsait `D8..DF` **et** `E8..EF` dans « long » ; le **vrai**
+>   préfixe long est `E8..EF`.
+>
+> **Fix appliqué (décodeur + exécuteur).** `_prefixed_register_info` et
+> `_prefixed_register_execute_info` mappent `D8..DF → word`, `E8..EF → long`.
+> `D8 89` décode `ld BC, WA` (copie word, high préservé) et **s'exécute** ;
+> `D9 1C` décode `djnz BC` (word) et **s'exécute**. La copie `ld` **long**
+> (`E8..EF`) s'exécute aussi (32-bit). Les sous-cas special (mula/mirr/minc/
+> bs1f, largeur figée) sont inchangés. Effet concret : le boot BIOS réel passe
+> de 143 → **189 instructions** (le mauvais alignement long est levé).
+>
+> **`mr_robot`** boote toujours : son `D8 89` est un `ld BC, WA` word valide —
+> cohérent avec le jeu qui tourne sur console.
+>
+> **`D8 8B` (ancien « crash HW » attribué avril/mai) :** sous le décodage
+> correct c'est `ld HL, WA` (word), pas `ld XHL, XWA`. La question de taille est
+> résolue ; si un crash réel existait il portait sur la destination `HL` en
+> word — reste une note-de-côté mineure (jamais reproduite depuis), non
+> bloquante. Voir `core/quirks_db.json` `cpu.d8_df_register_to_register`.
+
+> ## ✅ RÉSOLU HW (2026-07-03) — `D0..D7` est une famille MÉMOIRE word, PAS registre-direct
+>
+> **Tranché sur vraie NGPC** (ROM flashé `04_MY_PROJECTS/hw_test_d0`, v2 sentinelle+canari) :
+>
+> | Test flashé | Résultat HW | Verdict |
+> |---|---|---|
+> | `D0 89` (croyait `ld BC,WA` reg-direct) | store résultat **sauté**, canari OK | `D0` **consomme des octets d'opérande** (mis-aligne), **NE plante PAS** |
+>
+> **Conséquence.** `0xD0..0xD7` n'est **pas** le préfixe registre-direct word
+> (ça c'est `0xD8..0xDF`) — c'est une **famille d'adressage MÉMOIRE word**
+> (parallèle de `0xC0..0xC7` byte). Croisé ngdis : `getmem(0xD0)`→`decode_zz_mem`
+> (mémoire) vs `getmem(0xD8)`→`decode_zz_r` (registre). Ex. `D0 B6 3F 50 00` =
+> `cpw (0xB6), 0x0050`, PAS le 2-octets `sbc IZ, WA`.
+>
+> **Le quirk `cpu.d0_d7_non_immediate` était un MIS-DIAGNOSTIC** (mis-décode, pas
+> silicon-broken) — reframé en v9. Le crash 2026-05-20 (`D0 C8`) = le toolchain a
+> émis `0xD0` pour du word-reg-immédiat, mais `0xD0` est un mode mémoire → octets
+> malformés → crash (mis-encode, pas bug silicium). **Garde conservée** : le
+> toolchain ne doit jamais émettre d'op word-registre avec un préfixe `0xD0..0xD7`.
+>
+> **Fix (pass 155).** Décode+exécute les formes abs8 word (`cpw`, `ldw R16`) ;
+> le re-décodage complet de la famille `D0..D7` reste un chantier en cours.
+
+> ## ⚠️ RÉTRACTATION (2026-07-10) — « niveau VBlank = 6 » était FAUX
+>
+> Un jalon du 2026-07-03 affirmait ici : *« niveau VBlank corrigé 4→6 (le BIOS fait
+> `ei 5; halt`, et TLCS-900 n'accepte que `level > iff`) »*. **Les deux moitiés de
+> ce raisonnement sont fausses**, et c'est un cas d'école à retenir :
+>
+> 1. **La règle de masque était off-by-one.** Le manuel CPU Toshiba TLCS-900/L1
+>    (SR bits 12-14, IFF2:0) dit : `110` = *« enables interrupts with **level 6 or
+>    higher** »*. Donc une IRQ de niveau `L` est acceptée quand **`L >= IFF`**, pas
+>    `L > IFF`.
+> 2. **Le niveau VBlank est 4.** Le SDK officiel SNK (`01_SDK/docs/SysPro.txt`)
+>    l'écrit noir sur blanc : *« It is forbidden to prohibit Vertical Blanking
+>    Interrupt (**Interrupt level 4**) »*.
+>
+> Le « 6 » était une **inférence bâtie sur le bug de gate**. Avec le gate corrigé,
+> la prémisse s'effondre : `ei 5` masque bien un VBlank niveau 4, et le `halt`
+> d'init du BIOS est réveillé par une source **plus prioritaire** (timer / ADC,
+> dont le BIOS programme lui-même le niveau via `VECT_INTLVSET`).
+>
+> **LEÇON DE DOCTRINE : deux sources documentées battent une inférence — surtout
+> une inférence bâtie sur un composant qu'on n'a pas vérifié.** Voir DEVLOG passes
+> 183-184 et `specs/FRAME_TIMING.md` § 3.6.
+
+> ## 📚 SOURCES AUTORITATIVES (acquises 2026-07-10) — à consulter AVANT d'inférer
+>
+> Trois documents constructeur couvrent désormais l'essentiel du matériel. **Ne
+> plus deviner ce qu'ils contiennent :**
+>
+> | Document | Chemin | Couvre |
+> |---|---|---|
+> | **Manuel CPU Toshiba TLCS-900/L1** | `NgpCraft_toolchain/doc t_900/catalog_en_20010831_ALT00146.txt` | SR/IFF, règles de masque, base des vecteurs (0xFFFF00), reset |
+> | **Datasheet Toshiba TMP95C061** | (fournie par Wilfried, PDF) | **Table 3.3(1) = table complète des vecteurs d'interruption**, ADC (ADMOD/ADREG), timers, prescaler |
+> | **SDK officiel SNK** | `01_SDK/docs/` | `SysPro`/`SysWork` (vecteurs RAM, batterie), `8Bit` (timers), `K2GETechRef`, `SerialCom`, `MicroDMA` |
+>
+> ⚠️ **Les TABLES du PDF datasheet sont des IMAGES** → invisibles en conversion
+> texte. Méthode : rendre la page en PNG avec `pymupdf` (`fitz`) puis la **lire**.
+> Pages clés : **11** = Table des interruptions, **148** = ADMOD, **149/150** = ADREG.
+
 ## 1. But
 
 Le projet ne vise pas une machine "idealisee".

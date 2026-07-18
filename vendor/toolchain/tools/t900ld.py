@@ -44,6 +44,7 @@ class ObjSection:
     patches: list          # [{offset, ptype, sym, instr_end}, …]
     source: str            # original .asm filename
     obj_file: str          # .t9obj path
+    align: int = 1         # alignement declare (`section ... align=N`)
     # Filled by linker pass 2
     link_addr: Optional[int] = None  # ROM or RAM address
     ram_addr:  Optional[int] = None  # RAM address (only for f_data dual-map)
@@ -189,9 +190,28 @@ def _apply_patch(data: bytearray, offset: int, ptype: str,
 
     elif ptype in ('ABS8', 'ABS16', 'ABS24', 'ABS32'):
         nbytes = int(ptype[3:]) // 8
+        # ⛔ On TRONQUAIT EN SILENCE. Un symbole en ROM vit à une adresse 24 bits
+        # (0x2xxxxx) : le loger dans un champ ABS16 perd les 16 bits de poids fort
+        # et l'accès part lire la RAM. C'est exactement ce qui rendait la tilemap
+        # du menu vide (écran noir). Une troncature silencieuse est un piège :
+        # on ÉCHOUE, l'émetteur doit choisir le bon mode d'adressage.
+        if target >> (nbytes * 8):
+            raise ValueError(
+                f"{ptype} : l'adresse 0x{target:X} ne tient pas sur {nbytes} octets "
+                f"(mode d'adressage trop court a l'emission)")
         addr = target & ((1 << (nbytes * 8)) - 1)
         for i in range(nbytes):
             data[offset + i] = (addr >> (8 * i)) & 0xFF
+
+    elif ptype == 'HIGH16':          # (symbole >> 16) & 0xFFFF — mot haut d'un far-ptr
+        val = (target >> 16) & 0xFFFF
+        data[offset + 0] = val & 0xFF
+        data[offset + 1] = (val >> 8) & 0xFF
+
+    elif ptype == 'LOW16':           # symbole & 0xFFFF — mot bas d'un far-ptr
+        val = target & 0xFFFF
+        data[offset + 0] = val & 0xFF
+        data[offset + 1] = (val >> 8) & 0xFF
 
     elif ptype == 'LD_R32_SYM':
         # LD XRR, SYMBOL — patch 4 bytes at offset (instruction is 40+R + 4 bytes imm)
@@ -261,6 +281,7 @@ def link(obj_files: list, lcf_path: str, output_bin: str,
                 patches      = sd.get("patches", []),
                 source       = source,
                 obj_file     = obj_path,
+                align        = int(sd.get("align", 1) or 1),
             )
             obj_secs.append(sec)
 
@@ -307,6 +328,17 @@ def link(obj_files: list, lcf_path: str, output_bin: str,
                 # Abs section: use its declared address directly
                 link_addr = sec.org
             else:
+                # ⛔⛔ ON CONCATENAIT LES SECTIONS BOUT A BOUT, SANS ALIGNEMENT (2026-07-14).
+                # tulink ALIGNE la contribution de CHAQUE module sur l'alignement declare
+                # (`f_const section romdata large align=2,2`). Constate sur la ROM
+                # officielle : le `f_const` de `main.asm` finit sur une adresse IMPAIRE,
+                # tulink insere un `ff` avant d'accoler le module suivant.
+                # Sans ca, TOUTES les constantes des modules suivants sont decalees d'un
+                # octet vs la ROM Toshiba -> byte-match impossible.
+                # (Le trou reste a 0xFF : l'image ROM est initialisee a 0xFF.)
+                a = max(1, sec.align)
+                if region.cursor % a:
+                    region.cursor += a - (region.cursor % a)
                 # Relocatable section: assign from region cursor
                 link_addr = region.cursor
 
@@ -433,6 +465,13 @@ def link(obj_files: list, lcf_path: str, output_bin: str,
     linker_symbols["_Bss_SIZE"]     = linker_symbols["_Bss_END"]     - linker_symbols["_Bss_START"]
     linker_symbols["_DataROM_SIZE"] = linker_symbols["_DataROM_END"] - linker_symbols["_DataROM_START"]
 
+    # Alias DOUBLE-underscore : en C ces symboles s'appellent `_Bss_START`… et
+    # l'assembleur préfixe TOUT symbole C d'un `_` → le code référence
+    # `__Bss_START`. On publie les deux orthographes pour lier quelle que soit
+    # la convention du crt0 (tulink fait de même).
+    for _n, _v in list(linker_symbols.items()):
+        linker_symbols.setdefault("_" + _n, _v)
+
     # Full symbol table: linker symbols as base, PUBLIC symbols override
     full_symbols = {**linker_symbols, **global_symbols}
 
@@ -446,18 +485,27 @@ def link(obj_files: list, lcf_path: str, output_bin: str,
 
     for sec in all_sections:
         if sec.link_addr is None:
+            # ⛔ FATAL, plus un simple warning : une section non placée laisse
+            # ses symboles à 0 → `cal 0x000000` et la ROM crashe à la 2e
+            # instruction (kuroi `SYSPATCH`/`VRAMQ_ASM`, sections custom des
+            # .asm écrits main — tulink, lui, les place automatiquement).
+            # Un lien qui échoue est un CADEAU ; une ROM silencieusement
+            # cassée n'en est pas un. → ajouter la règle au .lcf.
             print(
-                f"WARNING: section '{sec.name}' from '{sec.obj_file}' "
-                f"not placed (no matching LCF rule) — skipped",
+                f"ERROR: section '{sec.name}' from '{sec.obj_file}' "
+                f"not placed (no matching LCF rule) — ajoutez une règle .lcf",
                 file=sys.stderr,
             )
-            continue
+            sys.exit(4)
 
         for patch in sec.patches:
             offset    = patch["offset"]
             ptype     = patch["ptype"]
             sym       = patch["sym"]
             instr_end = patch.get("instr_end", 0)  # relative to section start
+            # `_s_slots + 0x6` : l'assembleur transmet le décalage, on l'ajoute à
+            # l'adresse résolue du symbole (les tables/champs indexés en dépendent).
+            addend    = patch.get("addend", 0)
 
             # Absolute address of instruction end (for relative patches)
             instr_end_abs = sec.link_addr + instr_end
@@ -483,7 +531,7 @@ def link(obj_files: list, lcf_path: str, output_bin: str,
             # local abs patches are idempotent (writing the same value).
 
             try:
-                _apply_patch(sec.data, offset, ptype, target, instr_end_abs)
+                _apply_patch(sec.data, offset, ptype, target + addend, instr_end_abs)
             except (ValueError, IndexError) as e:
                 errors.append(
                     f"'{sec.obj_file}':{sec.name}+0x{offset:04x} "

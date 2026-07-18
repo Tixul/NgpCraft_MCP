@@ -16,6 +16,7 @@ from core.savestate import compute_rom_sha256
 
 EVENT_LOG_FORMAT = "ngpc-emu-event-log"
 EVENT_LOG_FORMAT_VERSION = "2026-05-20.v2"
+_POST_STATE_TERMINAL_STATUSES = {"cpu-halted"}
 
 
 def build_event_log_payload(
@@ -73,6 +74,15 @@ def build_event_log_payload(
             memory_bytes=current_memory,
         )
         events.append(_execution_to_event(index=index, execution=execution))
+
+        if execution.status in _POST_STATE_TERMINAL_STATUSES:
+            assert execution.after_cpu is not None
+            assert execution.after_memory is not None
+            current_cpu = execution.after_cpu
+            current_memory = execution.after_memory
+            stop_reason = f"stopped-on-{execution.status}"
+            matched_quirk_on_stop = _known_quirk_to_dict(execution.matched_quirk)
+            break
 
         if execution.status != "executed" or execution.after_cpu is None or execution.after_memory is None:
             stop_reason = f"stopped-on-{execution.status}"

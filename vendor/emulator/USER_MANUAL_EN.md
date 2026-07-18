@@ -3,6 +3,125 @@
 Status:
 - work in progress
 - update this file incrementally as features land
+- current executor follow-ups on 2026-07-02 include:
+  - **`ld r+r` register copies now execute, and `D8..DF` is WORD (16-bit), not
+    long (HW-corrected 2026-07-03).** A flashed test ROM on a real NGPC proved
+    `ld xbc,xwa` (`D8 89`) is `ld BC, WA` (16-bit copy -> `AAAA3344`) and
+    `djnz xbc` (`D9 1C`) is `djnz BC` (16-bit -> `0002FFFF`). The prefixed-size
+    split is `C8..CF`=byte, `D0..D7`=word, `D8..DF`=word, `E8..EF`=long — the
+    genuine long-register prefix is `E8..EF`. Word `ld` copies (`D8..DF`) and
+    long `ld` copies (`E8..EF`) both execute; ALU r+r stays blocked; `D0..D7`
+    copies stay blocked pending their own evidence. See the RÉSOLU banner in
+    `HARDWARE_COMPAT_POLICY.md`.
+  - prefixed register `push/pop r` execution on the safe stack subset
+    (`C8..CF`, plus the word `D8..DF` / long `E8..EF` forms that already pass
+    the silicon-quirk filter)
+  - `C7 <reg> 04/05` byte-slice stack traffic (`push` / `pop`)
+  - prefixed byte `daa r` execution on the safe register-prefix subset
+  - `C7 <reg> 10` byte-slice `daa`, with honest stop when incoming
+    `C/H/N` flags are still unknown
+  - prefixed `paa r` execution on the defined word/long register-prefix
+    forms, with honest stop on byte forms that the local Toshiba table
+    marks undefined
+  - prefixed byte `djnz r, d8` execution on the safe byte register-prefix
+    subset, with honest stop on long forms that the local Toshiba table
+    marks undefined
+  - prefixed `mirr r` execution on the documented word-only special case
+    `D8..DF : 16`, reversing the 16-bit register bit pattern with flags
+    left unchanged
+  - prefixed `bs1f` / `bs1b` execution on the documented word-only
+    special cases `D8..DF : 0E/0F`, writing the found bit index into `A`
+    and stopping honestly when the source word is zero because `A`
+    becomes undefined there in the local Toshiba table
+  - prefixed `mula rr` execution on the documented long-register special
+    case `D8..DF : 19`, reading signed 16-bit words from `(XDE)` and
+    `(XHL)`, adding the product into the selected 32-bit destination,
+    then decrementing `XHL` by `2`
+  - prefixed `minc1/2/4` and `mdec1/2/4` execution on the documented
+    word-only special cases `D8..DF : 38/39/3A/3C/3D/3E`, with decode
+    preserving the encoded imm16 payload (`# - step`) and execution
+    reconstructing/validating the actual modulo window `#`
+  - prefixed byte-register `andcf/orcf/xorcf/ldcf/stcf` execution for the
+    safe `C8..CF` family, with immediate `#4` and dynamic `A & 0x0F`
+    bit-index forms
+  - `C7 <reg> 20..24 / 28..2C` execution as the matching current-bank
+    byte-slice mirrors of that carry-flag family
+  - honest `silicon-undefined` stops for decoded-but-impossible byte-only
+    forms:
+    - prefixed byte `extz/exts`
+    - `C7` byte-slice `unlk/extz/exts`
+  - symbolic decode for the locally verified `ldc` control-register subset:
+    `DMASn`, `DMADn`, `DMACn`, `DMAMn`, `INTNEST`
+  - the CPU state now carries the matching TLCS-900/H control-register file
+    subset with unknown-by-default values:
+    `DMASn`, `DMADn`, `DMACn`, `DMAMn`, `INTNEST`
+  - prefixed `ldc` execution now performs real reads/writes on that subset,
+    with honest `requires-known-control-register` stops when a control-register
+    source has not been modeled yet
+  - the matching `C7` byte-slice `ldc` forms now execute the real byte
+    control-register subset (`DMAMn`), while non-byte control-register targets
+    still stop honestly as `silicon-undefined`
+  - the current IRQ-delivery / `reti` subset now increments/decrements
+    `INTNEST` when that counter is already known
+  - the UI/session BIOS hand-off layer now also seeds `INTNEST = 0`
+    as a hand-off invariant; raw bootstrap CPU state still leaves the
+    control-register file unknown by default
+  - `cpu-info` and `registers` now expose the modeled TLCS-900/H
+    control-register file subset in both human and JSON output
+  - `--seed-reg` now accepts that modeled TLCS-900/H control-register
+    subset too, both on direct CLI runs and through the engine bridge
+  - the executor-facing CLI now also exposes `--seed-bios-handoff-minimal`
+    so batch runs can mirror the current UI/session BIOS hand-off layer
+    (`XSP=0x00006C00`, `INTNEST=0`)
+  - the engine bridge now mirrors that idea through
+    `runtime.seed_presets = ["bios-handoff-minimal"]`, applied before
+    explicit `runtime.seed_registers` / `runtime.seed_xsp`
+  - real Toshiba timing for that stack subset:
+    - prefixed `push r` = byte `4`, word `4`, long `6`
+    - prefixed `pop r` = byte `5`, word `5`, long `7`
+    - `C7 <reg> 04/05` = `4` / `5`
+  - real Toshiba timing for `daa`:
+    - prefixed byte `daa r` = `4`
+    - `C7 <reg> 10` = `4`
+  - real Toshiba timing for `paa`:
+    - prefixed word/long `paa r` = `4`
+  - real Toshiba timing for `djnz`:
+    - prefixed byte `djnz r, d8` = `6` if branch taken, `4` otherwise
+  - real Toshiba timing for `mirr`:
+    - prefixed word-only `mirr r` = `3`
+  - real Toshiba timing for `bs1f/bs1b`:
+    - prefixed word-only `bs1f/bs1b` = `2`
+  - real Toshiba timing for `mula`:
+    - prefixed `mula rr` = `19`
+  - real Toshiba timing for `minc/mdec`:
+    - prefixed `minc1/2/4` = `5`
+    - prefixed `mdec1/2/4` = `4`
+  - real Toshiba timing for carry-flag register forms:
+    - prefixed `andcf/orcf/xorcf/ldcf/stcf r` = `3`
+    - `C7 <reg> 20..24 / 28..2C` = `3`
+  - real Toshiba timing for `ldc` control-register transfers:
+    - prefixed `ldc` = `3`
+    - `C7 <reg> 2E/2F` = `3`
+  - pre-decrement simple loads `ld R8/R16/R32, (-R32)`
+  - abs24 indirect calls `call (abs24)` and `call CC, (abs24)`
+  - abs24 byte memory-immediate ALU `add/adc/sub/sbc/and/xor/or/cp (abs24), imm8`
+  - abs8 B0-memory stores `ld/ldw (abs8), #imm` and `ld[w] (abs8), (abs16)`
+  - abs24 word-memory follow-up `cp R16, (abs24)` and `pushw (abs24)`
+  - prefixed WORD register r+r `mul/muls/div/divs` execute for `D8..DF 0x40..0x5F`
+    (HW-cleared 2026-07-06, `hw_test_muldiv`: `div WA, BC` / `D9 50` runs and is
+    correct — this pocket now executes; only shift-by-A `0xF8..0xFF` and the
+    `0xB8..0xBF` gap remain silicon-broken)
+  - `opcode-coverage` now reports immediate post-`silicon-broken`
+    fallout bytes separately from true unknown opcodes
+  - first non-repeat word block-memory execution now lands too:
+    `LDI/LDD` on the documented implicit pointer pairs and `CPI/CPD`
+    as `WA` versus `(R32+/-)`, with honest `XBC` alias blocking still
+    preserved
+  - the repeat block-memory forms `LDIR/LDDR/CPIR/CPDR` now execute too:
+    `LDIR/LDDR` copy `BC` items until `BC == 0`; `CPIR/CPDR` compare until
+    a match (`Z=1`) or `BC == 0`. The whole repeat is atomic — if a needed
+    memory access is missing before the honest stopping point, it blocks
+    with `runtime-memory-unavailable` and mutates nothing
 
 ## 1. Overview
 
@@ -226,9 +345,16 @@ python ngpc_emu.py eventlog golden-delete <rom> <name>
 
 ### 4.1 Savestate status
 
-- The savestate v1 format is specified in `specs/SAVESTATE.md` and
-  carries CPU state, writable memory overlay, ROM identity hash and
-  quirk-database version.
+- The current savestate format is **v5** (`2026-07-01.v5`), specified
+  in `specs/SAVESTATE.md`.
+- It carries CPU state, writable memory overlay, ROM identity hash,
+  quirk-database version, frame/scanline state, IRQ pending state, and
+  the alternate flag register set (`cpu.alt_flags`, the TLCS-900/H
+  shadow `F'` flags), plus the modeled TLCS-900/H control-register
+  file subset (`cpu.control_registers`).
+- The loader keeps backward compatibility for `v4` / `v3` / `v2` savestates;
+  missing newer fields default to the documented reset/unknown state
+  instead of being fabricated.
 - Savestates are strictly separate from cartridge persistent saves; a
   savestate loader must never overwrite a cart save file.
 
@@ -387,6 +513,61 @@ The target product includes:
 
 All three should rely on the same emulation core.
 
+### 5.0a The modern front-end (`ngpc_shell.py`) — recommended
+
+    python ngpc_shell.py                 # open the game library
+    python ngpc_shell.py "<rom>.ngc"     # boot straight into a game
+
+A clean, dark, PPSSPP-shaped shell over the fast native core — the everyday way
+to play:
+
+- **Library** — game covers with live thumbnails (rendered once and cached under
+  `thumbnails/`). Three views from the header — **Grid**, **List** (small cover +
+  name), **Compact** (names only) — plus a **cover-size** slider. Click a game to
+  play; "Open ROM…" and "Choose ROM folder…" set what shows up. It defaults to the
+  local `jeux officiel` folder. Thumbnails pick the richest of several sampled
+  frames, so titles show instead of a boot logo or a fade — mono games show their
+  black-and-white title (white is normal for mono), not a black square.
+- **Console boot (experimental)** — Settings → General can play the Neo Geo
+  Pocket's own BIOS power-on before the game. ⚠ It is off by default: the console
+  clock (RTC) and coin-cell battery are not fully emulated yet, so the BIOS loops
+  on "SUB BATTERY DEAD" and does not reach the game. Until that lands, games boot
+  by **hand-off** (instant, no BIOS). Use "Boot BIOS" to see the BIOS by itself.
+- **Boot BIOS** — the header's "Boot BIOS" button starts the BIOS with **no
+  cartridge**, showing the console's own screen (language / clock) — one of the
+  NGPC's signature features. Needs a BIOS image.
+- **Settings** — categorized like a real emulator: **General** (language EN/FR,
+  BIOS image, console boot), **Graphics** (window scale, smoothing, scanline
+  overlay), **Audio** (enable, volume), **Controls** (rebind each of the seven
+  buttons — click it, then press a key). Everything persists.
+- **In game** — `P` pauses, `F5` reboots (the save survives), `Esc` returns to
+  the library. Controls come from your Settings bindings.
+
+The older `ngpc_emu_ui_qt.py` is the register-level DEBUGGER (breakpoints,
+watchpoints, memory/disasm/palette inspectors on the Python reference core) and
+is kept for that work; `ngpc_shell.py` is the player.
+
+### 5.0 The player (`scripts/play.py`)
+
+Play a game at full speed on the native core, with sound and a keyboard:
+
+    python scripts/play.py "<rom>.ngc" --bios "<bios>.bin"
+
+Keys: arrows = D-pad, `X` = A, `C` = B, Enter = OPTION, `P` = pause,
+`S` = screenshot, `R` = reboot (like the POWER switch: saves survive),
+Esc = quit.
+
+**`G` = glitch capture.** The player keeps a rolling buffer of the last
+`--glitch-ring` frames (default 90; `--glitch-ring 1200` is 20 seconds).
+Press `G` the moment you see a graphical bug: it writes every buffered frame
+as PNG plus the machine state at that instant (VRAM `0x8000..0xBFFF`, the
+per-scanline raster log, and one raster log per buffered frame as
+`raster_ring.npy`) into `audio_out/<rom>_glitch_NN/`. Decode a dump with
+`python scripts/analyze_glitch_state.py <dump folder>` — it prints the
+per-scanline scroll table, the tilemap tiles the affected band samples, and
+whether the raster split line jitters across frames. This is how the Metal
+Slug HUD flicker was captured, diagnosed and fixed (DEVLOG 2026-07-16).
+
 ### 5.1 Engine integration contract status
 
 - The first engine/emulator contract is now specified in
@@ -430,11 +611,13 @@ Whenever a user-visible feature lands, document:
 
 ## 8. Current State
 
-Snapshot 2026-05-21 — **744 tests passed, 0 skipped**.
+Snapshot 2026-05-25 — **897 tests passed, 0 skipped**.
 
 The emulator is no longer "minimal": M0 + M1a + M1c + M1d are closed,
-M1b SR is at Phase 2 partial (PUSH/POP SR opcodes wired), and M2 is
-**fully feature-complete for K2GE color mode**: Phase 0 inspectors,
+M1b SR is now at **Phase 3.1 delivered** (`PUSH/POP SR`, `LDF`,
+`EX F,F'`, shadow `F'` persistence, and visible `XWA/XBC/XDE/XHL`
+reload when `RFP` changes through `LDF` / `POP SR` / `RETI`), and M2 is **fully feature-complete for K2GE color
+mode**: Phase 0 inspectors,
 Phase 0.5 single-tile rasterizer, and a Phase 1.3 full-compose
 framebuffer renderer (backdrop + SCR1/SCR2 + sprites with PR.C
 4-level composition + chain + global PO offset + window clip with
@@ -447,7 +630,9 @@ ROM / bootstrap:
 - `python ngpc_emu.py info <rom>` — ROM header summary
 - `python ngpc_emu.py reset-info <rom>` — bootstrap machine state
 - `python ngpc_emu.py addr-info <rom> <addr>` — qualify one address
-- `python ngpc_emu.py cpu-info <rom>` — minimal CPU container
+- `python ngpc_emu.py cpu-info <rom>` — minimal CPU container, now
+  including both visible flags and the shadow `F'` flag set in human
+  and JSON output
 
 Memory access:
 - `python ngpc_emu.py peek <rom> <addr> [--count N]` — read bytes via the bus
@@ -494,7 +679,7 @@ Symbols:
 - `python ngpc_emu.py map info <map>` / `map lookup-name <map> <name>` / `map lookup-addr <map> <addr>`
 
 Debugger (M4 P0):
-- `python ngpc_emu.py registers <rom> [--seed-from state.json] [--json]` — rich CPU view
+- `python ngpc_emu.py registers <rom> [--seed-from state.json] [--json]` — rich CPU view, including visible `Flags` and shadow `Flags'`
 - `python ngpc_emu.py breakpoint add <rom> <addr> [--label] [--json]`
 - `python ngpc_emu.py breakpoint add-symbol <rom> <name> --map <map> [--label] [--json]`
 - `python ngpc_emu.py breakpoint list|remove|clear|check <rom> [...]`
@@ -539,17 +724,18 @@ M3 Phase 3.1 — RAS.V + BLNK live everywhere `--seed-from` flows (passes 35-36)
   stepped through by seeding at scanline ≥ 152.
 
 M3 Phase 3.2.0 + 3.2.1 — frame_state advances during CPU exec (pass 37):
-- Every CPU instruction now counts a flat ~8 cycles (placeholder),
-  rolling up to a scanline every ~64 instructions
-  (`CYCLES_PER_SCANLINE = 517`). The executor chain emits output
-  savestates whose `frame_state` reflects `seed.frame_state +
-  (executed_count × 8 / 517) scanlines`. Active for `step-exec`,
+- Unpopulated instructions still count a flat ~8 cycles (fallback),
+  but the common control-flow / CPU-control subset now uses real
+  Toshiba timing (`NOP=2`, `RETI=12`, etc.). The executor chain emits
+  output savestates whose `frame_state` reflects the accumulated
+  `total_cycles_consumed`. For pure NOP streams this means roughly one
+  scanline every ~259 instructions instead of ~64. Active for `step-exec`,
   `run-steps`, `trace-exec`, `run-until-exec`, plus
   `savestate save --run-until`, `checkpoint save --run-until`,
-  `session save --run-until`. The flat estimate is documented as a
-  non-reference-mode divergence in `HARDWARE_COMPAT_POLICY.md § 4.3`
-  — Phase 3.2.3 replaces it with the proper TLCS-900 per-opcode
-  cycle table.
+  `session save --run-until`. The shared fallback estimate remains
+  documented as a non-reference-mode divergence in
+  `HARDWARE_COMPAT_POLICY.md § 4.3` until the remaining opcode rows are
+  populated.
 
 UI — PyQt6 debugger shell with floating inspector windows (passes 41-46):
 - **Launch**: `python ngpc_emu.py ui` opens the PyQt6 window. Pass
@@ -569,6 +755,11 @@ UI — PyQt6 debugger shell with floating inspector windows (passes 41-46):
   - --- separator ---
   - Load Symbol Map…    (pass 45)    — loads a t900ld .map file
   - --- separator ---
+  - Load Breakpoints    (pass 81)    — loads the ROM-local breakpoint registry
+  - Save Breakpoints    (pass 81)    — writes the live BP set back to that registry
+  - Load Watchpoints    (pass 81)    — loads the ROM-local watchpoint registry
+  - Save Watchpoints    (pass 81)    — writes the live WP set back to that registry
+  - --- separator ---
   - Quit                Ctrl+Q
   When no ROM is loaded, the LCD shows "(no ROM loaded)", the
   registers panel is "—", the disasm + memory panels show
@@ -583,12 +774,18 @@ UI — PyQt6 debugger shell with floating inspector windows (passes 41-46):
     when a `.map` is loaded.
   - `Add` button (Enter also works) / `@PC` button to add a BP
     at the current PC.
+  - Pass 81: rows now show a stable breakpoint id (`#N`) so two
+    breakpoints on the same PC remain distinguishable after loading
+    the ROM-local JSON registry.
   - List sorted by address ; double-click a row to remove ;
     `Remove` / `Clear` action buttons.
   - Disasm lines that match a BP are prefixed with `●`.
   - During continuous Run, the loop pauses automatically on BP
     hit (status bar shows `last: breakpoint-hit`). Press `Step`
     once to leave the BP before resuming.
+  - `Load Breakpoints` / `Save Breakpoints` reuse the existing
+    ROM-local registry path:
+    - `.ngpc_emu/breakpoints/<rom>.breakpoints.json`
 - **Watchpoints panel** (pass 47) — independent floating window :
   - Address input (hex / decimal / symbol name).
   - Kind dropdown : write / read / access.
@@ -601,9 +798,30 @@ UI — PyQt6 debugger shell with floating inspector windows (passes 41-46):
   - During Run / Step / Step Frame, the loop pauses on the first
     matching memory access (write or read per kind). Status bar
     surfaces the hit : `watch: write 0x00000010=[AB]`.
+  - `Load Watchpoints` / `Save Watchpoints` reuse the existing
+    ROM-local registry path:
+    - `.ngpc_emu/watchpoints/<rom>.watchpoints.json`
+- **K2GE inspector windows** (pass 78) â€” four extra floating
+  debugger windows built on top of the existing core K2GE
+  inspectors :
+  - `K2GE Video` : live control-register summary (mode, BGC,
+    NEG/OOWC, window origin/size, sprite global offset, scroll
+    priority, SCR1/SCR2 scroll offsets).
+  - `K2GE Palettes` : plane selector (`all`, `sprite`, `scr1`,
+    `scr2`, `background`, `window`) with the same decoded color
+    rows as `palette-info`.
+  - `K2GE OAM` : `visible only` / `all` filter with one line per
+    sprite (tile, position, priority code, palette, flip / chain
+    flags), mirroring `oam-info`.
+  - `K2GE Tilemaps` : `scr1` / `scr2` selector plus `grid`,
+    `list non-empty`, `list all` views, mirroring
+    `tilemap-info`.
+  - These windows refresh from the live session state on every UI
+    action ; no external CLI round-trip is needed while debugging.
 - **Floating inspector windows** (pass 46-47, updated pass 52) —
-  classic IDE / MAME-debugger layout. The 5 inspector panels (CPU
-  Registers, Disassembly, Memory, Breakpoints, Watchpoints) are
+  classic IDE / MAME-debugger layout. The 9 inspector panels (CPU
+  Registers, Disassembly, Memory, Breakpoints, Watchpoints,
+  K2GE Video, K2GE Palettes, K2GE OAM, K2GE Tilemaps) are
   independent floating windows, **hidden by default** (pass 52)
   so the main window stays uncluttered ; open each on demand via
   View → <name>. The main window contains only the LCD game view +
@@ -614,10 +832,21 @@ UI — PyQt6 debugger shell with floating inspector windows (passes 41-46):
   dialogs open at the same folder. Persisted via QSettings under
   `%APPDATA%/NgpCraft/Emulator.ini` (Windows) or the platform
   equivalent.
+- **Window-layout persistence** (pass 82) — the debugger now also
+  remembers the main-window geometry and dock layout between
+  launches through the same `QSettings` scope:
+  - first launch without saved state keeps the pass-52 behavior
+    (inspectors hidden by default, default floating arrangement)
+  - later launches restore the last saved geometry / visibility /
+    dock state instead of reapplying the default arrangement
+  - `View -> Reset Window Layout` clears the saved layout,
+    re-shows every inspector, re-floats them, and reapplies the
+    default arrangement
 - **View menu** (pass 46) next to File :
   - One checkable entry per inspector (CPU Registers,
-    Disassembly, Memory, Breakpoints). Closing a window via [X]
-    auto-unchecks the entry ; clicking the entry toggles it back.
+    Disassembly, Memory, Breakpoints, Watchpoints, K2GE Video,
+    K2GE Palettes, K2GE OAM, K2GE Tilemaps). Closing a window via
+    [X] auto-unchecks the entry ; clicking the entry toggles it back.
   - Show All Inspector Windows / Hide All Inspector Windows
     convenience actions.
   - Reset Window Layout — re-shows all inspectors and re-arranges
@@ -630,6 +859,12 @@ UI — PyQt6 debugger shell with floating inspector windows (passes 41-46):
   `QImage.fromData(ppm, "PPM")` consumes the renderer's P6 PPM
   bytes directly ; scaled with nearest-neighbour
   (`FastTransformation`) so pixel-art stays crisp.
+- **External BIOS in live UI** (pass 92) : File → Load BIOS Image /
+  Clear BIOS Image lets the stateful session consume the same 64 KB
+  external BIOS image as the CLI `--bios` commands. This matters for
+  ROMs that early-read `0xFF0000..0xFFFFFF`: without it, the UI can
+  stop on `runtime-memory-unavailable` before VRAM/tiles are populated.
+  The status bar surfaces `bios=<name|none>`.
 - **CPU registers panel** : PC, XSP, 7 R32 (XWA/XBC/XDE/XHL/XIX/XIY/XIZ),
   iff_level, rfp, flags (SZVHCN — uppercase = bit set, lowercase =
   bit clear, `·` = unknown).
@@ -652,19 +887,36 @@ UI — PyQt6 debugger shell with floating inspector windows (passes 41-46):
   the read bus, matching what the executor sees ; unbacked bytes
   render as `??` / `.`.
 - **File menu** : Open ROM, Load Savestate, Save Savestate, Quit.
+- **Keyboard -> joypad mapping** (pass 79) : arrows -> D-pad,
+  `Z` -> A, `X` -> B, `Enter` / keypad Enter -> Option. The UI
+  writes the documented active-high `0x6F82` joypad byte through
+  the session overlay, ignores host auto-repeat, and does not
+  capture text-oriented widgets while you are typing in debugger
+  fields.
+- **Disassembly go-to navigation** (pass 80) : the Disassembly dock
+  now accepts an explicit address or symbol anchor through its
+  `Go to:` field. `Go` re-anchors the listing without changing CPU
+  state, and `@PC` returns to the live PC-follow view. The same
+  parser is reused as Breakpoints / Watchpoints, so the field
+  accepts `0x...`, decimal, or a loaded symbol name.
 - **Status bar** : frame count, scanline, visible/VBLANK indicator,
-  IRQ pending mask, accumulated cycles, last stop reason +
+  IRQ pending mask, accumulated cycles, current joypad state
+  (`pad=none`, `pad=Up+A`, ...), current disassembly anchor
+  (`disasm=@PC` or `disasm=0x...`), last stop reason +
   exec/IRQ-delivery counters.
 - `EmulatorSession` (core/, tech-neutral) auto-folds VBlank pending
   when a step's cycle-driven advance crosses scanline 152 → the
   next step delivers the IRQ through the executor's
   `try_deliver_pending_irq` path. Real-HW loop closes
   interactively. Cycle residue is tracked across small batches,
-  so 65 single-Step clicks correctly advance one scanline.
+  so repeated single-Step clicks still advance scanlines even when
+  the current opcode is cheaper than the fallback model (`NOP = 2`
+  now takes about 259 clicks to cross one scanline).
 
 M3 Phase 3.2.3a — per-instruction cycle accounting infrastructure (pass 40):
 - Every `ExecutionResult` carries a `cycles_consumed` field (default
-  `ESTIMATED_CYCLES_PER_INSTRUCTION = 8` — the flat placeholder).
+  `ESTIMATED_CYCLES_PER_INSTRUCTION = 8` — the shared fallback for
+  unpopulated opcodes).
   `IrqDeliveryResult.cycles_consumed = IRQ_DELIVERY_CYCLES = 13`
   on successful delivery (Toshiba TLCS-900/H IRQ entry cost).
 - Run results (`RunStepsResult`, `RunUntilResult`,
@@ -675,11 +927,45 @@ M3 Phase 3.2.3a — per-instruction cycle accounting infrastructure (pass 40):
   that deliver an IRQ correctly advance `frame_state` by the IRQ's
   13-cycle entry cost (the prior `executed_count × 8` math missed
   this).
-- This is **architectural prep work** for Phase 3.2.3b (populate
-  per-opcode cycle counts from the Toshiba spec table). The
-  user-visible change today is small ; the value is that 3.2.3b
-  becomes a per-opcode default-value change rather than a
-  CLI-surface rewire.
+- Phase 3.2.3b has now started: the executor already overrides the
+  fallback with real Toshiba timing for the common control-flow /
+  CPU-control subset (`NOP`, `RETI`, `JP/JR/JRL`, `CALL/RET`, `EI/DI`,
+  `LDF`, `LINK/UNLK`, `SWI`, `PUSH/POP SR`). The next stack slice is
+  also wired now: `PUSHW #16`, `PUSH R16`, `PUSH R32`, `POP R16`, and
+  `POP R32`. The currently executed indirect memory forms `jp (XIX+WA)`
+  and `call (XIX)` now also report their real Toshiba timing, as does
+  `EX F,F'`. The register/immediate execution slice now also uses real
+  timing: `LD R,r`, `LD r,R`, `LD r,#3`, `LD R,#`, `LD r,#`, `LDA`,
+  `ADD/ADC/SUB/SBC/AND/XOR/OR/CP`, `INC/DEC #3,r`, `EXTZ`, `EXTS`. The
+  currently executed memory subset now also uses real timing:
+  `LD R,(mem)`, `LD (mem),R`, `LD (mem),#8`, `LDW (mem),#16`, `CP`
+  register/memory forms, and `PUSHW (mem)`. The already executed
+  ALU-memory paths now also use real timing for `ADD/ADC/SUB/SBC/AND/XOR/OR
+  R,(mem)`, `... (mem),R`, byte/word `(mem),#`, `CP (mem),#`, and
+  byte/word `INC/DEC #3,(mem)`. The currently executed memory bit/carry
+  paths now also use real timing for `BIT #3,(mem)`,
+  `LDCF/ANDCF/ORCF/XORCF`, `STCF`, and `RES/SET/CHG/TSET` on memory,
+  and the currently executed memory rotate/shift paths now also use real
+  timing for `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL (mem)`, plus the matching
+  `C7` current-bank byte-slice mirrors. The currently executed byte
+  register bit-op paths now also use real timing for
+  `BIT/RES/SET/CHG/TSET #4,r`. `INCF` and `DECF` are now also executed
+  for real using the same visible-core bank flush/reload path as `LDF`,
+  and they use their real `2`-cycle Toshiba timing. The currently
+  executed prefixed shift-immediate register paths now also use the
+  Toshiba `3 + n/4` cycle formula for `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL
+  #4,r`. The matching prefixed shift-by-A register family
+  `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL A,r` now also executes for real using
+  the low nibble of `A` as the count source and its Toshiba `2`-cycle
+  timing. The matching `C7` current-bank byte-slice mirrors of those
+  shift families now also decode/execute for real and use the same
+  timing rules. Safe prefixed byte `CPL` / `NEG` now also execute for
+  real, as do their `C7` current-bank byte-slice mirrors, using Toshiba
+  `2`-cycle timing. `RL` / `RR` now also execute for real when `CF` is
+  known, and still block honestly when that carry state is unknown.
+  `LDX (#8), #` is now also decoded/executed as a direct byte store and
+  uses its Toshiba `8`-cycle cost. Remaining executor rows still use
+  the fallback until they are populated.
 
 M3 Phase 3.2.2b — VBlank IRQ delivered by the executor (pass 39):
 - The executor now samples the IRQ controller between instructions
@@ -687,11 +973,11 @@ M3 Phase 3.2.2b — VBlank IRQ delivered by the executor (pass 39):
   savestate's `irq_state.pending_mask` has bit 4 set AND the seed
   CPU's `iff_level < 4`, the next `step-exec` (or `run-steps` /
   `trace-exec` / `run-until-exec`) iteration pushes PC + SR onto
-  the stack (6 bytes total, PC on top), sets PC to
-  `VBLANK_VECTOR_ADDRESS = 0x006FCC`, raises iff_level to 4, and
-  clears the pending bit. The output savestate persists the new
-  CPU state (PC at vector + 1 instruction worth, XSP - 6) and the
-  cleared `irq_state`.
+  the stack (6 bytes total, PC on top), then transfers control via
+  the VBlank user-vector slot at `VBLANK_VECTOR_ADDRESS = 0x006FCC`
+  (preferring the 4-byte handler pointer stored there when present),
+  raises iff_level to 4, and clears the pending bit. The output
+  savestate persists the new CPU state and the cleared `irq_state`.
 - `RETI` opcode `0x07` is now executed: pops PC (4B at XSP), then
   SR (2B at XSP+4), advances XSP by 6, restores all six flags +
   iff_level + rfp atomically.
@@ -699,11 +985,25 @@ M3 Phase 3.2.2b — VBlank IRQ delivered by the executor (pass 39):
   then `step-exec --seed-from pre.json --save-state post.json`
   delivers the VBlank IRQ on step 1 ; `post.json` shows
   `cpu.pc = 0x006FCD` and `irq_state.pending_mask = 0`.
-- Known limitation: instruction fetch reads the read bus only (not
-  the writable overlay), so software relying on a BIOS-installed
-  JMP at the vector RAM (cold-start 0x00 = NOP) won't go through
-  the BIOS shim. The executor jumps to the vector address directly.
-  Phase 3.2.2c (deferred) or BIOS HLE will close that gap.
+- The executor now fetches instructions through the writable runtime
+  overlay before falling back to the read bus. RAM-resident handlers
+  and vector stubs written earlier in the same run can therefore
+  execute end-to-end inside `step-exec` / `run-steps` /
+  `trace-exec` / `run-until-exec`.
+- IRQ delivery now also prefers the 4-byte handler pointer stored in
+  the user vector slot itself (`*(Interrupt**)0x6FCC = handler` in the
+  SDK model). If that slot is still zero / unset, the current minimal
+  model falls back to the slot address directly so bootstrap-only
+  workflows remain usable.
+- The executor-side JSON payloads now also expose IRQ-delivery
+  observability directly: `step-exec`, `run-steps`, `trace-exec`, and
+  `run-until-exec` report `irq_deliveries` plus a structured
+  `last_irq_delivery` block with the consulted vector slot, the raw
+  4-byte slot contents, the resolved transfer target, and whether the
+  delivery used the handler pointer or the unset-slot fallback.
+- Remaining limitation: the zero / unset vector-slot fallback is still
+  a debugger-friendly simplification. A stricter future IRQ/BIOS slice
+  could turn that case into a more explicit bad-vector behavior.
 
 M3 Phase 3.2.2a — VBlank IRQ pending state observable (pass 38):
 - `tick-frame` now reports VBlank IRQ pending status alongside the
@@ -793,6 +1093,7 @@ Example:
 
 ```text
 python ngpc_emu.py info path/to/game.ngc
+python ngpc_emu.py ui path/to/game.ngc --bios path/to/ngp_bios.bin
 python ngpc_emu.py reset-info path/to/game.ngc
 python ngpc_emu.py addr-info path/to/game.ngc 0x200040
 python ngpc_emu.py cpu-info path/to/game.ngc
@@ -929,6 +1230,7 @@ Important:
 - flag-change records in text and JSON output when the current instruction updates the modeled flag subset
 - optional manual register seeds for one-shot validation while bootstrap reset still leaves state unknown:
   - repeatable `--seed-reg XWA=...` .. `--seed-reg XSP=...`
+  - repeatable `--seed-reg DMAS0=...` .. `--seed-reg INTNEST=...` for the modeled TLCS-900/H control-register subset
   - `--seed-xsp` kept as a convenience shortcut for the common stack-only case
 
 The full supported execution subset as of 2026-05-22:
@@ -963,7 +1265,13 @@ The full supported execution subset as of 2026-05-22:
     - `XBC@bank0..3`
     - `XDE@bank0..3`
     - `XHL@bank0..3`
+    - `DMAS0..3`
+    - `DMAD0..3`
+    - `DMAC0..3`
+    - `DMAM0..3`
+    - `INTNEST`
   - these seeds populate the persistent banked backing store and become visible automatically if the selected bank later becomes current via `LDF`
+  - control-register seeds populate the modeled TLCS-900/H control-register file directly before execution starts
   - this is the intended way to drive BIOS-bank entry code honestly when the caller context lives in bank 3 instead of in the default visible bank
 - **BIOS-call seed shortcut - widened 2026-05-22 (pass 73)**:
   - new CLI convenience flag:
@@ -1012,6 +1320,43 @@ The full supported execution subset as of 2026-05-22:
     - keeping the assumption narrower than `--seed-zero-caller-saved` when only argument registers are justified by local toolchain evidence
   - this is an ABI/toolchain convention shortcut, not a hardware reset contract
   - explicit `--seed-reg NAME=VALUE` still overrides this preset
+- **toolchain-derived `XIZ` loop-variable shortcut - widened 2026-05-23 (pass 76)**:
+  - new CLI convenience flag:
+    - `--seed-zero-toolchain-loop-iz`
+  - expands only to:
+    - `XIZ = 0`
+  - intended use:
+    - stepping into thc2-style loop / copy / post-increment paths where the local toolchain commonly keeps the live loop state in `IZ`
+    - avoiding a broader seed like `--seed-zero-caller-saved` when only `XIZ` is justified by the observed codegen pattern
+  - local provenance:
+    - `NgpCraft_Toolchain_v2/docs/09_CODEGEN_PATTERNS.md` documents `push IZ ... pop IZ` loop-variable preservation patterns around calls
+  - this is a toolchain/codegen convention shortcut, not a hardware reset contract
+  - explicit `--seed-reg NAME=VALUE` still overrides this preset
+- **sourced BIOS-hand-off stack shortcut - widened 2026-05-23 (pass 77)**:
+  - new CLI convenience flag:
+    - `--seed-bios-handoff-xsp`
+  - expands only to:
+    - `XSP = 0x00006C00`
+  - intended use:
+    - reproducing the common bootstrap / smoke context without repeating `--seed-xsp 0x6C00`
+    - composing with narrower register presets such as `--seed-zero-toolchain-loop-iz`
+  - local provenance:
+    - [RESET_STATE.md](C:/Users/wilfr/Desktop/NGPC_RAG/04_MY_PROJECTS/NgpCraft_emulator/specs/RESET_STATE.md:42) documents the BIOS hand-off `regs.xsp = 0x00006C00`
+  - this is a sourced hand-off-layer shortcut, not a claim that the raw hardware reset stack is fully modeled
+  - explicit `--seed-reg XSP=...` or `--seed-xsp ...` still overrides this preset
+- **minimal BIOS-hand-off session shortcut - widened 2026-07-02 (pass 130)**:
+  - new CLI convenience flag:
+    - `--seed-bios-handoff-minimal`
+  - expands to:
+    - `XSP = 0x00006C00`
+    - `INTNEST = 0`
+  - intended use:
+    - reproducing the same narrow BIOS hand-off context the UI/session layer now applies by default
+    - unblocking CLI reads from `INTNEST` without inventing any DMA control-register state
+  - local provenance:
+    - [RESET_STATE.md](C:/Users/wilfr/Desktop/NGPC_RAG/04_MY_PROJECTS/NgpCraft_emulator/specs/RESET_STATE.md:55) documents `INTNEST = 0` as a hand-off-layer invariant, not a raw bootstrap claim
+  - this is a hand-off-layer shortcut, not a statement that the full reset-time control-register file is modeled
+  - explicit `--seed-reg NAME=VALUE` or `--seed-xsp ...` still overrides this preset
 - **word-memory multiply/divide into XR32 - widened 2026-05-22 (pass 67)**:
   - `(r32)` `MUL/MULS/DIV/DIVS XR32, (r32)`
   - `(r32+d8)` `MUL/MULS/DIV/DIVS XR32, (r32+d8)`
@@ -1051,7 +1396,38 @@ The full supported execution subset as of 2026-05-22:
   - oracle-verified against `NgpCraft_Disasm/ngpc_disasm.py::decode_one` before adding to executor (104/104 broad sweep clean for pass 55)
 - post-increment byte-memory: `LD R8, (r32+)`, `LD (r32+), R8`, `LD (r32+), imm8`
 - post-increment long-word store: `LD (r32+), R32`
+- pre-decrement loads: `LD R8/R16/R32, (-r32)`
+  - the address register is decremented before the memory read
+  - aliasing forms such as `LD XWA, (-XWA)` still stop honestly until the exact side-effect ordering is sourced
 - stack: `PUSHW`, `PUSH`, `POP`, `CALL`, `RET`, `RETD`
+- fixed 1-byte stack forms:
+  - `PUSH A`
+  - `POP A`
+  - `PUSH F`
+  - `POP F`
+  - `PUSH F` requires all six modeled flags to be known
+  - `POP F` reloads the modeled `S/Z/V/H/N/C` subset from the popped byte
+- first non-repeat word block-memory forms:
+  - `LDI`
+  - `LDD`
+  - `CPI`
+  - `CPD`
+  - `LDI` / `LDD` currently execute only on the documented implicit pointer
+    pairs `(XDE+/-, XHL+/-)` and `(XIX+/-, XIY+/-)`
+  - `CPI` / `CPD` currently compare `WA` against `(R32+/-)`, decrement `BC`,
+    preserve `CF`, and still stop honestly when the pointer is `XBC`
+- repeat block-memory forms (new 2026-07-02, pass 137):
+  - `LDIR`
+  - `LDDR`
+  - `CPIR`
+  - `CPDR`
+  - `LDIR` / `LDDR` copy `BC` items across the same documented pointer pairs
+    until `BC == 0` (`H/N/V=0`, `S/Z/C` preserved)
+  - `CPIR` / `CPDR` compare `A`/`WA` against `(R32+/-)` until a match sets `Z`
+    or `BC == 0` (`S/Z/H` from the last compare, `V = BC != 0`, `N=1`, `CF`
+    preserved); the `XBC` pointer alias still blocks honestly
+  - the repeat is atomic: any missing memory access before the honest stopping
+    point blocks with `runtime-memory-unavailable` and mutates nothing
 - indexed register stores: `LD (r32+d8), R8/R16/R32`
 - **(r32+d8) immediate stores: `LD (r32+d8), imm8`, `LDW (r32+d8), imm16` — new 2026-04-09**
 - **abs24 byte-memory ALU R8 ↔ mem, both directions — new 2026-05-22 (pass 59)**:
@@ -1066,13 +1442,60 @@ The full supported execution subset as of 2026-05-22:
   - honest blocking remains in place for unknown CF, unknown `A` source, undefined byte bit index `8..15`, unreadable memory, and unwritable targets
 - absolute-memory stores: `LD (abs24), R8/imm8`, `LDW (abs24), imm16`, `LDW (abs16), R32/imm8/imm16`
 - **ARI secondary indexed stores: `LD (r32+r16), imm8`, `LDW (r32+r16), imm16` — new 2026-04-09**
+- **ARI secondary mode=1 `(r32+d16)` stores — new 2026-07-02 (pass 138)**:
+  - `LD (r32+d16), imm8` / `LDW (r32+d16), imm16`
+  - `LD (r32+d16), R8/R16/R32`
+  - `EA = r32_base + signed(d16)`; blocks honestly on unknown base/source
+    register. Mirrors the mode=3 `(r32+r16)` store family (previously only
+    `LDA` was handled on mode=1). Unblocked ~6.5k more honest instructions on
+    `a_test_battle.ngc` boot.
+- **ARI secondary mode=1 `(r32+d16)` loads / cp-imm — new 2026-07-02 (pass 140)**:
+  - `LD R8/R16/R32, (r32+d16)` for `C3`/`D3`/`E3`
+  - `CP (r32+d16), imm8` (`C3` op `0x3F`)
+  - read-side mirror of the pass-138 mode=1 stores; blocks honestly on unknown
+    base register / unreadable effective address
+- **secondary-indexed `CP R,(mem)` — new 2026-07-02 (pass 141)**:
+  - `CP R8/R16/R32, (r32+d16)` (mode=1) and `CP R8/R16/R32, (r32+r16)`
+    (mode=3), op `0xF0..0xF7`, for `C3`/`D3`/`E3`
+  - compares `R - mem`, sets subtract flags, writes nothing; blocks on unknown
+    compared register
+- **secondary-indexed `INC/DEC #n,(mem)` RMW — new 2026-07-02 (pass 142)**:
+  - `INC/DEC #n, (r32+d16)` and `INC/DEC #n, (r32+r16)` (op `0x60..0x6F`,
+    `n=0 -> 8`) for `C3`/`D3`/`E3`
+  - reads memory, applies `+/- n`, writes back; sets `S/Z/V/H`+`N`, preserves
+    carry
+- **long register-indirect `LD R32, (r32)` — new 2026-07-02 (pass 143)**:
+  - `0xA0..0xA7` op `0x20..0x27`; reads 4 bytes at `(r32)` into R32
+  - fills the long size next to the already-modeled byte/word register-indirect
+    families; blocks honestly on unknown base register
+- **`BIT #n, (r32+d8)` — new 2026-07-02 (pass 144)**:
+  - `0xB8..0xBF` op `0xC8..0xCF`; reads one byte at `r32 + signed(d8)`, sets
+    `Z = NOT bit` (`H=1`, `N=0`), writes nothing
+- **`BIT #n` on F3 secondary-indexed `(r32+d16)`/`(r32+r16)` — new 2026-07-02 (pass 145)**:
+  - op `0xC8..0xCF`; same read-only `Z = NOT bit` (`H=1`, `N=0`) semantics
+- **register-indirect `CALL [cc,] (r32)` — generalized 2026-07-02 (pass 139)**:
+  - all base registers `0xB0..0xB7` (op `0xE0..0xEF`), unconditional and
+    conditional; previously only `B4 E8` = `call (XIX)` was handled
+  - taken -> push return address + `PC = r32`; false conditional -> fall
+    through; blocks honestly on unknown base register / unknown flags
 - **(r32) register-indirect stores: `LD (r32), imm8`, `LDW (r32), imm16`**
 - **CPU I/O immediate stores: `LDB (n), imm8` (0x08), `LDW (n), imm16` (0x0A) — new 2026-04-09**
 - ALU-immediate: `ADD/ADC/SUB/SBC/AND/XOR/OR/CP r, #N` via prefixed family
 - **ALU register-register: `ADD/SUB R, r` all sizes — new 2026-04-09**
 - `EXTS r` / `EXTZ r` (sign/zero-extend)
 - `EI n` / `DI` (IFF tracked, interrupt dispatch not modeled)
+- fixed CPU carry-flag control ops:
+  - `RCF`
+  - `SCF`
+  - `CCF`
+  - `ZCF`
+  - `CCF` / `ZCF` keep the documented undefined `H` result as unknown
+    in the model instead of forging a concrete bit
 - `SWI` (basic)
+- `HALT` as a bounded terminal post-state:
+  - the instruction advances `PC` to the next sequential address
+  - the executor returns status `cpu-halted`
+  - bounded runners stop there until interrupt resume is modeled
 - confirmed broken `D0..D7` word-register prefix instructions now stop explicitly with
   `silicon-broken` instead of falling back to a generic unsupported status
   - the current reference model keeps the documented immediate-safe forms executable
@@ -1085,7 +1508,8 @@ The full supported execution subset as of 2026-05-22:
 Important:
 - `execute-next` is the first real state-mutation command, but it is not a full interpreter
 - stack execution is still narrow and local to one command invocation
-- interrupts, halts, general memory/IO writes, full flag/SR evaluation and multi-step persistence are still outside the current subset
+- interrupts, general memory/IO writes, full flag/SR evaluation and multi-step persistence are still outside the current subset
+- `HALT` is the current exception: it is modeled narrowly as a terminal post-state with sequential `PC`
 - 8-bit and 16-bit register writes only execute when the owning 32-bit register is already known
 - each CLI invocation still starts from the bootstrap state, so this command does not yet preserve multi-step execution state across separate runs
 

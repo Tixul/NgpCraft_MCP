@@ -826,6 +826,24 @@ ngpc_gfx_set_palette(GFX_SCR1, 0u,
   frame so dead objects are simply never re-emitted. Never let a kill flip a flag
   without also releasing the slot.
 
+**Sprites vanish past the middle of the screen (signed/unsigned coordinate bug)**
+- Symptom: entities behave correctly near the left/top of the playfield but disappear —
+  or are never drawn — once they pass a certain coordinate, typically **x or y ≥ 128**.
+  Often shows up as "enemies vanish after a few seconds" once the level scrolls them
+  into the affected range. Not a sprite-count problem: OAM is nowhere near full.
+- Root cause: the coordinate is **stored as `u8` but read back (or compared) as `s8`**.
+  Any value ≥ 128 sign-extends to a negative number, so an off-screen test like
+  `if (e->x < 0 || e->x > 160) despawn();` culls a perfectly on-screen object. The
+  mismatch is easy to introduce because the OAM registers themselves are 8-bit, which
+  tempts you to keep the *world* coordinate 8-bit too.
+- Fix: keep entity/world coordinates in **`s16`** and only narrow to `u8` at the moment
+  you write OAM (after the on-screen test). Reserve `u8` for the final hardware write,
+  never for the logic. A shipped project traced exactly this ("stored unsigned 8-bit,
+  read back as signed") and fixed it by moving the coordinates to signed 16-bit.
+- Distinguishing it from a slot leak (above): this bug is **position-dependent and
+  reversible** — the object reappears if it moves back below 128 — whereas a slot leak
+  is permanent and position-independent.
+
 **"Bullet time" / frame lag with many sprites and projectiles**
 - Symptom: game slows down noticeably when several sprites and bullets are active.
 - Root cause: full OAM write (tile + flags + X + Y) for every slot every frame,

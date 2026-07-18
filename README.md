@@ -4,6 +4,13 @@
 
 Install once, and every Claude Code / Cursor / Claude Desktop session gains the ability to look up real NGPC hardware facts, retrieve canonical ASM patterns, search a proven game's source by feature, and scaffold a new project — instead of hallucinating half-correct code that crashes on silicon.
 
+
+> **Using this from an AI agent? Read [AGENT_GUIDE.md](AGENT_GUIDE.md) first.**
+> It maps symptom → tool, explains the save-state workflow for reproducing a user's bug,
+> and covers the BIOS requirement — without a real `bios.bin` the emulator renders a
+> plausible but **wrong** picture. It is also served as the MCP resource
+> `ngpc://doc/agent_guide`.
+
 ---
 
 ## Why this exists
@@ -68,6 +75,7 @@ Any of these prompts should now work:
 | `ngpc_font_bake` | stub (v0.3) | PNG → NGPC 2bpp font data — bake pipeline lives outside the live editor |
 | `ngpc_disasm` | working | Disassemble ROM/byte range via ngpc_disasm.py bridge |
 | `ngpc_emu_rom_info` | working | Parse ROM header + bootstrap reset state via NgpCraft emulator |
+| `ngpc_emu_native_run` | working | **Runs** the game on the native C++ core: load a player save state (`.s0`), hold buttons, advance frames, return registers + a beam-accurate screenshot. Needs a real `bios.bin`. |
 | `ngpc_emu_peek` | working | Read bytes from emulated memory bus |
 | `ngpc_emu_decode` | working | Decode one TLCS-900 instruction at address |
 | `ngpc_emu_step_trace` | working | Run N instructions from boot/address, return trace + CPU state |
@@ -83,9 +91,41 @@ For `ngpc_screenshot`, a fake CanvasRenderingContext2D captures the framebuffer;
 
 For `ngpc_png_to_sprite` / `ngpc_png_to_tilemap`, PNG decoding goes through `pngjs` (replaces the browser-only `URL.createObjectURL` + `Image` path used inside `asset_tools.decodePng`).
 
-The `ngpc_emu_*` tools spawn `python vendor/emulator/ngpc_emu.py <cmd> --json` (Python 3 required on the host). They expose **only the reliable parts** of the emulator (ROM parsing, memory bus reads, single-instruction decode/execute, bounded run-steps). Per the emulator's `FEATURE_MATRIX.md` policy ("a feature marked as supported must be really exploitable on NGPC"), no full-game emulation tool is exposed — VDP/PSG/IRQ/timing are not implemented yet.
+The `ngpc_emu_*` tools spawn `python vendor/emulator/ngpc_emu.py <cmd> --json` (Python 3 required on the host). They cover ROM parsing, memory bus reads, decode/execute and the K2GE inspectors, and they read **static** state — a ROM at reset or a save state.
+
+`ngpc_emu_native_run` is the exception: it spawns `python vendor/emulator/ngpc_native.py run --json` and **executes the machine** on the native C++ core (VDP, PSG, IRQ and timing all modelled), drawing the frame line by line as the beam passes. It needs the compiled core in `vendor/emulator/cpp/build/` and, for most commercial games, a real `bios.bin`.
 
 ---
+
+## Requirements
+
+| For | You need |
+|---|---|
+| the server | **Node 18+** |
+| every `ngpc_emu_*` tool | **Python 3** on PATH |
+| `ngpc_compile_homemade` | working | ⚠️ EXPERIMENTAL AND UNSTABLE — NOT A PRODUCTION COMPILER |
+| `ngpc_emu_breakpoint` | working | Per-ROM PC-address breakpoint registry + event-log match |
+| `ngpc_emu_eventlog_profile` | working | Bucket an event-log v1 JSON file by owning symbol via a t900ld .map |
+| `ngpc_emu_map_lookup` | working | Resolve symbols from a t900ld .map file |
+| `ngpc_emu_memory_dump` | working | Hexdump-style multi-row memory inspector |
+| `ngpc_emu_oam_info` | working | Decode the K2GE OAM (0x8800..0x88FF, 64 sprites × 4 bytes) and the CP.C palette-code strip (0x8C00..0x8C3F) |
+| `ngpc_emu_opcode_coverage` | working | Linear-walk a ROM from its entry point and report which leading-byte opcodes the current TLCS-900/H decoder does NOT yet handle |
+| `ngpc_emu_palette_info` | working | Decode the K2GE palette RAM (0x8200..0x83FF) into a human view: 16 palettes × 4 entries (12-bit 0BGR) for each plane (sprite / SCR1 / SCR2 /… |
+| `ngpc_emu_registers` | working | Rich CPU register view: 8 R32 with their R16/R8 decomposition (XWA → WA → W/A …), PC, SR, IFF level, RFP bank pointer, and the six modeled flags… |
+| `ngpc_emu_run_until` | working | Run the emulator forward until PC reaches `target_pc`, an honest stop is hit, or `max_steps` is exhausted |
+| `ngpc_emu_screenshot` | working | Compose a K2GE framebuffer (160×152) from memory and return PNG base64. Static state only — for a scrolling game or a raster split use `ngpc_emu_native_run`, which draws as the beam passes |
+| `ngpc_emu_tick_frame` | working | Advance the K2GE frame/scanline state model (M3 Phase 0+) |
+| `ngpc_emu_tile_view` | working | Render one 8×8 tile from CHAR_RAM as 4-level grayscale ASCII art (` ░▒█`) |
+| `ngpc_emu_tilemap_info` | working | Decode one K2GE scroll-plane tilemap (SCR1 @ 0x9000 or SCR2 @ 0x9800, 32×32 tiles × 2 bytes/cell) |
+| `ngpc_emu_tiles_view` | working | Render a grid of CHAR_RAM tiles as a binary PPM atlas, returned as PNG base64 |
+| `ngpc_emu_watchpoint` | working | Per-ROM memory watchpoint registry + event-log match (v3 format) |
+| running or rendering a game | a real **`bios.bin`**, supplied by you — never shipped here |
+
+⚠️ **The BIOS is not optional for correct output.** The interrupt vector table lives in it;
+with no BIOS that table is all zeroes, so the first interrupt sends the CPU to address 0 and
+the game dies **while the screen still shows a plausible frame**. Some games check for it
+directly: *Metal Slug — 2nd Mission* silently disables fire and jump if the console did not
+boot through its BIOS.
 
 ## Resources
 
@@ -177,6 +217,9 @@ NgpCraft_MCP/
 - **The NGPC dev wiki** (`corpus/wiki/`) + a high-density `DENSE_INDEX.md` — the core knowledge, cleaned and engine-agnostic.
 - **Structured knowledge** — `bugs_silicon.json` + `asm_patterns.json`, hand-curated from hardware-validation sessions.
 - **The homemade toolchain** (`vendor/toolchain/`: t900cc / t900as / t900ld / ngpc_romtool) — drives `ngpc_compile_homemade`, no `.exe` dependency.
+  ⚠️ **Experimental and unstable — a teaching pipeline, not a compiler to build with.** It is
+  there so the stages of a TLCS-900 build can be read and understood; expect mis-compiles and
+  unimplemented constructs. For a ROM that must actually run, use `ngpc_compile_official`.
 - **The headless emulator** (`vendor/emulator/`) — drives the `ngpc_emu_*` tools (ROM parsing, memory bus, decode/execute, bounded run-steps, K2GE inspectors).
 - **The disassembler** + the **live-editor transpiler** (lint / quickrun / screenshot / asset converters).
 - **Templates** (base + 3 genre variants) and **reference games** (StarGunner on the NgpCraft template; Windcup on the legacy 2000s template).
@@ -184,7 +227,7 @@ NgpCraft_MCP/
 ### Intentionally not included
 
 - **Proprietary Toshiba binaries** (`cc900` / `asm900` / `tulink` / `tuconv` / `s242ngp`, `system.lib`). `ngpc_compile_official` invokes the user's local install — nothing is bundled or redistributed.
-- **Full-game (frame-accurate) emulation** — the `ngpc_emu_*` tools expose the reliable headless subset; the VDP/PSG/IRQ/timing frame loop is still in development.
+- **Full-game emulation is available** via `ngpc_emu_native_run` (native C++ core). The other `ngpc_emu_*` tools remain static inspectors by design — they describe a frozen moment, they do not run the machine.
 - **ROM binaries** — no value for code generation.
 
 ---
@@ -207,7 +250,7 @@ MIT. Vendored snapshots retain their original licenses (see `vendor/*/LICENSE`).
 |---|---|
 | **NgpCraft Live Editor** | Browser playground, transpiler, lint |
 | **NgpCraft Toolchain** | Pure-Python cc/as/ld for TLCS-900/H (WIP — not exposed via MCP yet) |
-| **NgpCraft Emulator** | Python NGPC emulator (WIP — reliable parts exposed via `ngpc_emu_*` tools) |
+| **NgpCraft Emulator** | NGPC emulator — Python inspectors (`ngpc_emu_*`) plus the native C++ core that runs games (`ngpc_emu_native_run`) |
 | **NgpCraft Base Template** | Starter project + 4 genre variants |
 | **NgpCraft Disasm** | TLCS-900/H disassembler |
 | **NgpCraft Learn** | Bilingual FR/EN course site |

@@ -38,12 +38,304 @@ Principe d'architecture:
 - `ngpc_emu_bridge` : raccord avec `NgpCraft_engine`
 - le sous-systeme audio devra rester assez propre et modulaire pour etre reintegre hors de l'emulateur, notamment comme futur remplacement du core NeoPop encore utilise par l'outil son
 
+## Jalon : le modèle matériel repose désormais sur les docs constructeur (2026-07-10)
+
+Passes 180-186. **1314 tests verts.** Le sous-système périphérique/BIOS est passé
+d'un modèle bâti sur des inférences à un modèle où **chaque constante est citée
+d'un document Toshiba ou SNK** (voir `DOC_SOURCES_INDEX.md` § 0).
+
+**Livré :**
+- **BIOS `swi 1` (SYSTEM_CALL)** — dispatch sur RW3, tous les vecteurs
+  déterministes (SHUTDOWN, CLOCKGEARSET, INTLVSET, RTCGET, FLASHWRITE,
+  SYSFONTSET, SYS_SUCCESS, comms sans peer). → `specs/BIOS_HLE.md`
+- **Sauvegardes flash** — les **deux** chemins : BIOS-médié *et* direct (séquence
+  AMD + `/WE`, celui qu'utilise la lib maison du projet). Non-volatile.
+  → `specs/FLASH.md`
+- **SYSFONTSET** — la **vraie font SNK**, lue dans le BIOS attaché. Rien
+  d'embarqué : zéro souci de licence *et* pixel-exact.
+- **Contrôleur d'interruptions multi-source** — table de vecteurs HW
+  (`0xFFFF00`) → handler BIOS, puis chaînage vers le hook RAM (`0x6FB8 + i*4`).
+  → `specs/FRAME_TIMING.md`
+- **A/D converter (la jauge batterie)** et **timers 8 bits 0..3**.
+  → `specs/ADC.md`, `specs/TIMERS.md`
+
+**Trois erreurs de fidélité corrigées** par la lecture des docs — dont deux vrais
+bugs : la règle de masque IRQ était *off-by-one* (`L > IFF` au lieu de
+`L >= IFF`), le masque post-acceptation était faux (`IFF = L` au lieu de
+`min(L+1, 7)`), et la page I/O comme les registres K2GE ne resettent **pas** à
+zéro. Détail et rétractation : `HARDWARE_COMPAT_POLICY.md`.
+
+**Non-régression de fidélité** vérifiée contre l'oracle (`oracle_tools/cosim_diff.py`) :
+Big Bang / Cotton / Crush Roller = **0 divergence sur 3 000 pas**.
+
+**Vitesse** : deux optimisations *behaviour-neutral* (cache de la fetch view,
+mémoïsation de `probe()`) → **1 123 → 1 706 instr/s (×1,5)**. Le coût restant est
+structurel et documenté comme cahier des charges du futur **cœur C++** :
+`PERF_TIMING_POLICY.md` § 10.
+
+## Jalon : première image de cartouche (2026-07-08)
+
+`Engine_test_project/menu_test_project` s'exécute désormais de bout en bout (init
+complète -> boucle principale, 5 000 000+ instructions sans honest-stop) et **rend son
+écran de menu** : le splash "NGPC" (rouge) + "craft" (jaune) sur fond noir (SCR1 tilemap
++ glyphes CHAR + palette). C'est la **première frame de cartouche** produite par
+l'émulateur, et elle est obtenue **100 % en fidélité hardware** : chaque déblocage a été
+tranché sur la vraie NGPC de Wilfried (ROMs de test flashées) ou contre la source
+ground-truth ngdis, honest-stop conservé pour l'état réellement indisponible.
+
+Le déclencheur principal a été le **modèle open-bus** : `hw_test_openbus` (flashé sur
+vrai HW) a prouvé que le TLCS-900/H n'a pas de bus-fault -> une lecture d'adresse
+non-mappée renvoie `0x0000`, une écriture est ignorée, sans hang. L'émulateur modélise
+maintenant ce comportement mesuré au lieu de honest-stopper, ce qui laisse le runtime de
+la cartouche franchir un déréférencement de pointeur vers l'espace non-mappé et
+continuer jusqu'au rendu. Cf. DEVLOG pass 168 pour la chaîne complète (open-bus,
+`mul/div/muls/divs, imm16`, `pushw (r32+d16)`, `inc/dec byte (r32+d8)`).
+
+NB perf : le core CPython est un **prototype/oracle de référence** (fidélité HW =
+la moat du projet), pas le moteur temps réel. ~1000 instr/s aujourd'hui (interprétation
+pure + état immuable copié par instruction) vs ~1 M instr/s nécessaires pour du 60 fps
+-> le cœur natif visé (`ngpc_emu_core`, état mutable) fera le temps réel ; le Python
+reste l'oracle qui valide le comportement opcode par opcode.
+
 Choix technique actuel:
 - le vrai coeur final est vise en `C++`
 - le bootstrap, les specs executablees, les outils et certains prototypes peuvent vivre en `Python`
 - le prototype Python actuel n'est pas le coeur final, il prepare le terrain pour le coeur `C++`
 
-Etat actuel (2026-05-20, **389 tests verts, 0 skipped**) :
+Etat actuel (2026-07-02, **1116 tests verts, 0 skipped**) :
+
+- derniers decode/execute follow-ups :
+  - `push/pop r` executes maintenant pour les formes safe du
+    sous-ensemble prefixed register, y compris le byte family `C8..CF`
+    et les formes long `D8..DF` / `E8..EF` qui passent deja le filtre
+    quirk
+  - `push/pop` executes maintenant aussi pour les byte-slices `C7`,
+    avec lecture/ecriture sur la stack writable en largeur 1 byte
+  - `cycles_consumed` utilise maintenant aussi les valeurs Toshiba pour
+    `push/pop r` prefixed et pour `C7 <reg> 04/05`
+  - `cpl` / `neg` executes maintenant pour les formes prefixed byte
+    safe et pour les mirroirs `C7` current-bank byte-slice
+  - `daa` executes maintenant pour les formes prefixed byte safe et
+    pour le miroir `C7` current-bank byte-slice, avec blocage honnete
+    si les flags d'entree `C/H/N` ne sont pas connus
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `DAA r`
+    (`4` cycles) pour les formes prefixed byte et pour `C7 <reg> 10`
+  - `paa` executes maintenant pour les formes prefixed `word/long`
+    definies (`D8..DF` / `E8..EF : 14`), avec stop honnete
+    `silicon-undefined` sur les formes byte non definies
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `PAA r`
+    (`4` cycles) pour les formes `word/long` executees
+  - `djnz` executes maintenant pour le sous-ensemble prefixed byte safe
+    (`C8..CF : 1C : d8`), avec split branche prise / non prise
+  - les formes prefixed long `djnz` non definies stoppent maintenant
+    honnetement en `silicon-undefined`
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `DJNZ`
+    (`6` si branche prise, `4` sinon) pour ce sous-ensemble execute
+  - `mirr` decode/execute maintenant comme cas special `D8..DF : 16`
+    sur registres 16-bit (`WA..SP`), avec reversal des 16 bits et
+    drapeaux inchanges
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `MIRR r`
+    (`3` cycles) pour ce cas special word-only
+  - `bs1f` / `bs1b` decode/execute maintenant comme cas speciaux
+    `D8..DF : 0E/0F` sur source 16-bit et destination fixe `A`
+  - si la source vaut zero, `bs1f/bs1b` stoppent honnetement en
+    `silicon-undefined` car la doc locale rend `A` indefini
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba
+    `BS1F/BS1B` (`2` cycles)
+  - `mula` decode/execute maintenant comme cas special `D8..DF : 19`
+    sur destination 32-bit (`XWA..XSP`), avec lecture signee 16-bit
+    depuis `(XDE)` et `(XHL)` puis decrement de `XHL`
+  - le cas de recouvrement `mula XHL` suit l'ordre documente:
+    somme ecrite dans `XHL`, puis `XHL -= 2`
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba
+    `MULA rr` (`19` cycles)
+  - `minc1/2/4` et `mdec1/2/4` decode/execute maintenant comme cas
+    speciaux word-only `D8..DF : 38/39/3A/3C/3D/3E`
+  - l'immediat desassemble reste la valeur encodee `# - step`, puis
+    l'execution reconstruit la vraie fenetre modulo `#` et la valide
+    comme puissance de deux documentee avant d'agir
+  - `cycles_consumed` utilise maintenant aussi les lignes Toshiba
+    `MINC*` (`5` cycles) et `MDEC*` (`4` cycles)
+  - `andcf/orcf/xorcf/ldcf/stcf` sur registres prefixes byte
+    (`C8..CF`) decode/execute maintenant, avec index immediat `#4`
+    ou dynamique `A & 0x0F`
+  - les formes byte hors plage (`bit >= 8`) restent honnetes:
+    `stcf` ne change rien, les autres stoppent en `silicon-undefined`
+  - les miroirs `C7` current-bank byte-slice de cette famille
+    decode/execute maintenant avec la meme semantique
+  - les formes registre long restent non definies, et les formes word
+    `D0..D7` continuent a etre arretees par le garde-fou
+    `silicon-broken` deja documente
+  - `extz/exts` sur registre byte prefixe et `unlk/extz/exts` sur
+    byte-slices `C7` ne tombent plus sur un stop generique:
+    ils s'arretent maintenant honnetement en `silicon-undefined`
+  - `ldc` prefixed decode maintenant les CR connus avec leurs noms
+    symboliques locaux (`DMAS0/DMAD0/DMAC0/DMAM0/INTNEST`) au lieu de
+    laisser seulement `CR_0xNN`
+  - le fichier des control registers TLCS-900/H est maintenant modele
+    dans l'etat CPU (`DMAS0..3`, `DMAD0..3`, `DMAC0..3`, `DMAM0..3`,
+    `INTNEST`) avec valeurs inconnues tant qu'aucun chemin execute ne
+    les initialise
+  - `ldc` prefixed execute maintenant pour ce sous-ensemble:
+    - ecritures et lectures reelles sur `DMAS/DMAD/DMAC/DMAM/INTNEST`
+    - stop honnete `requires-known-control-register` si une lecture vise
+      un CR encore inconnu
+  - le miroir `C7` byte-slice de `ldc` execute maintenant aussi pour les
+    CR byte (`DMAMn`) ; les cibles non-byte par ce chemin restent
+    arretees honnetement en `silicon-undefined`
+  - `INTNEST` suit maintenant aussi les chemins IRQ deja modeles:
+    increment sur delivery si sa valeur etait connue, decrement sur
+    `reti` si sa valeur etait connue
+  - la couche BIOS hand-off de `EmulatorSession` initialise maintenant
+    aussi `INTNEST=0` comme invariant de session UI ; le bootstrap brut
+    garde toujours ce control register inconnu
+  - savestate v5 persiste maintenant aussi ce fichier TLCS-900/H des
+    control registers
+  - `cpu-info` et `registers` exposent maintenant aussi ce fichier de
+    control registers en sortie humaine et JSON
+  - `--seed-reg` accepte maintenant aussi le sous-ensemble modele de
+    control registers TLCS-900/H (`DMAS*`, `DMAD*`, `DMAC*`, `DMAM*`,
+    `INTNEST`) dans les commandes CLI et via l'engine bridge
+  - l'engine bridge accepte maintenant aussi `runtime.seed_presets` avec
+    `bios-handoff-minimal`, pour reproduire le handoff minimal
+    `XSP=0x6C00` + `INTNEST=0` sans recopier ces seeds a la main
+  - `halt` execute maintenant dans un modele borne:
+    `PC` avance a l'adresse sequentielle suivante, puis l'execution
+    s'arrete explicitement en `cpu-halted` jusqu'a modelisation d'une
+    vraie reprise par interruption
+  - `rcf/scf/ccf/zcf` executes maintenant aussi:
+    `cf` suit la semantique Toshiba, `n` est remis a `0`, et
+    `ccf/zcf` gardent le `H` documente comme indetermine sous forme
+    inconnue (`None`) au lieu d'inventer une valeur
+  - les formes fixes `push/pop A` et `push/pop F` executes maintenant
+    aussi, avec timings Toshiba `3/4` cycles et un encodage honnete du
+    byte `F` depuis les six flags modeles
+  - le premier sous-ensemble block-memory non-repeat execute maintenant
+    aussi sur les formes word decodees:
+    `LDI/LDD` avec paires implicites `(XDE+/-, XHL+/-)` ou
+    `(XIX+/-, XIY+/-)`, et `CPI/CPD` avec accumulateur implicite
+    `WA` sur `(R32+/-)`
+  - `CPI/CPD` preservent honnetement `CF`, mettent `V` a `1` tant que
+    `BC != 0` apres decrementation, et bloquent encore les cas alias
+    `XBC` ou ordre de side effects non source
+  - le sous-ensemble block-memory *repeat* execute maintenant aussi:
+    `LDIR/LDDR` recopient `BC` items sur les memes paires implicites
+    jusqu'a `BC == 0` (`H/N/V=0`, `S/Z/C` preserves), et `CPIR/CPDR`
+    comparent `A/WA` jusqu'a un match (`Z=1`) ou `BC == 0`
+    (`S/Z/H` du dernier compare, `V = BC != 0`, `N=1`, `CF` preserve).
+    Le repeat est applique atomiquement: si un acces memoire manque avant
+    le point d'arret honnete, l'instruction bloque
+    (`runtime-memory-unavailable`) sans muter d'etat. `BC=0` au depart
+    boucle sur le pass complet `0x10000` (ordre decrement-puis-test)
+  - correction fidelite decodeur: `0x95 0x11` etait decode `ldirw
+    (XDE+),(XHL+)`; la source autoritative ngdis selectionne la paire via
+    `w = first & 7`, donc `0x95` (w=5) est `(XIX+),(XIY+)`
+  - la famille `0xF3` ARI secondary-indexed **mode=1** `(r32+d16)` decode
+    et execute maintenant tous les stores (immediate `imm8`/`imm16` +
+    registre `R8`/`R16`/`R32`), plus juste `LDA`; miroir du mode=3
+    `(r32+r16)`. `EA = base + signed(d16)`, bloque honnetement sur base ou
+    source inconnue. Debloque ~6.5k instructions de plus au boot de
+    `a_test_battle.ngc` (arret honnete ensuite sur `ld XBC,XWA` silicon-broken)
+  - `CALL [cc,] (r32)` register-indirect decode+execute pour toute la famille
+    `0xB0..0xB7` (op `0xE0..0xEF`), conditionnel inclus; avant seul `B4 E8`
+    = `call (XIX)` etait gere. Taken => push return + `PC = r32`; conditionnel
+    faux => fall-through. Miroir de `JP (r32)`
+  - `0xC3`/`0xD3`/`0xE3` ARI secondary-indexed **mode=1** `(r32+d16)` decode
+    et execute maintenant les loads `ld R8/R16/R32, (r32+d16)` + `cp
+    (r32+d16), imm8` (miroir lecture du pass 138, avant seul mode=3
+    `(r32+r16)`)
+  - `cp R8/R16/R32, (mem)` (op `0xF0..0xF7`) secondary-indexed decode+execute
+    pour les deux modes (`(r32+d16)` et `(r32+r16)`) : compare `R - mem`,
+    pose les flags de soustraction, n'ecrit rien
+  - `inc/dec #n, (mem)` (op `0x60..0x6F`, `n=0->8`) secondary-indexed RMW
+    decode+execute pour les deux modes : lit, applique `+/- n`, reecrit ;
+    pose `S/Z/V/H`+`N`, preserve la retenue. Ferme entierement la famille
+    secondary-indexed mode=1 sur les prefixes `C3`/`D3`/`E3`
+  - `ld R32, (r32)` long register-indirect (`0xA0..0xA7` op `0x20..0x27`)
+    decode+execute : lit 4 octets a `(r32)` dans R32. Complete la taille long
+    a cote des familles byte (`0x80`)/word (`0x90`) deja gerees
+  - `bit #n, (r32+d8)` (`0xB8..0xBF` op `0xC8..0xCF`) decode+execute : lit un
+    octet a `r32 + signed(d8)`, pose `Z = NOT bit` (`H=1`, `N=0`), n'ecrit rien
+  - `bit #n` sur l'addressing F3 secondary-indexed `(r32+d16)`/`(r32+r16)`
+    (op `0xC8..0xCF`) decode+execute : meme semantique read-only. menu_test
+    decode maintenant proprement jusqu'a son frontier d'execution reel
+  - **RENVERSEMENT HW (2026-07-02, quirk DB v7)** : les copies `ld r+r` 32-bit
+    (`D8..DF` sub-op `0x88..0x8F`/`0x98..0x9F`) ne sont **PAS** silicon-broken
+    et s'executent maintenant (copie registre). Contre-preuve : la cartouche
+    commerciale **mr_robot boote sur vraie NGPC** en executant `ld XBC, XWA`
+    (`D8 89`), et le compilateur officiel CC900 emet la meme famille. Les ALU
+    r+r restent bloquees (conservateur) ; les copies `ld` 16-bit (`D0..D7`)
+    restent bloquees mais marquees « meme famille, tres probablement sures ».
+    ⚠️ **Doute ouvert** (banniere en tete de `HARDWARE_COMPAT_POLICY.md`) :
+    pourquoi le `D8 8B` avait-il ete attribue crash ? Mini-ROM de test HW du
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba
+    `ANDCF/ORCF/XORCF/LDCF/STCF r` (`3` cycles), y compris en miroir `C7`
+  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `LDC`
+    (`3` cycles) pour les formes prefixed et `C7` executees
+  - les mirroirs `C7` current-bank byte-slice de
+    `rlc/rrc/rl/rr/sla/sra/sll/srl #4,r` et `A,r` executent
+    maintenant aussi, avec le meme blocage honnete sur `CF`
+  - `rlc/rrc/rl/rr/sla/sra/sll/srl A,r` execute maintenant,
+    avec count = low nibble de `A` et blocage honnete sur `CF`
+    inconnu pour `rl` / `rr`
+  - `ldx (#8), #` decode + execute maintenant comme store direct byte,
+    avec tolérance Toshiba sur les bytes de padding
+  - `rl #4,r` / `rr #4,r` execute maintenant quand `CF` est connu,
+    avec blocage honnete si `CF` reste inconnu
+  - `incf` / `decf` executes maintenant pour la rotation de banque
+    visible, via le meme flush/reload que `ldf`
+  - `ld R8/R16/R32, (-R32)` pour la tranche pre-decrement simple
+  - `call (abs24)` / `call CC, (abs24)` via `F2`
+  - `add/adc/sub/sbc/and/xor/or/cp (abs24), imm8` via `C2`
+  - `ld/ldw (abs8), #imm` et `ld[w] (abs8), (abs16)` via `F0`
+  - `cp R16, (abs24)` et `pushw (abs24)` via `D2`
+  - exécution des formes prefixed WORD r+r `mul/muls/div/divs` via `D8..DF 0x40..0x5F`
+    (HW-cleared 2026-07-06, `hw_test_muldiv` : `div WA, BC` / `D9 50` s'exécute et est
+    correct — ne restent silicon-broken que shift-by-A `0xF8..0xFF` et le trou `0xB8..0xBF`)
+  - **OPEN BUS modélisé (HW-mesuré, `hw_test_openbus` 2026-07-08)** : une lecture
+    d'adresse hors de toute région mappée renvoie `0x0000`, une écriture est
+    silencieusement ignorée, et rien ne hang (le TLCS-900/H n'a pas de trap de
+    bus-fault). Honest-stop conservé pour l'in-region non-backé (région BIOS sans
+    image BIOS = seule classe qui bloque encore). C'est mesuré sur silicium, pas inventé.
+  - exécution word `mul/muls/div/divs R, imm16` via `D8..DF 0x08/0x09/0x0A/0x0B`
+    (réparé 2026-07-08 : cassé depuis le resize D8..DF→word ; `divs HL, 0x64`)
+  - `pushw (r32+d16)` via `D3` (famille word-mémoire ARI, op 0x04)
+  - `inc/dec byte (r32+d8)` RMW indexé via `0x88..0x8F` op 0x60..0x6F
+  - `opcode-coverage` distingue maintenant les vrais trous de decode des
+    bytes immediatement apres une instruction deja connue `silicon-broken`
+- derniers timing follow-ups :
+  - `cycles_consumed` couvre maintenant aussi le sous-ensemble
+    registre/immediat deja execute :
+    `LD`, `LDA`, `ADD/ADC/SUB/SBC/AND/XOR/OR/CP`, `INC/DEC`, `EXTZ/EXTS`
+  - `cycles_consumed` couvre aussi le sous-ensemble memoire deja execute :
+    `LD R,(mem)`, `LD (mem),R`, `LD (mem),#8`, `LDW (mem),#16`,
+    `CP` registre/memoire et `PUSHW (mem)`
+  - `cycles_consumed` couvre aussi les chemins ALU/memoire deja executes :
+    `ADD/ADC/SUB/SBC/AND/XOR/OR R,(mem)`, `... (mem),R`,
+    `ADD/SUB/AND/XOR/OR (mem),#`, `CP (mem),#`, `INC/DEC #3,(mem)`
+  - `cycles_consumed` couvre aussi les operations bit/carry memoire deja
+    executees : `BIT`, `LDCF/ANDCF/ORCF/XORCF`, `STCF`,
+    `RES/SET/CHG/TSET` sur `(mem)`
+  - `cycles_consumed` couvre aussi les rotate/shift memoire deja executes :
+    `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL` sur `(mem)`
+  - `cycles_consumed` couvre aussi le sous-ensemble bit ops registre byte
+    deja execute : `BIT/RES/SET/CHG/TSET #4,r`
+  - `cycles_consumed` couvre aussi `INCF` / `DECF` (`2` cycles Toshiba)
+  - `cycles_consumed` couvre aussi les shifts immediats registre executes :
+    `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL #4,r` via la formule Toshiba `3 + n/4`
+  - `cycles_consumed` couvre aussi les formes registre `A,r` de
+    `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL` (`2` cycles Toshiba)
+  - `cycles_consumed` couvre aussi les mirroirs `C7` byte-slice des
+    formes shift immediates et `A,r`, avec les memes couts Toshiba
+  - `cycles_consumed` couvre aussi `cpl` / `neg` et leurs mirroirs
+    `C7` byte-slice (`2` cycles Toshiba)
+  - `cycles_consumed` couvre aussi `LDX (#8), #` (`8` cycles Toshiba)
+  - les miroirs `C7` current-bank byte-slice de ces familles suivent la
+    meme table Toshiba au lieu du fallback global `8`
+- corpus check courant :
+  - `python ngpc_emu.py opcode-coverage ..\NgpCraft_toolchain\StarGunner_save_lib_test\bin\main.ngc --bytes 4096 --json`
+  - resultat actuel : `4093 / 4096` bytes decoded (`99.9%`), `0` unknowns,
+    `0` unsupported-decoded, `3` silicon-broken fallout
 
 Doctrine + roadmap :
 - roadmap detaillee dans `ROADMAP.md`
@@ -67,7 +359,7 @@ Format specs lockes (chaque format en JSON strict, rejet implicit upgrade) :
 - watchpoints v3 (`specs/WATCHPOINTS.md`, kind=write/read/access + byte-value filter)
 - breakpoints v1 (`specs/BREAKPOINTS.md`)
 - symbols .map v1 (`specs/SYMBOLS.md`)
-- quirks v3 + matcher v4 (`specs/QUIRKS.md`, `core/quirks_db.json` `2026-05-20.v4`)
+- quirks v3 + matcher v4 (`specs/QUIRKS.md`, `core/quirks_db.json` `2026-05-26.v6`)
 - contrat d'integration engine (`specs/ENGINE_INTEGRATION_CONTRACT.md`)
 - K2GE inspecteurs (palette / OAM / tilemap / tile pixels, `specs/K2GE_*.md`)
 
@@ -176,7 +468,8 @@ L'execution minimale actuelle couvre maintenant aussi:
 - premiers `inc` / `dec` prefixes sur registres quand la vue source est representable par le modele CPU courant
 - un premier modele writable minimal pour la pile courante
 - `pushw`, `push`, `pop`, `call`, `ret` et `retd` quand le pointeur de pile est connu et que l'effet reste representable
-- un seed manuel des 8 registres 32-bit via `--seed-reg`, avec `--seed-xsp` conserve comme raccourci pratique
+- un seed manuel des 8 registres 32-bit et du sous-ensemble modele de control registers TLCS-900/H via `--seed-reg`, avec `--seed-xsp` conserve comme raccourci pratique
+- un preset `--seed-bios-handoff-minimal` qui reproduit maintenant le meme contexte minimal que la session UI (`XSP=0x6C00`, `INTNEST=0`) sans inventer l'etat DMA
 - un premier `run-steps` borne qui conserve `CPU` et overlay memoire entre instructions dans une seule invocation
 - `run-steps` peut maintenant aussi reprendre depuis un savestate (`--seed-from`) et sauvegarder directement son etat final (`--save-state`)
 - `trace-exec` peut maintenant aussi reprendre depuis un savestate (`--seed-from`) et sauvegarder directement le frontier final (`--save-state`)
@@ -278,6 +571,10 @@ L'execution minimale actuelle couvre maintenant aussi:
   - `ld R8, (r32+)`
   - `ld (r32+), R8`
   - `ld (r32+), imm8`
+- premiere tranche pre-decrement utile sur le smoke ROM stable:
+  - `ld R8, (-r32)`
+  - `ld R16, (-r32)`
+  - `ld R32, (-r32)`
 - le bloc de sortie bootstrap decode maintenant aussi `pop XIZ` a `0x0020D0AC`
 - premier backing lisible minimal pour la memoire systeme officielle:
   - `0x6F86`

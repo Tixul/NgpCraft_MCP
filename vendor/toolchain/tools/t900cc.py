@@ -1198,14 +1198,14 @@ class Parser:
         left = self.parse_bxor()
         while self.consume(TK_PUNCT, '|'):
             right = self.parse_bxor()
-            left = BinOp('|', left, right)
+            left = self._const_fold('|', left, right)  # Phase 5 PoC: fold const|const
         return left
 
     def parse_bxor(self):
         left = self.parse_band()
         while self.consume(TK_PUNCT, '^'):
             right = self.parse_band()
-            left = BinOp('^', left, right)
+            left = self._const_fold('^', left, right)  # Phase 5 PoC: fold const^const
         return left
 
     def parse_band(self):
@@ -1213,7 +1213,7 @@ class Parser:
         while self.match(TK_PUNCT, '&') and self.peek(1).value != '&':
             self.advance()
             right = self.parse_eq()
-            left = BinOp('&', left, right)
+            left = self._const_fold('&', left, right)  # Phase 5 PoC: fold const&const
         return left
 
     def parse_eq(self):
@@ -1237,7 +1237,15 @@ class Parser:
         while self.cur().kind == TK_PUNCT and self.cur().value in ('<<', '>>'):
             op = self.advance().value
             right = self.parse_add()
-            left = BinOp(op, left, right)
+            # Phase 5 PoC (2026-06-22): fold `<<`/`>>` of two compile-time
+            # constants like parse_add/parse_mul already do. _const_fold
+            # already handles these ops; parse_shift was the only arith
+            # level not wired to it, so `1u << 3` emitted a runtime
+            # `ld WA,1; extz; sll 3` instead of the constant 8 (cf
+            # NgpCraft_rebuild FINDINGS §0quater). Semantics-preserving:
+            # only fires when BOTH operands are compile-time Const.
+            # Measured: StarGunner j16 body 146112 -> 145945 B (-167).
+            left = self._const_fold(op, left, right)
         return left
 
     @staticmethod
@@ -1643,6 +1651,20 @@ class CodeGen:
             'functions_with_structured_emits': 0,
             'shadow_skipped_structured': 0,
         }
+
+        # Phase 5 (2026-06-22) — NATIVE 32-bit reg-reg ALU for sz==4 binops.
+        # The legacy sz==4 path byte-splits (`add A,L; adc W,H`) which only
+        # touches the LOW 16 bits → 32-bit `long`/pointer arithmetic that
+        # crosses a 64 KB boundary is COMPUTED WRONG (verified: 0x20FFFF+1
+        # → 0x200000 instead of 0x210000). The native op `add XWA, XHL` is
+        # both correct (full 32-bit) and shorter. It needs the E8..EF
+        # encoding (silicon-safe, CC900-proven) which t900as now emits for
+        # 32-bit r+r (was D8..DF = HW-broken). Emulator-verified:
+        # add/sub/and/or/xor XWA,XHL execute and cross bit-16 correctly.
+        # GATED OFF by default (HW-unvalidated on our corpus for the full
+        # E8..EF ALU family; CC900 proves E8/E9/EA, EB is emulator-clean).
+        # Set T900CC_C5_ALU32=1 to opt in (produces a HW-test ROM).
+        self._opt_c5_alu32 = os.environ.get('T900CC_C5_ALU32', '0') != '0'
 
         # Chantier 4 Phase P-4' (post P-4 rollback) — safe peephole that
         # removes consecutive `push X; pop X` (same register) no-op
@@ -6686,16 +6708,23 @@ class CodeGen:
         # Emit operation
         if op == '+':
             if sz == 4:
-                # 'add XWA, XHL' = D0 prefix → broken silicon. Split into 16-bit ops.
-                self.emit_instr('add  A, L           ; low 16: A += XHL.low (CF safe)')
-                self.emit_instr('adc  W, H           ; high 16: W += XHL.high + carry (CE safe)')
+                if self._opt_c5_alu32:
+                    # Phase 5: native full-32-bit add (E8..EF enc, HW-safe via t900as).
+                    self.emit_instr('add  XWA, XHL       ; full 32-bit (Phase5 alu32)')
+                else:
+                    # Legacy: byte-split touches LOW 16 ONLY → wrong above 64 KB.
+                    self.emit_instr('add  A, L           ; low 16: A += XHL.low (CF safe)')
+                    self.emit_instr('adc  W, H           ; high 16: W += XHL.high + carry (CE safe)')
             else:
                 self._emit_alu16('+')
         elif op == '-':
             if sz == 4:
-                # 'sub XWA, XHL' = D0 prefix → broken silicon. Split into 16-bit ops.
-                self.emit_instr('sub  A, L           ; low 16: A -= XHL.low (CF safe)')
-                self.emit_instr('sbc  W, H           ; high 16: W -= XHL.high - borrow (CE safe)')
+                if self._opt_c5_alu32:
+                    self.emit_instr('sub  XWA, XHL       ; full 32-bit (Phase5 alu32)')
+                else:
+                    # Legacy: byte-split touches LOW 16 ONLY → wrong above 64 KB.
+                    self.emit_instr('sub  A, L           ; low 16: A -= XHL.low (CF safe)')
+                    self.emit_instr('sbc  W, H           ; high 16: W -= XHL.high - borrow (CE safe)')
             else:
                 self._emit_alu16('-')
         elif op == '*':
@@ -6762,24 +6791,34 @@ class CodeGen:
                 self.emit_instr('pop  WA')              # WA = remainder
         elif op == '&':
             if sz == 4:
-                # 'and XWA, XHL' = D0 prefix → broken silicon. Split into 16-bit ops.
-                self.emit_instr('and  A, L           ; low 16: A &= XHL.low (CF safe)')
-                self.emit_instr('and  W, H           ; high 16: W &= XHL.high (CE safe)')
-                self.emit_instr('db 0xE8, 0x12       ; extz XWA — zero high 16 (E8 safe)')
+                if self._opt_c5_alu32:
+                    self.emit_instr('and  XWA, XHL       ; full 32-bit (Phase5 alu32)')
+                else:
+                    # Legacy: ANDs low 16 then ZEROES high 16 (extz) — wrong for
+                    # true 32-bit AND (should AND the high halves, not clear them).
+                    self.emit_instr('and  A, L           ; low 16: A &= XHL.low (CF safe)')
+                    self.emit_instr('and  W, H           ; high 16: W &= XHL.high (CE safe)')
+                    self.emit_instr('db 0xE8, 0x12       ; extz XWA — zero high 16 (E8 safe)')
             else:
                 self._emit_alu16('&')
         elif op == '|':
             if sz == 4:
-                # 'or XWA, XHL' = D0 prefix → broken silicon. Split into 16-bit ops.
-                self.emit_instr('or   A, L           ; low 16: A |= XHL.low (CF safe)')
-                self.emit_instr('or   W, H           ; high 16: W |= XHL.high (CE safe)')
+                if self._opt_c5_alu32:
+                    self.emit_instr('or   XWA, XHL       ; full 32-bit (Phase5 alu32)')
+                else:
+                    # Legacy: byte-split touches LOW 16 ONLY → high 16 left stale.
+                    self.emit_instr('or   A, L           ; low 16: A |= XHL.low (CF safe)')
+                    self.emit_instr('or   W, H           ; high 16: W |= XHL.high (CE safe)')
             else:
                 self._emit_alu16('|')
         elif op == '^':
             if sz == 4:
-                # 'xor XWA, XHL' = D0 prefix → broken silicon. Split into 16-bit ops.
-                self.emit_instr('xor  A, L           ; low 16: A ^= XHL.low (CF safe)')
-                self.emit_instr('xor  W, H           ; high 16: W ^= XHL.high (CE safe)')
+                if self._opt_c5_alu32:
+                    self.emit_instr('xor  XWA, XHL       ; full 32-bit (Phase5 alu32)')
+                else:
+                    # Legacy: byte-split touches LOW 16 ONLY → high 16 left stale.
+                    self.emit_instr('xor  A, L           ; low 16: A ^= XHL.low (CF safe)')
+                    self.emit_instr('xor  W, H           ; high 16: W ^= XHL.high (CE safe)')
             else:
                 self._emit_alu16('^')
         elif op == '<<':
@@ -7130,9 +7169,9 @@ class CodeGen:
 
         # Compute new value
         # NOTE: inc/dec WA (D0 61/D0 69) is broken on NGPC hardware (bisect_j7d confirmed).
-        #       add A,C (CB 81) = C-source arith/logic ALU CASSÉ sur silicium NGPC (bisect_j8z13).
-        #       NUANCE: le break CB est sub-op-specific — byte mul/div C-source
-        #       (CB 0x40..0x5F, ex. div A,C = CB 51) est SAFE (hw_test_bytediv 2026-07-08).
+        #       add A,C (CB 81) = ALU byte C-source (CB sous-op 0x80..0xFF) CASSÉ sur silicium NGPC (bisect_j8z13).
+        #       Sous-op-spécifique : le byte mul/div reg-reg CB 0x40..0x5F (CB 51 = div A,C) est HW-cleared/SAFE
+        #       (hw_test_bytediv 2026-07-08, miroir word D8..DF 0x40..0x5F) ; seuls les ALU C-source cassent.
         #       Fix: utiliser HL — add A,L (CF 81) + adc W,H (CE B0) sont SAFE.
         #       delta=1  -> ld HL, 1      (H=0, L=1)
         #       delta=-1 -> ld HL, 65535  (H=0xFF, L=0xFF = -1 en u16)

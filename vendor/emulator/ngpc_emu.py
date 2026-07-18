@@ -15,8 +15,14 @@ from core.checkpoints import (
     load_named_checkpoint,
     save_named_checkpoint,
 )
-from core.cpu import NgpcCpuState
-from core.decode import DecodeResult, decode_instruction_at, decode_next_instruction
+from core.cpu import NgpcCpuState, encode_f_from_flags
+from core.decode import (
+    CONTROL_REGISTER_NAMES,
+    DecodeResult,
+    control_register_name,
+    decode_instruction_at,
+    decode_next_instruction,
+)
 from core.engine_bridge import (
     EngineBridgeError,
     build_error_response,
@@ -47,6 +53,10 @@ from core.memory import MemoryReadResult, load_read_bus
 from core.quirks import match_known_quirk, match_known_silicon_broken
 from core.rom import NgpcRomHeader, load_rom_header
 from core.run_steps import RunStepsResult, RunUntilResult, load_run_steps, load_run_until
+from core.seed_presets import (
+    BIOS_HANDOFF_XSP,
+    bios_handoff_minimal_seed_registers,
+)
 from core.k2ge import (
     CHAR_RAM_TILE_COUNT,
     CHAR_RAM_TILE_HEIGHT,
@@ -335,13 +345,22 @@ def _machine_to_dict(state: NgpcMachineState) -> dict[str, object]:
             "sr_raw_hex": None if state.cpu.sr_raw is None else f"0x{state.cpu.sr_raw:04X}",
             "register_bank": state.cpu.register_bank,
             "modeled_fields": list(state.cpu.modeled_fields),
-            "flags": {
-                "sf": state.cpu.flags.sf,
-                "zf": state.cpu.flags.zf,
-                "vf": state.cpu.flags.vf,
-                "hf": state.cpu.flags.hf,
-                "cf": state.cpu.flags.cf,
-            },
+        "flags": {
+            "sf": state.cpu.flags.sf,
+            "zf": state.cpu.flags.zf,
+            "vf": state.cpu.flags.vf,
+            "hf": state.cpu.flags.hf,
+            "cf": state.cpu.flags.cf,
+            "nf": state.cpu.flags.nf,
+        },
+        "alt_flags": {
+            "sf": None if state.cpu.alt_flags is None else state.cpu.alt_flags.sf,
+            "zf": None if state.cpu.alt_flags is None else state.cpu.alt_flags.zf,
+            "vf": None if state.cpu.alt_flags is None else state.cpu.alt_flags.vf,
+            "hf": None if state.cpu.alt_flags is None else state.cpu.alt_flags.hf,
+            "cf": None if state.cpu.alt_flags is None else state.cpu.alt_flags.cf,
+            "nf": None if state.cpu.alt_flags is None else state.cpu.alt_flags.nf,
+        },
             "registers": {
                 "xwa": state.cpu.regs.xwa,
                 "xbc": state.cpu.regs.xbc,
@@ -1701,6 +1720,16 @@ def _cpu_named_hex(cpu: NgpcCpuState, name: str) -> str:
     if name == "PC":
         return f"0x{cpu.pc:08X}"
 
+    if name == "F":
+        value = encode_f_from_flags(cpu.flags)
+        return "<unknown>" if value is None else f"0x{value:02X}"
+
+    if name == "F'":
+        if cpu.alt_flags is None:
+            return "<unknown>"
+        value = encode_f_from_flags(cpu.alt_flags)
+        return "<unknown>" if value is None else f"0x{value:02X}"
+
     if "@bank" in name:
         base_name, _, bank_suffix = name.partition("@bank")
         if (
@@ -1763,6 +1792,9 @@ def _cpu_named_hex(cpu: NgpcCpuState, name: str) -> str:
         if cpu.iff_enabled is None:
             return "<unknown>"
         return "enabled" if cpu.iff_enabled else "disabled"
+
+    if name == "SR":
+        return "<unknown>" if cpu.sr_raw is None else f"0x{cpu.sr_raw:04X}"
 
     if name == "RFP":
         return "<unknown>" if cpu.rfp is None else str(cpu.rfp)
@@ -1857,6 +1889,11 @@ _ADECL_ARG_ZERO_SEEDS = {
     "XBC": 0,
     "XDE": 0,
 }
+_TOOLCHAIN_LOOP_IZ_ZERO_SEEDS = {
+    "XIZ": 0,
+}
+_BIOS_HANDOFF_XSP_SEED = BIOS_HANDOFF_XSP
+_BIOS_HANDOFF_MINIMAL_SEEDS = bios_handoff_minimal_seed_registers()
 _BIOS_CALL_CONTEXT_ZERO_SEEDS = {
     "XBC@BANK3": 0,
     "XDE@BANK3": 0,
@@ -1864,6 +1901,7 @@ _BIOS_CALL_CONTEXT_ZERO_SEEDS = {
     "XIY": 0,
     "XIZ": 0,
 }
+_SEEDABLE_CONTROL_REGISTER_NAMES = {name.upper() for name in CONTROL_REGISTER_NAMES.values()}
 
 
 def _parse_seed_registers(args: argparse.Namespace) -> dict[str, int]:
@@ -1880,12 +1918,20 @@ def _parse_seed_registers(args: argparse.Namespace) -> dict[str, int]:
          zero the observed cdecl caller-saved set XWA/XBC/XDE/XHL/XIX/XIZ).
       3. --seed-zero-adecl-args (low-priority ABI/toolchain convention:
          zero the observed __adecl argument registers XWA/XBC/XDE).
-      4. --seed-reg NAME=VALUE (individual seeds; override the low-priority
-         preset flags above for any register named explicitly).
-      4b. --seed-zero-bios-call-context (low-priority exploratory default for
+      4. --seed-zero-toolchain-loop-iz (low-priority toolchain/codegen
+         convention: zero XIZ for loop-variable / post-increment paths where
+         the current toolchain commonly uses IZ explicitly).
+      5. --seed-bios-handoff-xsp (low-priority sourced reset-layer shortcut:
+         seed XSP with the documented BIOS hand-off stack top 0x00006C00).
+      6. --seed-bios-handoff-minimal (low-priority UI/session-equivalent
+         hand-off shortcut: seed `XSP=0x00006C00` and `INTNEST=0`).
+      7. --seed-reg NAME=VALUE (individual seeds; override the low-priority
+         preset flags above for any general or modeled control register named
+         explicitly).
+      7b. --seed-zero-bios-call-context (low-priority exploratory default for
          BIOS-call stepping: `XBC@bank3`, `XDE@bank3`, `XHL@bank3`, `XIY`,
          `XIZ` -> `0`).
-      5. --seed-xsp (a convenience shortcut equivalent to --seed-reg XSP=...).
+      8. --seed-xsp (a convenience shortcut equivalent to --seed-reg XSP=...).
 
     Conflicts between --seed-reg values for the same register raise.
     Mixing --seed-zero-bank0 with --seed-reg for the same register is
@@ -1901,6 +1947,12 @@ def _parse_seed_registers(args: argparse.Namespace) -> dict[str, int]:
         seed_registers.update(_CALLER_SAVED_ZERO_SEEDS)
     if getattr(args, "seed_zero_adecl_args", False):
         seed_registers.update(_ADECL_ARG_ZERO_SEEDS)
+    if getattr(args, "seed_zero_toolchain_loop_iz", False):
+        seed_registers.update(_TOOLCHAIN_LOOP_IZ_ZERO_SEEDS)
+    if getattr(args, "seed_bios_handoff_xsp", False):
+        seed_registers["XSP"] = _BIOS_HANDOFF_XSP_SEED
+    if getattr(args, "seed_bios_handoff_minimal", False):
+        seed_registers.update(_BIOS_HANDOFF_MINIMAL_SEEDS)
     if getattr(args, "seed_zero_bios_call_context", False):
         seed_registers.update(_BIOS_CALL_CONTEXT_ZERO_SEEDS)
 
@@ -1920,10 +1972,13 @@ def _parse_seed_registers(args: argparse.Namespace) -> dict[str, int]:
                     "banked seed register name must use XWA@bank0..3, XBC@bank0..3, "
                     "XDE@bank0..3 or XHL@bank0..3"
                 )
-        elif register_name not in {"XWA", "XBC", "XDE", "XHL", "XIX", "XIY", "XIZ", "XSP"}:
+        elif register_name not in {
+            "XWA", "XBC", "XDE", "XHL", "XIX", "XIY", "XIZ", "XSP",
+            *_SEEDABLE_CONTROL_REGISTER_NAMES,
+        }:
             raise ValueError(
                 "seed register name must be one of: XWA, XBC, XDE, XHL, XIX, XIY, XIZ, XSP, "
-                "or XWA/XBC/XDE/XHL@bank0..3"
+                "DMAS0..3, DMAD0..3, DMAC0..3, DMAM0..3, INTNEST, or XWA/XBC/XDE/XHL@bank0..3"
             )
         value = _parse_address(raw_value.strip()) & 0xFFFFFFFF
         current_value = seed_registers.get(register_name)
@@ -1943,6 +1998,21 @@ def _parse_seed_registers(args: argparse.Namespace) -> dict[str, int]:
             and register_name in _ADECL_ARG_ZERO_SEEDS
             and current_value == 0
         )
+        is_toolchain_loop_iz_default = (
+            getattr(args, "seed_zero_toolchain_loop_iz", False)
+            and register_name in _TOOLCHAIN_LOOP_IZ_ZERO_SEEDS
+            and current_value == 0
+        )
+        is_bios_handoff_xsp_default = (
+            getattr(args, "seed_bios_handoff_xsp", False)
+            and register_name == "XSP"
+            and current_value == _BIOS_HANDOFF_XSP_SEED
+        )
+        is_bios_handoff_minimal_default = (
+            getattr(args, "seed_bios_handoff_minimal", False)
+            and register_name in _BIOS_HANDOFF_MINIMAL_SEEDS
+            and current_value == _BIOS_HANDOFF_MINIMAL_SEEDS[register_name]
+        )
         is_bios_call_default = (
             getattr(args, "seed_zero_bios_call_context", False)
             and register_name in _BIOS_CALL_CONTEXT_ZERO_SEEDS
@@ -1954,6 +2024,9 @@ def _parse_seed_registers(args: argparse.Namespace) -> dict[str, int]:
             and not is_bank0_default
             and not is_caller_saved_default
             and not is_adecl_arg_default
+            and not is_toolchain_loop_iz_default
+            and not is_bios_handoff_xsp_default
+            and not is_bios_handoff_minimal_default
             and not is_bios_call_default
         ):
             raise ValueError(f"conflicting seed values were provided for {register_name}")
@@ -1962,7 +2035,20 @@ def _parse_seed_registers(args: argparse.Namespace) -> dict[str, int]:
     if args.seed_xsp is not None:
         xsp_value = _parse_address(args.seed_xsp) & 0xFFFFFFFF
         current_value = seed_registers.get("XSP")
-        if current_value is not None and current_value != xsp_value:
+        is_bios_handoff_xsp_default = (
+            getattr(args, "seed_bios_handoff_xsp", False)
+            and current_value == _BIOS_HANDOFF_XSP_SEED
+        )
+        is_bios_handoff_minimal_default = (
+            getattr(args, "seed_bios_handoff_minimal", False)
+            and current_value == _BIOS_HANDOFF_XSP_SEED
+        )
+        if (
+            current_value is not None
+            and current_value != xsp_value
+            and not is_bios_handoff_xsp_default
+            and not is_bios_handoff_minimal_default
+        ):
             raise ValueError("conflicting seed values were provided for XSP")
         seed_registers["XSP"] = xsp_value
 
@@ -2023,6 +2109,37 @@ def _execute_to_dict(result: ExecutionResult) -> dict[str, object]:
             for name in result.written_registers
         ],
         "flag_changes": flag_changes,
+    }
+
+
+def _irq_delivery_to_dict(delivery: "IrqDeliveryResult | None") -> dict[str, object] | None:
+    if delivery is None:
+        return None
+    return {
+        "delivered": delivery.delivered,
+        "blocked_reason": delivery.blocked_reason,
+        "note": delivery.note,
+        "cycles_consumed": delivery.cycles_consumed,
+        "vector_slot_address": delivery.vector_slot_address,
+        "vector_slot_address_hex": (
+            None
+            if delivery.vector_slot_address is None
+            else f"0x{delivery.vector_slot_address:08X}"
+        ),
+        "vector_slot_raw": delivery.vector_slot_raw,
+        "vector_slot_raw_hex": (
+            None
+            if delivery.vector_slot_raw is None
+            else f"0x{delivery.vector_slot_raw:08X}"
+        ),
+        "vector_target": delivery.vector_target,
+        "vector_target_hex": (
+            None
+            if delivery.vector_target is None
+            else f"0x{delivery.vector_target:08X}"
+        ),
+        "used_handler_pointer": delivery.used_handler_pointer,
+        "used_slot_fallback": delivery.used_slot_fallback,
     }
 
 
@@ -2099,6 +2216,8 @@ def _step_exec_to_dict(result: RunStepsResult) -> dict[str, object]:
         "start_pc": result.start_pc,
         "start_pc_hex": f"0x{result.start_pc:08X}",
         "executed_count": result.executed_count,
+        "irq_deliveries": result.irq_deliveries,
+        "last_irq_delivery": _irq_delivery_to_dict(result.last_irq_delivery),
         "stop_reason": result.stop_reason,
         "final_cpu": _cpu_to_dict(result.final_cpu),
         "final_memory": _memory_overlay_to_rows(result.final_memory),
@@ -2217,6 +2336,16 @@ def _cmd_step_exec(args: argparse.Namespace) -> int:
     print(f"Execution status: {execution['status']}")
     print(f"Stop reason: {payload['stop_reason']}")
     print(f"Final PC: {payload['final_cpu']['pc_hex']}")  # type: ignore[index]
+    print(f"IRQ deliveries: {payload['irq_deliveries']}")
+    last_irq_delivery = payload["last_irq_delivery"]
+    assert last_irq_delivery is None or isinstance(last_irq_delivery, dict)
+    if last_irq_delivery is not None:
+        print(
+            "Last IRQ delivery: "
+            f"slot={last_irq_delivery['vector_slot_address_hex']} "
+            f"target={last_irq_delivery['vector_target_hex']} "
+            f"fallback={'yes' if last_irq_delivery['used_slot_fallback'] else 'no'}"
+        )
     symbol_line = _format_symbol_line(symbol_payload)
     if symbol_line is not None:
         print(symbol_line)
@@ -2271,6 +2400,8 @@ def _run_steps_to_dict(result: RunStepsResult) -> dict[str, object]:
         "requested_count": result.requested_count,
         "emitted_count": result.emitted_count,
         "executed_count": result.executed_count,
+        "irq_deliveries": result.irq_deliveries,
+        "last_irq_delivery": _irq_delivery_to_dict(result.last_irq_delivery),
         "stop_reason": result.stop_reason,
         "final_cpu": _cpu_to_dict(result.final_cpu),
         "final_memory": _memory_overlay_to_rows(result.final_memory),
@@ -2292,6 +2423,8 @@ def _execution_trace_to_dict(result: ExecutionTraceResult) -> dict[str, object]:
         "requested_count": result.requested_count,
         "emitted_count": result.emitted_count,
         "executed_count": result.executed_count,
+        "irq_deliveries": result.irq_deliveries,
+        "last_irq_delivery": _irq_delivery_to_dict(result.last_irq_delivery),
         "stop_reason": result.stop_reason,
         "final_cpu": _cpu_to_dict(result.final_cpu),
         "final_memory": _memory_overlay_to_rows(result.final_memory),
@@ -2319,10 +2452,10 @@ def _advance_frame_state_for_run(
     - **Cycle total mode** (Phase 3.2.3a, preferred): pass
       `total_cycles_consumed` from `run_result.total_cycles_consumed`.
       Each executed instruction + each IRQ delivery contributes its
-      own cycle count to the total. Currently every instruction
-      contributes the flat `ESTIMATED_CYCLES_PER_INSTRUCTION` and
-      every IRQ entry contributes `IRQ_DELIVERY_CYCLES = 13`. Phase
-      3.2.3b will populate per-opcode cycle counts.
+      own cycle count to the total. Unpopulated instructions still
+      fall back to `ESTIMATED_CYCLES_PER_INSTRUCTION`, selected common
+      opcodes now override it with real TLCS-900 timing, and every IRQ
+      entry contributes `IRQ_DELIVERY_CYCLES = 13`.
     - **Executed-count fallback** (Phase 3.2.0/3.2.1): when
       `total_cycles_consumed` is None, multiply `executed_count` by
       `ESTIMATED_CYCLES_PER_INSTRUCTION` (the original flat model).
@@ -2507,8 +2640,18 @@ def _cmd_run_steps(args: argparse.Namespace) -> int:
     print(f"Requested steps: {payload['requested_count']}")
     print(f"Emitted records: {payload['emitted_count']}")
     print(f"Executed records: {payload['executed_count']}")
+    print(f"IRQ deliveries: {payload['irq_deliveries']}")
     print(f"Stop reason: {payload['stop_reason']}")
     print(f"Final PC: {payload['final_cpu']['pc_hex']}")
+    last_irq_delivery = payload["last_irq_delivery"]
+    assert last_irq_delivery is None or isinstance(last_irq_delivery, dict)
+    if last_irq_delivery is not None:
+        print(
+            "Last IRQ delivery: "
+            f"slot={last_irq_delivery['vector_slot_address_hex']} "
+            f"target={last_irq_delivery['vector_target_hex']} "
+            f"fallback={'yes' if last_irq_delivery['used_slot_fallback'] else 'no'}"
+        )
     symbol_line = _format_symbol_line(symbol_payload)
     if symbol_line is not None:
         print(symbol_line)
@@ -2662,8 +2805,18 @@ def _cmd_trace_exec(args: argparse.Namespace) -> int:
     print(f"Requested records: {payload['requested_count']}")
     print(f"Emitted records: {payload['emitted_count']}")
     print(f"Executed records: {payload['executed_count']}")
+    print(f"IRQ deliveries: {payload['irq_deliveries']}")
     print(f"Stop reason: {payload['stop_reason']}")
     print(f"Final PC: {payload['final_cpu']['pc_hex']}")
+    last_irq_delivery = payload["last_irq_delivery"]
+    assert last_irq_delivery is None or isinstance(last_irq_delivery, dict)
+    if last_irq_delivery is not None:
+        print(
+            "Last IRQ delivery: "
+            f"slot={last_irq_delivery['vector_slot_address_hex']} "
+            f"target={last_irq_delivery['vector_target_hex']} "
+            f"fallback={'yes' if last_irq_delivery['used_slot_fallback'] else 'no'}"
+        )
     symbol_line = _format_symbol_line(symbol_payload)
     if symbol_line is not None:
         print(symbol_line)
@@ -2725,6 +2878,8 @@ def _run_until_exec_to_dict(result: RunUntilResult) -> dict[str, object]:
         "target_pc": result.target_pc,
         "target_pc_hex": f"0x{result.target_pc:08X}",
         "executed_count": result.executed_count,
+        "irq_deliveries": result.irq_deliveries,
+        "last_irq_delivery": _irq_delivery_to_dict(result.last_irq_delivery),
         "stop_reason": result.stop_reason,
         "final_cpu": _cpu_to_dict(result.final_cpu),
         "final_memory_size": len(result.final_memory),
@@ -2770,6 +2925,7 @@ def _cmd_run_until_exec(args: argparse.Namespace) -> int:
         auto_tick_period=args.auto_tick_period,
         initial_frame_state=initial_frame_state,
         initial_irq_state=initial_irq_state,
+        bios_path=getattr(args, "bios", None),
     )
     payload = _run_until_exec_to_dict(result)
     if seed_registers:
@@ -2846,8 +3002,18 @@ def _cmd_run_until_exec(args: argparse.Namespace) -> int:
         )
     _print_auto_tick_summary(auto_tick_payload)
     print(f"Executed steps: {payload['executed_count']}")
+    print(f"IRQ deliveries: {payload['irq_deliveries']}")
     print(f"Stop reason: {payload['stop_reason']}")
     print(f"Final PC: {payload['final_cpu']['pc_hex']}")  # type: ignore[index]
+    last_irq_delivery = payload["last_irq_delivery"]
+    assert last_irq_delivery is None or isinstance(last_irq_delivery, dict)
+    if last_irq_delivery is not None:
+        print(
+            "Last IRQ delivery: "
+            f"slot={last_irq_delivery['vector_slot_address_hex']} "
+            f"target={last_irq_delivery['vector_target_hex']} "
+            f"fallback={'yes' if last_irq_delivery['used_slot_fallback'] else 'no'}"
+        )
     symbol_line = _format_symbol_line(symbol_payload)
     if symbol_line is not None:
         print(symbol_line)
@@ -3103,11 +3269,75 @@ def _cmd_trace_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hex_or_none(value: int | None, width: int = 8) -> str | None:
+    if value is None:
+        return None
+    return f"0x{value:0{width}X}"
+
+
+def _cpu_control_register_rows(cpu: NgpcCpuState) -> list[dict[str, object]]:
+    control = cpu.control_registers
+    rows: list[dict[str, object]] = []
+
+    def _append_group(
+        base_code: int,
+        values: tuple[int | None, ...],
+        *,
+        size: str,
+        width: int,
+        step: int,
+    ) -> None:
+        for index, value in enumerate(values):
+            code = base_code + (index * step)
+            rows.append(
+                {
+                    "name": control_register_name(code),
+                    "size": size,
+                    "value": value,
+                    "value_hex": _hex_or_none(value, width),
+                }
+            )
+
+    _append_group(
+        0x00,
+        (None, None, None, None) if control is None else control.dmas,
+        size="long",
+        width=8,
+        step=0x04,
+    )
+    _append_group(
+        0x10,
+        (None, None, None, None) if control is None else control.dmad,
+        size="long",
+        width=8,
+        step=0x04,
+    )
+    _append_group(
+        0x20,
+        (None, None, None, None) if control is None else control.dmac,
+        size="word",
+        width=4,
+        step=0x04,
+    )
+    _append_group(
+        0x22,
+        (None, None, None, None) if control is None else control.dmam,
+        size="byte",
+        width=2,
+        step=0x04,
+    )
+    rows.append(
+        {
+            "name": control_register_name(0x30),
+            "size": "word",
+            "value": None if control is None else control.intnest,
+            "value_hex": _hex_or_none(None if control is None else control.intnest, 4),
+        }
+    )
+    return rows
+
+
 def _cpu_to_dict(cpu: NgpcCpuState) -> dict[str, object]:
-    def _hex_or_none(value: int | None, width: int = 8) -> str | None:
-        if value is None:
-            return None
-        return f"0x{value:0{width}X}"
 
     return {
         "pc": cpu.pc,
@@ -3124,6 +3354,14 @@ def _cpu_to_dict(cpu: NgpcCpuState) -> dict[str, object]:
             "hf": cpu.flags.hf,
             "cf": cpu.flags.cf,
             "nf": cpu.flags.nf,
+        },
+        "alt_flags": {
+            "sf": None if cpu.alt_flags is None else cpu.alt_flags.sf,
+            "zf": None if cpu.alt_flags is None else cpu.alt_flags.zf,
+            "vf": None if cpu.alt_flags is None else cpu.alt_flags.vf,
+            "hf": None if cpu.alt_flags is None else cpu.alt_flags.hf,
+            "cf": None if cpu.alt_flags is None else cpu.alt_flags.cf,
+            "nf": None if cpu.alt_flags is None else cpu.alt_flags.nf,
         },
         "registers": {
             "xwa": cpu.regs.xwa,
@@ -3143,6 +3381,7 @@ def _cpu_to_dict(cpu: NgpcCpuState) -> dict[str, object]:
             "xsp": cpu.regs.xsp,
             "xsp_hex": _hex_or_none(cpu.regs.xsp),
         },
+        "control_registers": _cpu_control_register_rows(cpu),
         "iff_enabled": cpu.iff_enabled,
         "iff_level": cpu.iff_level,
         "note": cpu.note,
@@ -3233,7 +3472,16 @@ def _registers_view(cpu: NgpcCpuState) -> dict[str, object]:
             "C": cpu.flags.cf,
             "N": cpu.flags.nf,
         },
+        "alt_flags": {
+            "S": None if cpu.alt_flags is None else cpu.alt_flags.sf,
+            "Z": None if cpu.alt_flags is None else cpu.alt_flags.zf,
+            "V": None if cpu.alt_flags is None else cpu.alt_flags.vf,
+            "H": None if cpu.alt_flags is None else cpu.alt_flags.hf,
+            "C": None if cpu.alt_flags is None else cpu.alt_flags.cf,
+            "N": None if cpu.alt_flags is None else cpu.alt_flags.nf,
+        },
         "registers": rows,
+        "control_registers": _cpu_control_register_rows(cpu),
         "modeled_fields": list(cpu.modeled_fields),
     }
 
@@ -3275,6 +3523,12 @@ def _cmd_registers(args: argparse.Namespace) -> int:
         for name in ("S", "Z", "V", "H", "C", "N")
     )
     print(f"Flags: {flag_text}")
+    alt_flags = view["alt_flags"]  # type: ignore[index]
+    alt_flag_text = " ".join(
+        f"{name}={'1' if alt_flags[name] is True else '0' if alt_flags[name] is False else '?'}"  # type: ignore[index]
+        for name in ("S", "Z", "V", "H", "C", "N")
+    )
+    print(f"Flags': {alt_flag_text}")
     print()
     print(f"{'Long':<5} {'value':<11}  {'Word':<5} {'value':<7}  {'Hi8':<4} {'value':<5}  {'Lo8':<4} {'value':<5}")
     for row in view["registers"]:  # type: ignore[index]
@@ -3294,6 +3548,10 @@ def _cmd_registers(args: argparse.Namespace) -> int:
             f"{hi_name:<4} {hi_v:<5}  "
             f"{lo_name:<4} {lo_v:<5}"
         )
+    print()
+    print(f"{'CR':<8} {'size':<4} {'value':<11}")
+    for row in view["control_registers"]:  # type: ignore[index]
+        print(f"{row['name']:<8} {row['size']:<4} {str(row['value_hex'] or '<unknown>'):<11}")
     return 0
 
 
@@ -3316,13 +3574,26 @@ def _cmd_cpu_info(args: argparse.Namespace) -> int:
     regs = payload["registers"]  # type: ignore[index]
     for name in ("xwa", "xbc", "xde", "xhl", "xix", "xiy", "xiz", "xsp"):
         print(f"  - {name.upper()}: {regs[f'{name}_hex'] or '<unknown>'}")
+    print("Control registers:")
+    for row in payload["control_registers"]:  # type: ignore[index]
+        print(f"  - {row['name']}: {row['value_hex'] or '<unknown>'} ({row['size']})")
     print(
         "Flags: "
         f"S={payload['flags']['sf']} "
         f"Z={payload['flags']['zf']} "
         f"V={payload['flags']['vf']} "
         f"H={payload['flags']['hf']} "
-        f"C={payload['flags']['cf']}"
+        f"C={payload['flags']['cf']} "
+        f"N={payload['flags']['nf']}"
+    )
+    print(
+        "Flags': "
+        f"S={payload['alt_flags']['sf']} "
+        f"Z={payload['alt_flags']['zf']} "
+        f"V={payload['alt_flags']['vf']} "
+        f"H={payload['alt_flags']['hf']} "
+        f"C={payload['alt_flags']['cf']} "
+        f"N={payload['alt_flags']['nf']}"
     )
     iff_str = "<unknown>" if payload["iff_enabled"] is None else ("enabled" if payload["iff_enabled"] else "disabled")
     print(f"IFF: {iff_str}")
@@ -3351,10 +3622,16 @@ def _cmd_ui(args: argparse.Namespace) -> int:
     the user can pick a ROM via File → Open ROM…
     """
     rom_path: Path | None = None
+    bios_path: Path | None = None
     if args.rom is not None:
         rom_path = Path(args.rom)
         if not rom_path.exists():
             print(f"ERROR: ROM not found: {rom_path}", file=sys.stderr)
+            return 1
+    if getattr(args, "bios", None) is not None:
+        bios_path = Path(args.bios)
+        if not bios_path.exists():
+            print(f"ERROR: BIOS not found: {bios_path}", file=sys.stderr)
             return 1
     try:
         from ngpc_emu_ui_qt import launch_ui
@@ -3365,7 +3642,7 @@ def _cmd_ui(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    return launch_ui(rom_path)
+    return launch_ui(rom_path, bios_path=bios_path)
 
 
 def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
@@ -3414,9 +3691,11 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
     decoded_bytes = 0
     unknown_op: Counter[int] = Counter()
     unsupported_op: Counter[int] = Counter()
+    silicon_broken_fallout_op: Counter[int] = Counter()
     decoded_op: Counter[int] = Counter()
     sample_addresses: dict[int, list[int]] = {}
     stop_reason = "byte-budget-reached"
+    silicon_broken_fallout_pcs: set[int] = set()
 
     if args.follow_direct_control_flow:
         stop_reason = "worklist-exhausted"
@@ -3436,6 +3715,12 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
                 decoded_bytes += length
                 if d.raw_bytes:
                     decoded_op[d.raw_bytes[0]] += 1
+                if (
+                    d.falls_through
+                    and d.next_sequential_pc is not None
+                    and match_known_silicon_broken(d) is not None
+                ):
+                    silicon_broken_fallout_pcs.add(d.next_sequential_pc)
                 if d.falls_through and d.next_sequential_pc is not None:
                     pending.append(d.next_sequential_pc)
                 if d.direct_target is not None:
@@ -3446,7 +3731,9 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
             if read_result.status != "ok" or not read_result.data:
                 continue
             b = read_result.data[0]
-            if d.status == "unknown-opcode":
+            if pc in silicon_broken_fallout_pcs:
+                silicon_broken_fallout_op[b] += 1
+            elif d.status == "unknown-opcode":
                 unknown_op[b] += 1
             else:
                 unsupported_op[b] += 1
@@ -3461,11 +3748,18 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
                 decoded_bytes += length
                 if d.raw_bytes:
                     decoded_op[d.raw_bytes[0]] += 1
+                is_silicon_broken = match_known_silicon_broken(d) is not None
+                if (
+                    d.falls_through
+                    and d.next_sequential_pc is not None
+                    and is_silicon_broken
+                ):
+                    silicon_broken_fallout_pcs.add(d.next_sequential_pc)
                 if args.stop_on_non_fallthrough and d.falls_through is False:
                     stop_reason = "stopped-on-non-fallthrough"
                     pc += length
                     break
-                if args.stop_on_silicon_broken and match_known_silicon_broken(d) is not None:
+                if args.stop_on_silicon_broken and is_silicon_broken:
                     stop_reason = "stopped-on-silicon-broken"
                     pc += length
                     break
@@ -3477,14 +3771,20 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
                 pc += 1
                 continue
             b = read_result.data[0]
-            if d.status == "unknown-opcode":
+            if pc in silicon_broken_fallout_pcs:
+                silicon_broken_fallout_op[b] += 1
+            elif d.status == "unknown-opcode":
                 unknown_op[b] += 1
             else:
                 unsupported_op[b] += 1
             sample_addresses.setdefault(b, []).append(pc)
             pc += 1
 
-    total_misses = sum(unknown_op.values()) + sum(unsupported_op.values())
+    total_misses = (
+        sum(unknown_op.values())
+        + sum(unsupported_op.values())
+        + sum(silicon_broken_fallout_op.values())
+    )
     coverage_pct = (
         100.0 * decoded_bytes / max(1, budget)
     )
@@ -3500,6 +3800,7 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
             "stop_reason": stop_reason,
             "unknown_opcode_total": sum(unknown_op.values()),
             "unsupported_decoded_total": sum(unsupported_op.values()),
+            "silicon_broken_fallout_total": sum(silicon_broken_fallout_op.values()),
             "top_unknown_opcodes": [
                 {
                     "byte_hex": f"0x{b:02X}",
@@ -3514,6 +3815,16 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
                 {"byte_hex": f"0x{b:02X}", "count": c}
                 for b, c in unsupported_op.most_common(args.top)
             ],
+            "top_silicon_broken_fallout": [
+                {
+                    "byte_hex": f"0x{b:02X}",
+                    "count": c,
+                    "first_addresses_hex": [
+                        f"0x{a:08X}" for a in sample_addresses.get(b, [])[:3]
+                    ],
+                }
+                for b, c in silicon_broken_fallout_op.most_common(args.top)
+            ],
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
@@ -3527,20 +3838,30 @@ def _cmd_opcode_coverage(args: argparse.Namespace) -> int:
           f"({coverage_pct:.1f}% of budget)")
     print(f"Unknown-opcode misses   : {sum(unknown_op.values())}")
     print(f"Unsupported-decoded     : {sum(unsupported_op.values())}")
+    print(f"Silicon-broken fallout  : {sum(silicon_broken_fallout_op.values())}")
     if not total_misses:
         print("All bytes decoded — no coverage gaps in this walk.")
         return 0
-    print(f"\nTop {args.top} unknown opcode leading-bytes :")
-    print(f"  {'byte':>6}  {'count':>6}  first sample addresses")
-    for b, c in unknown_op.most_common(args.top):
-        sample = ", ".join(
-            f"0x{a:08X}" for a in sample_addresses.get(b, [])[:3]
-        )
-        print(f"  0x{b:02X}    {c:6d}  {sample}")
+    if unknown_op:
+        print(f"\nTop {args.top} unknown opcode leading-bytes :")
+        print(f"  {'byte':>6}  {'count':>6}  first sample addresses")
+        for b, c in unknown_op.most_common(args.top):
+            sample = ", ".join(
+                f"0x{a:08X}" for a in sample_addresses.get(b, [])[:3]
+            )
+            print(f"  0x{b:02X}    {c:6d}  {sample}")
     if unsupported_op:
         print(f"\nTop unsupported-decoded leading-bytes :")
         for b, c in unsupported_op.most_common(args.top):
             print(f"  0x{b:02X}    {c:6d}")
+    if silicon_broken_fallout_op:
+        print(f"\nTop immediate post-silicon-broken fallout bytes :")
+        print(f"  {'byte':>6}  {'count':>6}  first sample addresses")
+        for b, c in silicon_broken_fallout_op.most_common(args.top):
+            sample = ", ".join(
+                f"0x{a:08X}" for a in sample_addresses.get(b, [])[:3]
+            )
+            print(f"  0x{b:02X}    {c:6d}  {sample}")
     return 0
 
 
@@ -5730,6 +6051,14 @@ def build_parser() -> argparse.ArgumentParser:
             "UI opens with an empty session ; use File → Open ROM…"
         ),
     )
+    ui.add_argument(
+        "--bios",
+        help=(
+            "Optional path to a 64 KB NGPC BIOS image. When provided, the "
+            "live UI session can satisfy BIOS reads the same way the "
+            "executor CLI commands do."
+        ),
+    )
     ui.set_defaults(func=_cmd_ui)
 
     opcode_cov = sub.add_parser(
@@ -6608,6 +6937,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_until_exec.add_argument("rom", help="Path to a .ngp/.ngc ROM file.")
     run_until_exec.add_argument("target", help="Target PC in decimal or 0x-prefixed hex.")
+    run_until_exec.add_argument(
+        "--bios",
+        help=(
+            "Optional path to a BIOS image. Required by the SWI1 calls that read "
+            "real BIOS data (SYSFONTSET); without it those calls stop honestly."
+        ),
+    )
     run_until_exec.add_argument(
         "--address",
         help=(
@@ -8093,6 +8429,24 @@ def build_parser() -> argparse.ArgumentParser:
         "call boundaries without inventing non-argument scratch or frame state. "
         "NOT a hardware reset behavior; explicit --seed-reg NAME=VALUE still wins."
     )
+    _SEED_ZERO_TOOLCHAIN_LOOP_IZ_HELP = (
+        "Toolchain/codegen shortcut: set XIZ to 0 before run. Useful on the "
+        "current thc2-style loop/copy paths where IZ often carries the live loop "
+        "or post-increment pointer state and is explicitly saved/restored around calls. "
+        "NOT a hardware reset behavior; explicit --seed-reg NAME=VALUE still wins."
+    )
+    _SEED_BIOS_HANDOFF_XSP_HELP = (
+        "Sourced reset-layer shortcut: set XSP to the documented BIOS hand-off "
+        "stack top 0x00006C00 before run. Useful for the historical StarGunner/"
+        "bootstrap smoke context without repeating --seed-xsp 0x6C00. "
+        "Explicit --seed-reg XSP=... or --seed-xsp still wins."
+    )
+    _SEED_BIOS_HANDOFF_MINIMAL_HELP = (
+        "UI/session-equivalent hand-off shortcut: set XSP=0x00006C00 and "
+        "INTNEST=0 before run. Mirrors the current EmulatorSession BIOS "
+        "hand-off layer without inventing DMA control-register state. "
+        "Explicit --seed-reg NAME=VALUE or --seed-xsp still wins."
+    )
     _SEED_ZERO_BIOS_CALL_CONTEXT_HELP = (
         "Exploratory BIOS-call shortcut: set XBC@bank3/XDE@bank3/XHL@bank3/XIY/XIZ "
         "to 0 before run. Useful when stepping BIOS entry code that saves the bank-3 "
@@ -8124,6 +8478,21 @@ def build_parser() -> argparse.ArgumentParser:
             "--seed-zero-adecl-args",
             action="store_true",
             help=_SEED_ZERO_ADECL_ARGS_HELP,
+        )
+        seed_aware_parser.add_argument(
+            "--seed-zero-toolchain-loop-iz",
+            action="store_true",
+            help=_SEED_ZERO_TOOLCHAIN_LOOP_IZ_HELP,
+        )
+        seed_aware_parser.add_argument(
+            "--seed-bios-handoff-xsp",
+            action="store_true",
+            help=_SEED_BIOS_HANDOFF_XSP_HELP,
+        )
+        seed_aware_parser.add_argument(
+            "--seed-bios-handoff-minimal",
+            action="store_true",
+            help=_SEED_BIOS_HANDOFF_MINIMAL_HELP,
         )
         seed_aware_parser.add_argument(
             "--seed-zero-bios-call-context",

@@ -1,3 +1,4 @@
+
 # NgpCraft Live Editor
 
 **Browser-based live C editor for Neo Geo Pocket Color — write code, see the result, hear it too, no toolchain required.**
@@ -29,6 +30,8 @@ The API mirrors the NgpCraft template, so anything that runs in the editor is cl
 - **No runtime dependencies** — pure HTML/CSS/JS, no build step, no npm, no server required
 
 ---
+
+<img width="2403" height="1170" alt="9" src="https://github.com/user-attachments/assets/48168f82-11d5-4bb7-a5d4-b885add144ba" />
 
 ## Quick start
 

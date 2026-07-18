@@ -183,6 +183,51 @@ u8 enemy_speed(void) { return SPEED_BY_LEVEL[g_level]; }
 u8 fire_cooldown(void) { return FIRE_RATE_BY_LEVEL[g_level]; }
 ```
 
+### 3.4 Fixed vs self-timed frame rate (60 vs 30 fps)
+
+Not every game runs at a fixed 60 fps. Some (Cool Boarders Pocket, Densha de Go)
+**self-time**: the VBlank ISR does the full per-frame work only if the main loop
+already consumed the previous frame (a per-frame `vsync` byte, e.g. `0x4016`). If the
+per-frame work exceeds one VBlank period, the ISR skips every other VBlank and the game
+runs at **30 fps** automatically.
+
+```
+VBlank ISR:  cp (vsync),0xFF ; jr Z, skip   ; last frame not consumed -> skip
+             ...full work...  ; ld (vsync),0xFF
+main loop:   ld (vsync),0    ; ...update... ; spin until (vsync)!=0
+```
+The `0x4016` flag with the `cp ...,0xFF ; jr Z` guard is a real reverse-engineered
+pattern; whether it *sets* the frame rate depends on the per-frame load.
+
+> **Emulator bug — SOLVED (silicon-calibrated, 2026-07).** These games run at **30 fps on
+> silicon** but at **60 fps (2x too fast) on ares / BizHawk / this emulator** — the timer
+> counts double and the whole game is too fast. A genuine bug common to **all** NGPC
+> emulators. **Root cause: unmodelled cartridge-flash wait-states.** Every instruction is
+> fetched from the cart and data tables are read from it; that flash bus is slow, but
+> emulators fetch it for free, so cart code runs **~3.4x too fast**. The self-timed games'
+> per-frame work then fits inside one VBlank (60 fps) instead of spilling into a second
+> (30 fps). VBlank-locked games (Fatal Fury) are unaffected — their work fits in one frame
+> regardless.
+>
+> A calibration ROM run on **real hardware** (`hw_calibration/cpu_calib_v1.ngc`) measured
+> the per-class slowdown: short/fetch-bound ops ~3.4x, MUL/DIV ~2.5x, frame length (RASV)
+> correct — the exact signature of a fetch/access wait-state, not an execution-cost bug.
+> (The earlier "VRAM adjustment-circuitry wait-state" idea was **disproven** first: Cool
+> Boarders spins ~62% of every frame, so it is not CPU-bound and no VRAM cost could cause
+> the 2x. The slow bus is the **cart**, not VRAM. Also ruled out: clock gear, TI0 rate,
+> prescaler timers, global pacing.)
+>
+> **Fix (four causes).** (1) **3 cycles/byte for instruction FETCH from the cart**
+> (`Machine::cart_wait`) — silicon-confirmed. (2) Cart DATA reads are **NOT** wait-stated
+> (`data=0`) — a ROM found `CRND==RRND`, refuting an earlier `data=5` guess. (3) **MUL/DIV
+> were under-costed** (datasheet is a floor) — fixed to the silicon numbers. (4) The residual
+> ~51→30 fps is the game's big per-frame **LDIR** into a RAM buffer: the datasheet 7 cycles/byte
+> is also a floor, and **14 cycles/byte** puts Cool Boarders at 30 fps while Fatal Fury stays
+> at 60 — one fix, both games, confirmed by comparing the in-game timer to a stopwatch. (A
+> cart-flash write is also throttled in active display, but this game writes VRAM in vblank, so
+> that is a separate real effect, not its bottleneck.) **Any accurate NGPC emulator needs the
+> cart-flash FETCH wait-state and the silicon LDIR/MUL/DIV costs — the datasheet under-states them.**
+
 ---
 
 ## 4. Control Mapping Patterns

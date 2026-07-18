@@ -548,6 +548,70 @@ const NGPC_Interp = (() => {
     return out.join('\n');
   }
 
+  // HW-5 — TLCS-900 mis-encode inside an inline `__asm__` block.
+  //
+  // Hardware context: one opcode family MIS-ENCODES to a form that misbehaves
+  // on real NGPC silicon even though the assembler accepts it. (The former
+  // second case — `ld <XR>, XWA` r+r copies — was REMOVED 2026-07-05: those
+  // are NOT silicon-broken. The word copies `D8 88..8F` boot retail mr_robot,
+  // and the long copies `E8 88..8F` are the confirmed-safe long family; only
+  // the sizing differs, `D8` = 16-bit word vs `E8` = 32-bit long. Flagging the
+  // copy was a false positive.) The remaining confirmed case:
+  //
+  //   • `<alu> WA, imm16` emitted with a `0xD0` prefix (`D0 C8..CF lo hi`) —
+  //     this is a MIS-ENCODE, not a silicon defect. `0xD0..0xD7` is the word
+  //     MEMORY addressing family (HW-confirmed 2026-07-03), NOT a word-register
+  //     prefix, so `D0 C8..CF` does not encode a word-register ALU-imm at all;
+  //     a compiler that emits it for a `WA, imm16` op produces a
+  //     wrong-operand-class instruction that misbehaved on real NGPC
+  //     2026-05-20 (StarGunner Chantier 4 P-4 build). The earlier "D0 ALU-imm
+  //     silicon-broken" label was a mis-decode of the memory-family prefix.
+  //     The Toshiba cc900 compiler emits zero instances of this family in
+  //     production code — keep it out. Use the byte-split pattern instead:
+  //         `ld HL, imm; <alu> A, L; <carry> W, H`
+  //
+  // The live editor strips inline-asm before execution (see stripInlineAsm),
+  // so this lint runs BEFORE the strip pass to catch the patterns in user
+  // code. The detection is text-only (regex on TLCS-900 mnemonics) — it
+  // won't catch raw-byte forms like `.db 0xD0, 0xC8, …`, which are caught
+  // by the disassembler (NgpCraft_Disasm) at the build step.
+  function lintBrokenInlineAsmOpcodes(src, errors) {
+    // Inline-asm capture: parenthesised forms or block form.
+    const ASM_BLOCK_RE =
+      /\b(?:__asm__|__asm|asm|_asm)\s*(?:\(\s*("(?:\\.|[^"\\])*"(?:\s*,\s*"(?:\\.|[^"\\])*")*)\s*(?::[^)]*)?\)|\{([^}]*)\})/g;
+    // NOTE (HW-cleared 2026-07-05): the former `ld <XR>, XWA` r+r-copy pattern
+    // was REMOVED. It is NOT silicon-broken — the word copies `D8 88..8F`
+    // (retail mr_robot boots using `D8 89`) and the long copies `E8 88..8F`
+    // (the confirmed-safe long family) both execute. Flagging it was a false
+    // positive. Only the D0-prefix ALU-immediate mis-encode below stays.
+    const ALU_IMM_BROKEN = /\b(add|adc|sub|sbc|and|xor|or|cp)\s+WA\s*,\s*(0x[0-9a-f]+|[0-9]+)\b/gi;
+    let m;
+    while ((m = ASM_BLOCK_RE.exec(src)) !== null) {
+      const content = (m[1] || m[2] || '');
+      const baseLine = src.slice(0, m.index).split('\n').length;
+      let mi;
+      ALU_IMM_BROKEN.lastIndex = 0;
+      while ((mi = ALU_IMM_BROKEN.exec(content)) !== null) {
+        const op = mi[1].toLowerCase();
+        const imm = mi[2];
+        errors.push({
+          rule: 'HW-5',
+          title: `mis-encoded inline-asm: \`${op} WA, ${imm}\` (0xD0 = word-memory prefix)`,
+          lines: [`Inline-asm block at line ${baseLine}: \`${mi[0]}\``],
+          why: `The 0xD0 prefix + ALU-imm sub-op (encoding D0 C8..CF lo hi) is a ` +
+               `mis-encode, not a silicon defect: 0xD0..0xD7 is the word MEMORY ` +
+               `addressing family (HW-confirmed 2026-07-03), not a word-register ` +
+               `prefix, so it does not encode a word-register ALU-imm at all — the ` +
+               `earlier "D0 silicon-broken" label was a mis-decode. cc900 emits ` +
+               `zero instances of this family; a build that emitted it still ` +
+               `misbehaved on real NGPC 2026-05-20.`,
+          fix: `Byte-split: \`ld HL, ${imm}; ${op} A, L; ` +
+               `${op === 'sub' || op === 'sbc' || op === 'cp' ? 'sbc' : 'adc'} W, H\`.`,
+        });
+      }
+    }
+  }
+
   // HW-3b — loop variable declared inside `for (…)`.
   //
   // Hardware context: the `for (TYPE name = …; …; …)` init-declaration form
@@ -1927,6 +1991,9 @@ const NGPC_Interp = (() => {
     const userTypes = new Set([...TEMPLATE_TYPES, ...extractUserTypes(out)]);
     out = hoistFunctionStatics(out, userTypes);
     out = stripExternVarDecls(out);
+    // HW-5: silicon-broken inline-asm opcodes. Must run BEFORE stripInlineAsm
+    // because the strip rewrites the asm content to blank lines.
+    lintBrokenInlineAsmOpcodes(out, hwErrors);
     out = stripInlineAsm(out);
     out = expandUserMacros(out);
     out = stripPreprocessor(out);

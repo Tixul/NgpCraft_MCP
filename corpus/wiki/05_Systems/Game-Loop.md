@@ -70,6 +70,28 @@ void wait_n_frames_aligned(u8 n) {
 }
 ```
 
+### 1.4 The 8-bit counter wrap — phantom "frame drops" in your own FPS meter
+
+An 8-bit VBlank counter wraps every **256 frames ≈ 4.27 s** at 60 Hz. The wrap-safe
+idiom above (`(u8)(now - start)`) is correct **only for intervals shorter than 256
+frames** — it cannot tell one wrap from two, so any measurement spanning the wrap
+silently produces garbage.
+
+This bites hardest in a **home-made FPS/profiler display**: a shipped project chased
+"random ~3-second drops to single-digit fps" that did not exist — the counter wrapped
+mid-measurement and the arithmetic broke, printing a bogus figure while the game was
+in fact running at full speed. **Before optimising a reported slowdown, verify the
+measurement itself** (e.g. confirm the drop against emulator instrumentation or a
+second, independent timer). Rule of thumb: if a "slowdown" recurs on a period suspiciously
+close to 4.27 s, it is the wrap, not your game.
+
+- **Fix:** use a **`u16`** frame counter for anything measuring elapsed time or rate
+  (a `u16` wraps at 65 536 frames ≈ 18 min), and keep `u8` only for short cooldowns.
+- **When the slowdown is real:** heavy scenes can genuinely exceed the per-object
+  budget (§4.1). A stable **locked 30 fps with movement speeds rescaled** reads far
+  better than a framerate fluctuating between 40 and 60 — that is the trade a shipped
+  NGPC project settled on for scenes with 8-10 enemies plus bullets.
+
 ---
 
 ## 2. Minimal VBlank ISR

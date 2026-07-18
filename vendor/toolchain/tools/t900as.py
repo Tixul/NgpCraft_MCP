@@ -365,14 +365,16 @@ def encode_mem_abs16_inc_dec(mnem: str, size: int, addr16: int, count: int) -> b
 # Source: Toshiba TLCS-900/L1 Datasheet (900L1 Instruction Lists 1-10/10)
 # ---------------------------------------------------------------------------
 
-# zz offsets for the C8+zz+r prefix.
-# HW-confirmed 2026-07-03 (matches encode_ldc() Fix #26/#27 below and
-# bugs_silicon.json): word register-direct = D8..DF (zz=0x10), long = E8..EF
-# (zz=0x20). D0..D7 (zz=0x08) is a word alias that is BROKEN on NGPC silicon,
-# so word registers are emitted with the safe D8 prefix, not D0.
-_ZZ_BYTE = 0x00   # C8..CF (byte, R8)
-_ZZ_WORD = 0x10   # D8..DF (word, R16)  — safe form (D0..D7 word alias is broken)
-_ZZ_LONG = 0x20   # E8..EF (long, R32)
+# zz offsets for the C8+zz+r prefix
+_ZZ_BYTE = 0x00   # C8..CF
+_ZZ_WORD = 0x08   # D0..D7
+_ZZ_LONG = 0x10   # D8..DF
+
+# Phase 5 (2026-06-22): opt-in re-base of 32-bit r+r ALU from the silicon-broken
+# D8..DF encoding to the CC900-proven E8..EF encoding. Default OFF → byte-
+# identical output. Gated by the same env var as t900cc's native-32-bit codegen
+# so the build environment turns BOTH on together. See encode_alu_r_r.
+_ALU32_E_ENCODING = os.environ.get('T900CC_C5_ALU32', '0') != '0'
 
 # combined R-tables for lookup
 _ALL_REGS = {}
@@ -423,6 +425,22 @@ def encode_alu_r_r(sub_op_base: int, dest: str, src: str) -> bytes:
     if src_zz != dest_zz:
         raise ValueError(f"Size mismatch: {dest}({src_zz}) vs {src}({dest_zz})")
     prefix = 0xC8 + src_zz + src_idx
+    if (_ALU32_E_ENCODING and src_zz == _ZZ_LONG and sub_op_base != 0xF0):
+        # Phase 5 (2026-06-22): 32-bit r+r ALU at the D8..DF base (0xC8+0x10)
+        # HANGS the CPU on real NGPC silicon (USER_MANUAL_EN.md §12.1 + emulator
+        # quirk cpu.d8_df_register_to_register). CC900 emits the IDENTICAL ops
+        # at the E8..EF base and ships them in commercial ROMs (verified:
+        # `add XWA,XDE` = EA 80, `xor XWA,XBC` = E9 D0, decoded clean by the
+        # emulator). Re-base D8..DF -> E8..EF (+0x10) = the silicon-safe form.
+        # CP (sub_op_base 0xF0) is EXCLUDED: `cp XWA,XHL` at D8 is the documented
+        # SAFE exception (§12.1) and is ALREADY emitted by t900cc for 32-bit
+        # comparisons — re-basing it would needlessly change existing output.
+        # GATED behind T900CC_C5_ALU32 (default OFF) so default builds stay
+        # byte-identical: a handwritten `add xde,xix` in ngpc_flash_asm.asm
+        # currently assembles to the broken DC 82 — re-basing it is a fix but
+        # changes bytes, so it ships only with the opt-in alu32 build (for HW
+        # validation alongside t900cc's native 32-bit codegen).
+        prefix += 0x10
     return bytes([prefix, sub_op_base + dest_idx])
 
 

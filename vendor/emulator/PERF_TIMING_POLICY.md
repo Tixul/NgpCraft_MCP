@@ -118,3 +118,45 @@ La politique est respectee quand:
 - elles sont mesurables
 - elles sont expliquables
 - elles ne sont pas masquees par le frontend
+
+---
+
+## 10. Vitesse du modele de reference Python (mesure 2026-07-10)
+
+⚠️ Ne pas confondre avec les §1-9 : celles-ci parlent de la **cadence de la
+machine emulee**. Cette section parle du **debit de notre interpreteur**.
+
+**Etat mesure : ~1 700 instructions/seconde** (CPython, `EmulatorSession`, Crush
+Roller). C'est le mur documente depuis la passe 175 : un boot BIOS reel demande
+des centaines de milliers d'instructions, une frame commerciale des millions.
+**Le prototype Python ne peut pas y arriver par design.**
+
+### 10.1 Optimisations deja faites (behaviour-neutral, DEVLOG passe 186)
+
+| Optimisation | Ce qui n'allait pas |
+|---|---|
+| **Cache de la fetch view** | `_build_fetch_view` appelait `load_fetch_view` a **chaque batch** — relecture de la ROM **depuis le disque** + reconstruction de la map cold-start (~50 000 entrees), tous les 50 instructions. Or **2 octets seulement** dependent de la frame (RAS.V, BLNK). |
+| **Memoisation de `probe()`** | `NgpcAddressSpace.probe()` parcourait la liste des regions et allouait un `AddressProbe` neuf **pour chaque octet lu** : **370 000 appels `contains` pour 4 000 instructions** (~93 comparaisons/instruction). L'espace d'adressage est `frozen` ⇒ `probe()` est **pure** ⇒ memoisable sans changer le comportement. |
+
+**Gain : 1 123 → 1 706 instr/s (x1,5).** Fidelite re-verifiee apres coup contre
+l'oracle (`cosim_diff`) : **0 divergence**.
+
+### 10.2 Cahier des charges du coeur natif (C++)
+
+Le cout restant est **structurel**. Le profil (16 000 instructions) le dit
+precisement — c'est exactement ce qu'un coeur natif supprime :
+
+1. **`_dispatch_execute_next` est une chaine LINEAIRE de ~100 `_try_execute_*`**,
+   essayes un par un jusqu'a ce qu'un matche — **pour chaque instruction**.
+   → une **table de saut sur l'octet d'opcode** elimine ca.
+2. **Le decodeur lit ~7 octets par instruction, UN PAR UN**, chacun traversant
+   trois couches (`_RuntimeOverlayDecodeBus.read_bytes` → `NgpcReadBus.read_bytes`
+   → `probe`) : **113 861 appels `read_bytes` pour 16 000 instructions**.
+   → un coeur natif lit un mot dans un **tableau plat**.
+3. **Churn `dataclasses.replace`** : 32 003 appels / 16 000 instructions sur l'etat
+   CPU `frozen`.
+   → etat CPU **mutable** dans le coeur chaud.
+
+**Regle qui ne change pas :** le coeur rapide doit rester *reference-exact*. Toute
+optimisation se valide contre `oracle_tools/cosim_diff.py` sur le corpus (voir
+`README.md`), et une divergence est un **bug d'optimisation**, pas une licence.

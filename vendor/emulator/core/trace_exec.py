@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from core.cpu import NgpcCpuState
-from core.execute import ExecutionResult, seed_cpu_state_for_execution
+from core.execute import ExecutionResult, IrqDeliveryResult, seed_cpu_state_for_execution
 from core.fetch import NgpcFetchView, load_fetch_view
 from core.run_steps import build_run_steps
 
@@ -38,6 +38,7 @@ class ExecutionTraceResult:
     note: str
     final_irq_state: "IrqState | None" = None
     irq_deliveries: int = 0
+    last_irq_delivery: IrqDeliveryResult | None = None
     total_cycles_consumed: int = 0
 
 
@@ -77,6 +78,7 @@ def build_execution_trace(
         ),
         final_irq_state=run_result.final_irq_state,
         irq_deliveries=run_result.irq_deliveries,
+        last_irq_delivery=run_result.last_irq_delivery,
         total_cycles_consumed=run_result.total_cycles_consumed,
     )
 

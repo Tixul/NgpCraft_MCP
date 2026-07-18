@@ -6,17 +6,114 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from core.adc import IRQ_VECTOR_INDEX_INTAD, AdcController
 from core.cpu import NgpcCpuState
 from core.execute import (
     ExecutionResult,
+    IrqDeliveryResult,
     build_execute_next,
     seed_cpu_state_for_execution,
     try_deliver_pending_irq,
+    try_deliver_pending_vector_irq,
 )
 from core.fetch import NgpcFetchView, load_fetch_view
+from core.flash import FlashController, in_cart_window
+from core.frame_timing import RasterController, fold_vblank_irq_pending
+from core.timers import TimerController
+
+
+def _tick_raster(raster, cycles: int, irq_state):
+    """Advance the video clock and raise VBlank on the scanline it crosses.
+
+    The A/D and the timers have always ticked here, per instruction. The raster
+    did not -- the session folded it in after the whole batch, so VBlank became
+    pending one or more instructions LATE. That is invisible until an instruction
+    is long: Fatal Fury's 2798-byte `ldir` spans 38 scanlines in one instruction,
+    entering VBlank, and the late fold made this core take INTT0 (level 3) where
+    the native core correctly took VBlank (level 4). See RasterController.
+    """
+    if raster is None or irq_state is None:
+        return irq_state
+    transitions = raster.tick(cycles)
+    if not transitions:
+        return irq_state
+    return fold_vblank_irq_pending(irq_state, transitions)
+
+
+def _tick_timers(
+    timers: TimerController | None,
+    cycles: int,
+    current_memory: dict[int, int],
+    irq_state,
+    raster=None,
+):
+    """Advance the 8-bit timers and raise INTT0..3 as their comparators match.
+
+    Timer 0's external clock (TI0 = the K2GE's H-INT) comes FROM THE RASTER:
+    the pulses raised during this slice are drained here and handed to the
+    timers, so both clocks share one phase. See RasterController."""
+    if timers is None or irq_state is None:
+        return irq_state
+    pulses = raster.take_hint_pulses() if raster is not None else 0
+    for hw_vector_index in timers.tick(cycles, current_memory, hint_pulses=pulses):
+        irq_state = irq_state.with_vector_pending(hw_vector_index)
+    return irq_state
+
+
+def _tick_adc(
+    adc: AdcController | None,
+    cycles: int,
+    current_memory: dict[int, int],
+    irq_state,
+):
+    """Advance the A/D converter and raise INTAD when a conversion completes.
+
+    Returns the (possibly updated) irq_state. The converter's register writes are
+    merged straight into the running overlay so the very next instruction sees
+    the result / flags, exactly as on hardware.
+    """
+    if adc is None:
+        return irq_state
+    updates, raised = adc.tick(cycles, current_memory)
+    if updates:
+        current_memory.update(updates)
+    if raised and irq_state is not None:
+        return irq_state.with_vector_pending(IRQ_VECTOR_INDEX_INTAD)
+    return irq_state
 
 if TYPE_CHECKING:
     from core.frame_timing import FrameState, IrqState
+
+
+_POST_STATE_TERMINAL_STATUSES = {"cpu-halted"}
+
+
+def _apply_flash_writes(
+    flash: FlashController | None,
+    execution: ExecutionResult,
+    current_memory: dict[int, int],
+) -> None:
+    """Route hardware-discarded cart-window writes through the flash model.
+
+    Store executors surface writes to read-only / cart addresses as
+    `[DISCARDED]` MemoryWrites carrying the target address + data (open-bus
+    behaviour). When a flash controller is attached, those cart-window writes
+    drive the AMD flash command sequence; committed bytes are merged into the
+    running overlay so the very next instruction (e.g. the stub's status poll)
+    reads them back. No flash controller -> unchanged open-bus behaviour.
+    """
+    if flash is None:
+        return
+    for write in execution.memory_writes:
+        if not write.note.startswith("[DISCARDED]"):
+            continue
+        if not in_cart_window(write.address):
+            continue
+        committed = flash.process_discarded_write(
+            write.address, write.data, current_memory
+        )
+        if committed:
+            current_memory.update(committed)
 
 
 @dataclass(frozen=True)
@@ -42,6 +139,7 @@ class RunStepsResult:
     note: str
     final_irq_state: "IrqState | None" = None
     irq_deliveries: int = 0
+    last_irq_delivery: IrqDeliveryResult | None = None
     # M3 Phase 3.2.3a: sum of cycles consumed across all executed
     # instructions + IRQ deliveries during this run. Currently every
     # opcode contributes `ESTIMATED_CYCLES_PER_INSTRUCTION` (flat 8)
@@ -58,15 +156,20 @@ def build_run_steps(
     cpu_state: NgpcCpuState | None = None,
     memory_bytes: dict[int, int] | None = None,
     irq_state: "IrqState | None" = None,
+    flash: FlashController | None = None,
+    adc: AdcController | None = None,
+    timers: TimerController | None = None,
+    raster: RasterController | None = None,
 ) -> RunStepsResult:
     """Execute up to N instructions while carrying CPU and memory state forward.
 
     `irq_state` (M3 Phase 3.2.2b): when provided, the loop samples the
     IRQ controller between instructions via `try_deliver_pending_irq`.
     A deliverable pending IRQ (today: VBlank only, level 4) consumes
-    one step of the budget — PC + SR are pushed, PC jumps to the
-    vector, iff_level is raised, and the bit is cleared. When omitted
-    or None, the legacy behavior (no IRQ delivery) is preserved.
+    one step of the budget — PC + SR are pushed, control transfers
+    through the user-vector slot resolution path, iff_level is raised,
+    and the bit is cleared. When omitted or None, the legacy behavior
+    (no IRQ delivery) is preserved.
     """
     if count <= 0:
         raise ValueError("count must be >= 1")
@@ -81,6 +184,7 @@ def build_run_steps(
     records: list[RunStepsRecord] = []
     executed_count = 0
     irq_deliveries = 0
+    last_irq_delivery: IrqDeliveryResult | None = None
     stop_reason = "count-reached"
 
     irq_blocked = False
@@ -93,12 +197,37 @@ def build_run_steps(
                 memory=current_memory,
                 irq_state=current_irq_state,
             )
+            if not delivery.delivered and delivery.blocked_reason is None:
+                # No VBlank to take; a hardware-vector source (A/D, timer) may
+                # still be deliverable.
+                delivery = try_deliver_pending_vector_irq(
+                    view=view,
+                    cpu=current_cpu,
+                    memory=current_memory,
+                    irq_state=current_irq_state,
+                )
             if delivery.delivered:
                 current_cpu = delivery.after_cpu
                 current_memory = delivery.after_memory
                 current_irq_state = delivery.after_irq_state
                 irq_deliveries += 1
+                last_irq_delivery = delivery
                 total_cycles_consumed += delivery.cycles_consumed
+                # An interrupt entry's cycles are cycles like any others: every
+                # peripheral clock runs through them. Skipping them here slid the
+                # timers' phase 13 cycles per delivery against the raster -- the
+                # drift behind Metal Slug's flickering raster split (DEVLOG
+                # 2026-07-16). The native core ticks its peripherals here too.
+                current_irq_state = _tick_raster(
+                    raster, delivery.cycles_consumed, current_irq_state
+                )
+                current_irq_state = _tick_adc(
+                    adc, delivery.cycles_consumed, current_memory, current_irq_state
+                )
+                current_irq_state = _tick_timers(
+                    timers, delivery.cycles_consumed, current_memory,
+                    current_irq_state, raster=raster,
+                )
             elif delivery.blocked_reason is not None:
                 stop_reason = f"stopped-on-{delivery.blocked_reason}"
                 irq_blocked = True
@@ -111,6 +240,15 @@ def build_run_steps(
         )
         records.append(RunStepsRecord(index=index, execution=execution))
 
+        if execution.status in _POST_STATE_TERMINAL_STATUSES:
+            assert execution.after_cpu is not None
+            assert execution.after_memory is not None
+            current_cpu = execution.after_cpu
+            current_memory = execution.after_memory
+            total_cycles_consumed += execution.cycles_consumed
+            stop_reason = f"stopped-on-{execution.status}"
+            break
+
         if execution.status != "executed" or execution.after_cpu is None or execution.after_memory is None:
             stop_reason = f"stopped-on-{execution.status}"
             break
@@ -119,6 +257,20 @@ def build_run_steps(
         total_cycles_consumed += execution.cycles_consumed
         current_cpu = execution.after_cpu
         current_memory = execution.after_memory
+        _apply_flash_writes(flash, execution, current_memory)
+        # The video clock is a clock: it runs WHILE the instruction runs. Ticking
+        # it here, beside the A/D and the timers, is what makes VBlank pending at
+        # the same instruction boundary that raises it -- see RasterController.
+        current_irq_state = _tick_raster(
+            raster, execution.cycles_consumed, current_irq_state
+        )
+        current_irq_state = _tick_adc(
+            adc, execution.cycles_consumed, current_memory, current_irq_state
+        )
+        current_irq_state = _tick_timers(
+            timers, execution.cycles_consumed, current_memory, current_irq_state,
+            raster=raster,
+        )
 
     return RunStepsResult(
         start_pc=actual_start_pc,
@@ -137,6 +289,7 @@ def build_run_steps(
         ),
         final_irq_state=current_irq_state,
         irq_deliveries=irq_deliveries,
+        last_irq_delivery=last_irq_delivery,
         total_cycles_consumed=total_cycles_consumed,
     )
 
@@ -156,6 +309,7 @@ class RunUntilResult:
     note: str
     final_irq_state: "IrqState | None" = None
     irq_deliveries: int = 0
+    last_irq_delivery: IrqDeliveryResult | None = None
     total_cycles_consumed: int = 0
 
 
@@ -169,6 +323,7 @@ def build_run_until(
     auto_tick_address: int | None = None,
     auto_tick_period: int = 256,
     irq_state: "IrqState | None" = None,
+    flash: FlashController | None = None,
 ) -> RunUntilResult:
     """Execute instructions until PC reaches target_pc, a blocker is hit, or max_steps is exhausted.
 
@@ -201,6 +356,7 @@ def build_run_until(
     actual_start_pc = current_cpu.pc
     executed_count = 0
     irq_deliveries = 0
+    last_irq_delivery: IrqDeliveryResult | None = None
     total_cycles_consumed = 0
     last_record: RunStepsRecord | None = None
     stop_reason = "step-budget-exhausted"
@@ -222,6 +378,7 @@ def build_run_until(
                 current_memory = delivery.after_memory
                 current_irq_state = delivery.after_irq_state
                 irq_deliveries += 1
+                last_irq_delivery = delivery
                 total_cycles_consumed += delivery.cycles_consumed
                 # IRQ delivery happens before the instruction in the same
                 # iteration. Re-check target_pc since the vector jump may
@@ -240,6 +397,15 @@ def build_run_until(
         )
         last_record = RunStepsRecord(index=index, execution=execution)
 
+        if execution.status in _POST_STATE_TERMINAL_STATUSES:
+            assert execution.after_cpu is not None
+            assert execution.after_memory is not None
+            current_cpu = execution.after_cpu
+            current_memory = execution.after_memory
+            total_cycles_consumed += execution.cycles_consumed
+            stop_reason = f"stopped-on-{execution.status}"
+            break
+
         if execution.status != "executed" or execution.after_cpu is None or execution.after_memory is None:
             stop_reason = f"stopped-on-{execution.status}"
             break
@@ -248,6 +414,7 @@ def build_run_until(
         total_cycles_consumed += execution.cycles_consumed
         current_cpu = execution.after_cpu
         current_memory = execution.after_memory
+        _apply_flash_writes(flash, execution, current_memory)
 
         if auto_tick_address is not None and executed_count % auto_tick_period == 0:
             tick_addr = auto_tick_address & 0xFFFFFF
@@ -271,6 +438,7 @@ def build_run_until(
         ),
         final_irq_state=current_irq_state,
         irq_deliveries=irq_deliveries,
+        last_irq_delivery=last_irq_delivery,
         total_cycles_consumed=total_cycles_consumed,
     )
 
@@ -288,6 +456,7 @@ def load_run_until(
     auto_tick_period: int = 256,
     initial_frame_state: "FrameState | None" = None,
     initial_irq_state: "IrqState | None" = None,
+    bios_path: str | Path | None = None,
 ) -> RunUntilResult:
     """Load a ROM and run until target_pc.
 
@@ -306,7 +475,9 @@ def load_run_until(
       a pending VBlank IRQ (push PC + SR, jump to vector 0x006FCC,
       raise iff_level, clear bit). Defaults to no IRQ sampling.
     """
-    view = load_fetch_view(path, frame_state=initial_frame_state)
+    view = load_fetch_view(
+        path, frame_state=initial_frame_state, bios_path=bios_path
+    )
     cpu_state = view.machine.cpu if initial_cpu_state is None else initial_cpu_state
     if seed_xsp is not None or seed_registers:
         cpu_state = seed_cpu_state_for_execution(

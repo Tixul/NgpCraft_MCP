@@ -7,6 +7,14 @@ const CORPUS = join(__dirname, "..", "..", "corpus");
 
 // URI → { file (relative to corpus), name, description }
 const RESOURCES = {
+  // Listed first on purpose: it is the map for everything below, and it carries the
+  // BIOS warning that decides whether any rendering answer can be trusted at all.
+  "ngpc://doc/agent_guide": {
+    file: "../AGENT_GUIDE.md",
+    name: "Agent guide - which tool answers which question",
+    description:
+      "READ FIRST. How to drive this server's tools: the three emulator backends and what each can and cannot tell you, the save-state workflow for reproducing a user's bug, a symptom-to-tool table, and the BIOS requirement (without a real bios.bin the emulator renders a plausible but WRONG picture).",
+  },
   "ngpc://doc/quickstart": {
     file: "DENSE_INDEX.md",
     name: "NGPC Dense Index",

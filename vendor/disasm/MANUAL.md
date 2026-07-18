@@ -59,6 +59,31 @@ so the tool can be wrapped cleanly in shell scripts and CI pipelines.
 
 ---
 
+## Companion Analysis Scripts
+
+`ngpc_disasm.py` stays the core disassembler, but the repository now also
+ships small analysis scripts built directly on top of the decoder:
+
+| Script | Output |
+|--------|--------|
+| `ngpc_rom_identity.py` | Markdown identity report for one ROM |
+| `ngpc_search_hw.py` | Ranked list of functions touching a hardware region |
+| `ngpc_call_graph.py` | Markdown callers/callees tree around one function |
+| `ngpc_analysis.py` | Shared CFG / fingerprint / hardware analysis helpers |
+
+Examples:
+
+```bash
+python ngpc_rom_identity.py game.ngc
+python ngpc_search_hw.py game.ngc --region scroll
+python ngpc_call_graph.py game.ngc 0x200CFD --mode both --depth 3
+```
+
+These scripts do not change the output contract of `ngpc_disasm.py`; they are
+an extra analysis layer on top of the same decoder core.
+
+---
+
 ## Output Format
 
 ```
@@ -180,25 +205,24 @@ Instructions that are **known to crash or hang on NGPC silicon** are annotated w
 0x200100: D0 61    inc   8, WA    ; !BROKEN D0..D7 ALU (word-reg prefix)
 ```
 
-> **D0..D7 note (HW-confirmed 2026-07-03):** the `!BROKEN D0..D7` warning above is a
-> *mis-decode*, not a silicon bug. `0xD0..0xD7` is the **WORD MEMORY** addressing
-> family (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`); word register-direct is
-> `D8..DF`. The historic crashes came from the toolchain emitting a D0 byte for a
-> word-register op, which the CPU then decodes as a memory access. The disassembler
-> re-decode of the D0..D7 memory family is **in progress**, so it still prints the
-> legacy `!BROKEN` warning for now.
-
 ### Known broken opcodes on NGPC silicon
 
 | Opcode(s) | Issue | Suggested fix |
 |-----------|-------|---------------|
-| `D0 xx` emitted for a word register op | **Mis-decode, not silicon.** `D0..D7` = WORD MEMORY family; word reg-direct is `D8..DF`. Emitting D0 for a register op makes the CPU decode a memory access. | Never emit D0 for a register op — use D8 (word reg-direct) or `extz xwa; sll N, xwa` (E8 long) |
-| `D1..D7 xx` | WORD MEMORY forms (D1/D2-D5 as abs-address loads are **safe** and used by CC900) | Nothing to fix — these are memory ops, not a broken register-ALU prefix |
-| `CB xx` (arith/logic ALU) | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs. **Sub-op-specific:** byte mul/div (CB 0x40..0x5F, e.g. `div A, C` = CB 51) is HW-cleared SAFE (hw_test_bytediv 2026-07-08) and is NOT flagged | Route through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe |
+| `D0 xx` | D0 prefix (all sub-ops) — hangs watchdog | Use D8 (R32) family, e.g. `extz xwa; sll N, xwa` instead of `sll N, wa` |
+| `D0 C8..CF lo hi` (ALU-imm `<alu> WA, imm16`) | **HW crash confirmed 2026-05-20** on `stargunner_j16_C4_phase4_BROKEN_HW_20260520.ngc` — the prefix family covers this sub-op range too despite earlier "safe" classifications | Byte-split: `ld HL, imm; <alu> A, L; <carry> W, H` (the CC900 pattern, used for 25+ years) |
+| `D1..D7 xx` (ALU sub-ops) | Word-register ALU — broken (but D1/D2-D5 as abs-address loads are **safe**) | Switch to byte (C8..CF) or lword (D8..DF / E8..EF) source |
+| `D8..DF` ALU r+r (sub-ops `0x80..0xEF`, except `cp r,r` `0xF0..0xF7`) | Working-bank long-register ALU register-to-register **broken on silicon**. First payoff of the toolchain↔emulator loop: `D8 8B` (= `ld XHL, XWA`) was emitted 114× in StarGunner before the toolchain shipped `_emit_copy_xwa_to_xhl` (2026-05-20) | Byte-split via stack: `push WA; pop HL; add A,L; adc W,H` for `ld XHL, XWA`-style copies. The `cp r,r` exception (`0xF0..0xF7`) remains safe. |
+| `CB xx` | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs. Sub-op-specific: byte mul/div (`CB 0x40..0x5F`, e.g. `div A,C` = CB 51) is **HW-cleared 2026-07-08** and safe | Route the broken ALU ops through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe; byte mul/div CB 40..5F needs no workaround |
 | `LINK XIY, N` where N≥5 | Stack frame too large — corrupts SP | Use `link XIY, 0` then `add XSP, -N` to allocate locals |
 | `adc W, B` when W > 0 | High-byte add produces wrong result silently | Keep W=0 (count ≤ 255) or split the add manually |
 
-> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires on prefix `0xCB` for its arith/logic ALU sub-ops (0x80..0xFF) only; the byte mul/div reg-reg pocket (CB `0x40..0x5F`) is HW-cleared safe (hw_test_bytediv 2026-07-08) and no longer warns, and the surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
+> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires on prefix `0xCB` byte-ALU sub-ops **except** the mul/div pocket `0x40..0x5F` (HW-cleared 2026-07-08); the surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
+
+> **Synchronisation:** the broken-set above mirrors NgpCraft_emulator
+> `core/quirks_db.json` `2026-05-20.v4` entries `cpu.d0_d7_non_immediate`,
+> `cpu.d8_df_register_to_register`, and `cpu.link_xiy_large_frame`. When
+> the emulator's quirk database bumps, this table is the resync target.
 
 > **About the `adc W, B` warning:** static disassembly cannot know the runtime value of `W`. The flag is unconditional — the reader is expected to verify intent. A safe `adc W, B` with `W==0` will still be flagged.
 

@@ -16,7 +16,7 @@ Implements the full TLCS-900/L1 instruction set from the official Toshiba TMP95C
 - **NGPC hardware register annotations** — joypad, VBlank vector, watchdog, K2GE, sprite VRAM, scroll planes, tile RAM
 - **BIOS SWI names** — `swi 1` → `BIOS_CLOCKGEARSET`, `swi 5` → `BIOS_SYSFONTSET`, etc.
 - **DMA LDC register names** — `DMAC0`, `DMAS0`, `DMAD0`, `DMAM1`…
-- **Broken opcode detection** — `D0` prefix, `CB` C-source arith/logic ALU (`add A, C` = `CB 81` and friends — but NOT the byte mul/div pocket `CB 0x40..0x5F`, HW-cleared safe 2026-07-08), `LINK XIY, N≥5`, and `adc W, B` (silent wrong result when W>0) all flagged `; !BROKEN <reason — fix>` inline. The CB and `adc W, B` flags were wired up in 2026-04 to match the README's claims; the CB flag was narrowed to sub-op-specific in 2026-07.
+- **Broken opcode detection** — `D0` prefix, `CB` family (`add A, C` and friends), `LINK XIY, N≥5`, and `adc W, B` (silent wrong result when W>0) all flagged `; !BROKEN <reason — fix>` inline. The CB and `adc W, B` flags were wired up in 2026-04 to match the README's claims.
 - **Two-pass label resolution** — `entry_point:`, `sub_2XXXXX:` (call targets), `loc_2XXXXX:` (jump targets) with `; -> sub_XXXXXX` cross-references on every call/jump
 - **Auto ROM header parsing** — detects title, entry point, color/mono, software ID from the 64-byte SNK header
 
@@ -102,6 +102,31 @@ All addresses accept hex with or without the `0x` prefix (`0x200040` or
 `200040`). Bad input is rejected up-front with a clear stderr message and
 a non-zero exit code: missing ROM (`1`), permission denied (`1`), bad hex
 (`2`), `--start` greater than `--end` (`2`). Successful runs exit `0`.
+
+---
+
+## Companion Analysis Tools
+
+The repository also ships lightweight analysis helpers built on top of
+`decode_one()`:
+
+| Tool | Purpose |
+|------|---------|
+| `ngpc_rom_identity.py` | Quick markdown identity card for a ROM: header, function stats, opcode mix, hardware region usage, toolchain hints |
+| `ngpc_search_hw.py` | Find functions that touch a named hardware region (`oam`, `palette`, `scroll`, `z80_ram`, ...) |
+| `ngpc_call_graph.py` | Build a small callers/callees graph around a function entry point |
+| `ngpc_analysis.py` | Shared helper module used by the scripts above |
+
+Examples:
+
+```bash
+python ngpc_rom_identity.py game.ngc
+python ngpc_search_hw.py game.ngc --region oam
+python ngpc_call_graph.py game.ngc 0x200CFD --mode both --depth 2
+```
+
+These tools stay separate from `ngpc_disasm.py` so the core disassembler
+remains single-file and zero-dependency.
 
 ---
 

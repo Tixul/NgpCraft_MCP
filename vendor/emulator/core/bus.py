@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from core.rom import NgpcRomHeader, load_rom_header
@@ -49,6 +49,19 @@ class AddressProbe:
     note: str
 
 
+# `probe()` is called for *every byte* the CPU fetches or reads, and it used to
+# walk the region list and allocate a fresh `AddressProbe` each time. Profiling
+# the run loop (2026-07-10) showed 370k `AddressMapEntry.contains` calls and 30k
+# probe allocations for just 4000 executed instructions -- about 93 region
+# comparisons per instruction.
+#
+# The address space is an immutable, frozen description, so `probe(address)` is a
+# PURE function of `address`: memoising it is behaviour-neutral by construction.
+# The cache is bounded (the working set of a running ROM is a few thousand
+# addresses; the cap only guards a pathological scan of the 16 MB space).
+_PROBE_CACHE_LIMIT = 1 << 20
+
+
 @dataclass(frozen=True)
 class NgpcAddressSpace:
     """Minimal address-space description derived from one ROM image."""
@@ -56,8 +69,23 @@ class NgpcAddressSpace:
     rom_path: Path
     rom_size: int
     regions: tuple[AddressMapEntry, ...]
+    # Mutable memo on a frozen dataclass: `frozen` forbids rebinding the field,
+    # not mutating the dict it points at. Excluded from equality/repr so two
+    # address spaces still compare by their actual description.
+    _probe_cache: dict[int, AddressProbe] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     def probe(self, address: int) -> AddressProbe:
+        cached = self._probe_cache.get(address)
+        if cached is not None:
+            return cached
+        result = self._probe_uncached(address)
+        if len(self._probe_cache) < _PROBE_CACHE_LIMIT:
+            self._probe_cache[address] = result
+        return result
+
+    def _probe_uncached(self, address: int) -> AddressProbe:
         for region in self.regions:
             if region.contains(address):
                 note = region.note
@@ -146,6 +174,37 @@ def build_address_space(header: NgpcRomHeader) -> NgpcAddressSpace:
                 ),
             )
         )
+    if header.file_size > 0x200000:
+        # A 4 MB cartridge is TWO flash dies; the hardware maps the second at
+        # 0x800000. This window used to be unmapped on the claim that the BIOS
+        # only touches it for the autoselect handshake -- true for 2 MB carts,
+        # false for the three 4 MB ones: SNK vs. Capcom MotM keeps its whole
+        # intro (tile data, page descriptors, pointers into the same window)
+        # above 0x800000, and an unmapped window fed its decompressor zeros
+        # (pass 247). Carts of 2 MB or less keep the window unmapped exactly as
+        # before, so the fuzz gate's view of unmapped space is unchanged.
+        chip1_size = header.file_size - 0x200000
+        chip1_loaded_end = min(0x800000 + chip1_size - 1, 0x9FFFFF)
+        regions.append(
+            AddressMapEntry(
+                "CART_ROM_CHIP1",
+                0x800000,
+                chip1_loaded_end,
+                "rom",
+                "Second flash die of a 4 MB cartridge (file bytes 0x200000+).",
+                backing_file_offset_base=0x200000,
+            )
+        )
+        if chip1_loaded_end < 0x9FFFFF:
+            regions.append(
+                AddressMapEntry(
+                    "CART_ROM_CHIP1_UNLOADED",
+                    chip1_loaded_end + 1,
+                    0x9FFFFF,
+                    "rom-gap",
+                    "Second-die window not backed by the file: erased flash (0xFF).",
+                )
+            )
     regions.append(
         AddressMapEntry("BIOS_ROM", 0xFF0000, 0xFFFFFF, "bios", "Internal BIOS ROM.")
     )

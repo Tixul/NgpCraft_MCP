@@ -477,6 +477,18 @@ emulator but can drop a real cartridge to **< 1 fps**, because:
 - **NeoPop does not charge the IRQ/context-switch cost** → the overload is invisible in
   the emulator. Validate raster cost on real hardware (or a cycle-accurate emulator).
 
+> **Field report — prefer MicroDMA for a HUD band that must not move.** The CPU
+> one-split pattern below is hardware-validated at a steady load, but a shipped
+> project reported it **flickering on real hardware during heavy scrolling**: the
+> ISR is serviced with variable latency when the CPU is busy, so the split line
+> jitters by a scanline or two and the band visibly wobbles. A **MicroDMA raster
+> split triggered by Timer0/HBlank** rewrites the scroll register per line with
+> **zero CPU cost and no jitter**, and was the fix that made the bar rock-solid.
+> Use `ngpc_dma_raster` (§8.6, [DMA.md](DMA.md)) when the band must be perfectly
+> static under load; use the CPU split below when the scene is light or you cannot
+> spare a DMA channel. Both beat baking pre-shifted tile variants, which wastes
+> large amounts of tile RAM (that project recovered ~126 tiles by dropping it).
+
 **If you only need to freeze a HUD band, use a single split — one IRQ per frame.**
 This pattern is hardware-validated (HUD band, 60 fps stable):
 
@@ -508,6 +520,23 @@ while (1) {
     game_update();                  /* writes shadow_* for NEXT frame, not HW directly */
 }
 ```
+
+**Shipped reference implementation — `kuroi_dokutsu` (`src/main.c`).** This exact pattern
+ships and is hardware-validated in that project; read it there if you want the full
+context. Two details worth copying:
+
+- It keeps the scroll values in **`volatile` shadow variables** written by the camera
+  code, and pushes them to the registers in a single dedicated
+  `hud_apply_scroll_and_arm()` called right after `ngpc_vsync()` — so the camera logic
+  never touches hardware registers directly, and the arm point stays pinned to line ~0.
+- The boot sequence is the non-obvious part and is exactly the three steps above:
+  `ngpc_raster_init()` (performs the BIOS `INTLVSET` that actually enables the IRQ —
+  §6.5b), then `ngpc_raster_disable()` (stop the per-line ISR immediately, otherwise it
+  fires every scanline and destroys the framerate), then override `HW_INT_TIM0` with the
+  2-write mini ISR.
+
+If the band flickers on hardware under heavy scrolling, move it to MicroDMA — see the
+field report above and [DMA.md §7.5](DMA.md).
 
 Why arm **before** the update: `TREG0 = 136` fires 136 lines after the arm point. If you
 arm *after* a variable-duration update, the fire scanline jitters frame-to-frame (HUD

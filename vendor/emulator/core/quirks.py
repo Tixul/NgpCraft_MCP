@@ -232,8 +232,18 @@ def _matches_prefixed_range_non_immediate(
     #   of an absolute address, not a sub-op. They are documented
     #   safe and MUST NOT be flagged. Filtered out below by exact-
     #   length check (only len==2 OR len==4-with-alu-imm-subop).
+    # The decoder now decodes 0xD0..0xD7 as a WORD MEMORY-addressing family
+    # FIRST (HW-confirmed 2026-07-03). For a valid memory-form op the SECOND
+    # byte is the low byte of an absolute address, not an ALU-imm sub-op --
+    # e.g. `D1 CE 6F 04` = pushw (0x6FCE) has second byte 0xCE purely because
+    # the address is 0x6FCE. Only the genuine toolchain mis-encode falls
+    # through to the reg-direct path, which the decoder marks with a "!BROKEN"
+    # warning. Gate the 4-byte ALU-imm classification on that warning so valid
+    # memory ops whose address low byte lands in 0xC8..0xCF are not flagged.
     is_alu_imm_form = (
-        len(raw) == 4 and 0xC8 <= second <= 0xCF
+        len(raw) == 4
+        and 0xC8 <= second <= 0xCF
+        and "!BROKEN" in (decoded.warning or "")
     )
     if len(raw) != 2 and not is_alu_imm_form:
         return False

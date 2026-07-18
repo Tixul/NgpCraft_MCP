@@ -623,6 +623,64 @@ void demo_dma_autorearm_pingpong(void)
 
 ---
 
+### 7.5 Example E: Static HUD band (the flicker-free alternative to a CPU split)
+
+The most common reason to reach for raster on NGPC is a **status bar that must stay
+put while the playfield scrolls**. The CPU one-split ISR
+([Effects-and-Raster.md §6.6](Effects-and-Raster.md)) works, but its fire line jitters
+by a scanline or two when the CPU is loaded — a shipped project saw the bar visibly
+flicker on hardware during heavy scrolling and fixed it by moving to MicroDMA.
+
+The table holds the camera's scroll above the band and a fixed value on the HUD rows,
+so SCR2 is pinned for exactly those scanlines at **zero CPU cost and no jitter**:
+
+```c
+#define HUD_TOP_LINE   136u   /* first HUD scanline                    */
+#define HUD_SCROLL_Y   104u   /* SCR2 Y that exposes the HUD tile rows */
+
+static u8 g_scr2_y[SCREEN_H];          /* 152 entries — MUST live in RAM */
+static NgpcDmaU8Stream g_dma_scr2y;
+
+/* Rebuild only when the camera actually moved (see §13 for the build cost). */
+static void hud_build_table(u8 cam_y)
+{
+    u8 i;
+    for (i = 0u; i < HUD_TOP_LINE; i++) { g_scr2_y[i] = cam_y; }
+    for (;      i < (u8)SCREEN_H;   i++) { g_scr2_y[i] = (u8)HUD_SCROLL_Y; }
+}
+
+void hud_dma_init(u8 cam_y)
+{
+    ngpc_dma_init();
+    hud_build_table(cam_y);
+    ngpc_dma_timer0_hblank_enable();       /* TI0 (HBlank), TREG0 = 1 */
+    ngpc_dma_stream_begin_u8(&g_dma_scr2y, NGPC_DMA_CH0,
+                             (volatile u8 NGP_FAR *)&HW_SCR2_OFS_Y,
+                             g_scr2_y, (u16)SCREEN_H,
+                             NGPC_DMA_VEC_TIMER0);
+}
+
+/* Main loop */
+while (1) {
+    ngpc_vsync();
+    ngpc_dma_stream_rearm_u8(&g_dma_scr2y);   /* one-shot: rearm EVERY frame */
+    if (cam_y != prev_cam_y) {                /* rebuild only on change      */
+        hud_build_table(cam_y);
+        prev_cam_y = cam_y;
+    }
+    game_update();
+}
+```
+
+- **Rearm first, rebuild after** — the rearm must happen as early in VBlank as possible
+  (§6); building the table first eats into that window for no benefit.
+- **Timer0 is exclusive** (§8.1): this cannot coexist with `ngpc_raster` on Timer0.
+- **Do not bake pre-shifted tile variants** to fake a static bar — it burns large amounts
+  of tile RAM. The project above recovered **~126 tiles** by dropping that approach for
+  this one.
+
+---
+
 ## 8. Interactions with Other Modules
 
 ### 8.1 With ngpc_raster (CPU ISR Timer0)

@@ -1,5 +1,35 @@
 # Changelog — @ngpcraft/mcp
 
+
+## 2026-07-18 — emulator re-vendored (both cores), player save states, agent guide
+
+### Added
+- `ngpc_emu_native_run` — **runs** the game on the native C++ core: load a player save
+  state (`.s0` from NgpCraft Emulator, F2), hold buttons, advance frames, return CPU
+  registers + a screenshot drawn line by line as the beam passes. Backed by the new
+  `vendor/emulator/ngpc_native.py`. Every other `ngpc_emu_*` tool inspects static state;
+  this is the only one that executes the machine.
+- `AGENT_GUIDE.md`, served as the MCP resource `ngpc://doc/agent_guide` (listed first):
+  which tool answers which question, the save-state workflow for reproducing a user's
+  bug, and the BIOS requirement.
+
+### Changed
+- `vendor/emulator/` re-vendored from the current emulator: Python core refreshed
+  (was 2+ months stale), `core/quirks_db.json` added — it was **missing**, which made
+  `ngpc_emu_opcode_coverage` fail outright — plus the C++ core sources and a prebuilt
+  `cpp/build/ngpc_core.dll`.
+- Save states written by the emulator (`NGPCST01`) are now readable by
+  `core/savestate.py`, so **all** `--seed-from` consumers accept a `.s0` a user hands
+  over. No tool change was needed: they all funnel through one loader.
+- `vendor/transpiler/` re-synced from NgpCraft_live_editor: picks up the 2026-07-05
+  removal of a **false lint rule** that flagged `ld <XR>, XWA` as silicon-broken when it
+  is not (hardware-confirmed). `ngpc_lint` no longer condemns correct code.
+- `vendor/toolchain/` re-synced from NgpCraft_toolchain: constant folding for shifts and
+  the native 32-bit reg-reg ALU path.
+- `ngpc_compile_homemade` now states plainly that the homemade toolchain is
+  **experimental and unstable** — a teaching pipeline, not a compiler to ship with.
+- README: removed the claim that no full-game emulation tool is exposed. It is now.
+
 ## 2026-07-16 — corpus: OAM despawn discipline + "static plane vs raster split" for HUDs
 
 Documents two footguns that surfaced from a real user's shmup build.

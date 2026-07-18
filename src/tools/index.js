@@ -36,6 +36,7 @@ import * as emu_tile_view from "./emu_tile_view.js";
 import * as emu_tiles_view from "./emu_tiles_view.js";
 import * as emu_screenshot from "./emu_screenshot.js";
 import * as emu_tick_frame from "./emu_tick_frame.js";
+import * as emu_native_run from "./emu_native_run.js";
 import * as emu_watchpoint from "./emu_watchpoint.js";
 import * as emu_breakpoint from "./emu_breakpoint.js";
 // Homemade toolchain pipeline (t900cc + t900as + t900ld + romtool).
@@ -77,6 +78,7 @@ const modules = [
   emu_tiles_view,
   emu_screenshot,
   emu_tick_frame,
+  emu_native_run,
   emu_watchpoint,
   emu_breakpoint,
   compile_homemade,

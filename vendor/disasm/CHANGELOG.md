@@ -1,24 +1,18 @@
 # Changelog — ngpc_disasm
 
-> **Note:** `vendor/*` is a dist mirror. Durable edits belong upstream — this
-> entry records a correction applied to the mirror; propagate it to the source repo.
-
 ## 2026-07-08
 
 ### Fixed
 
-- **CB broken-opcode flag is now sub-op-specific — byte mul/div no longer
-  mis-flagged.** The decoder previously flagged **any** `0xCB` prefix as
-  `!BROKEN CB family`. Real-hardware test `hw_test_bytediv` (2026-07-08) proved
-  the C-source byte **mul/muls/div/divs** reg-reg pocket (`CB` sub-op
-  `0x40..0x5F`, e.g. `CB 51 = div A, C`: WA=0x1F64 / C=0x64 → WA=0x2450,
-  quotient 0x50, remainder 0x24) executes correctly and is **not** silicon-broken.
-  `decode_zz_r` now suppresses the warning when `b == 0xCB and 0x40 <= sub-op <=
-  0x5F`; the arith/logic ALU sub-ops (`add A, C = CB 81`, etc.) remain flagged.
-  This parallels the WORD mul/div clearing (`D8..DF`, hw_test_muldiv 2026-07-06).
-  `_zz_regs` docstring/comments, `MANUAL.md`, `DEVLOG.md`, and bug-DB entry
-  `CB_FAMILY_BROKEN` (`bugs_silicon.json`) updated to the nuance.
-  The `add A, C` (`CB 81`) broken flag is unchanged.
+- **Byte reg-reg mul/div (`CB 0x40..0x5F`) no longer flagged.** Flashed HW test
+  `hw_test_bytediv` on real NGPC proved byte `mul/muls/div/divs` with C as source
+  (canonical `CB 51 = div A,C`) executes and is correct — it is NOT part of the
+  `add A,C` (`CB 81`) silicon hang. `decode_zz_r` now emits no warning for
+  `CB 0x40..0x5F`; the residual `!SUSPECT CB xx` message for other untested
+  C-source sub-ops notes the mul/div carve-out. The `CB 81` `!BROKEN` flag is
+  unchanged. `_zz_regs` docstring/comments updated to the sub-op-specific nuance.
+- Mirror note: this file is a dist mirror; the durable edit belongs to upstream
+  `NgpCraft_Disasm/`.
 
 ## 2026-04-20
 
@@ -69,7 +63,9 @@ unhappy-path conditions (missing file, bad hex, reversed range).
 ### Notes
 
 - The MCP server (`@ngpcraft/mcp`) consumes this script through
-  `vendor/disasm/ngpc_disasm.py`.
+  `vendor/disasm/ngpc_disasm.py`. The same edits were synced into the workspace
+  copy at `Desktop/NGPC_RAG/04_MY_PROJECTS/NgpCraft_Disasm/` and into the MCP
+  vendor snapshot.
 - Bug-DB entry `CB_FAMILY_BROKEN` in `bugs_silicon.json` was tightened: the
   scope is "0xCB prefix specifically" (validated `CB 81`); the broader "C-prefix
   family" wording was removed because C8/C9/CA/CC..CF are confirmed safe.

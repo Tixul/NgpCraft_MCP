@@ -29,6 +29,7 @@ from core.frame_goldens import (
     list_frame_goldens,
     save_frame_golden,
 )
+from core.decode import CONTROL_REGISTER_NAMES
 from core.k2ge import (
     K2GE_PALETTE_SCR1_BASE,
     K2GE_PALETTE_SCR2_BASE,
@@ -42,6 +43,7 @@ from core.renderer import (
     render_frame,
 )
 from core.run_steps import load_run_until
+from core.seed_presets import bios_handoff_minimal_seed_registers
 from core.savestate import (
     build_savestate_payload,
     compute_rom_sha256,
@@ -53,6 +55,9 @@ from core.symbols import SymbolTable, load_map
 ENGINE_BRIDGE_REQUEST_FORMAT = "ngpc-engine-bridge-request"
 ENGINE_BRIDGE_RESPONSE_FORMAT = "ngpc-engine-bridge-response"
 ENGINE_BRIDGE_VERSION = "ngpc-engine-bridge.v1"
+ENGINE_BRIDGE_SEED_PRESETS = {
+    "bios-handoff-minimal": bios_handoff_minimal_seed_registers(),
+}
 
 
 class EngineBridgeError(ValueError):
@@ -112,8 +117,13 @@ def execute_engine_bridge_request(path: Path) -> dict[str, object]:
         initial_cpu_state = seed_from_doc.cpu
         initial_memory_bytes = dict(seed_from_doc.writable_overlay)
 
-    seed_registers = _normalize_seed_registers(runtime.get("seed_registers"))
     seed_xsp = _optional_int(runtime, "seed_xsp")
+    seed_presets = _normalize_seed_presets(runtime.get("seed_presets"))
+    seed_registers = _resolve_bridge_seed_registers(
+        _normalize_seed_registers(runtime.get("seed_registers")),
+        seed_presets=seed_presets,
+        seed_xsp=seed_xsp,
+    )
     start_pc = _optional_int(runtime, "start_pc")
     target_pc = _optional_int(runtime, "target_pc")
     max_steps = _optional_int(runtime, "max_steps") or 8
@@ -1199,6 +1209,7 @@ def _normalize_seed_registers(raw: object) -> dict[str, int] | None:
         return None
     if not isinstance(raw, dict):
         raise EngineBridgeError("runtime.seed_registers must be an object when present")
+    allowed_control_registers = {name.upper() for name in CONTROL_REGISTER_NAMES.values()}
     result: dict[str, int] = {}
     for key, value in raw.items():
         if not isinstance(key, str) or key.upper() not in {
@@ -1210,10 +1221,11 @@ def _normalize_seed_registers(raw: object) -> dict[str, int] | None:
             "XIY",
             "XIZ",
             "XSP",
+            *allowed_control_registers,
         }:
             raise EngineBridgeError(
                 "runtime.seed_registers keys must be one of: XWA, XBC, XDE, "
-                "XHL, XIX, XIY, XIZ, XSP"
+                "XHL, XIX, XIY, XIZ, XSP, DMAS0..3, DMAD0..3, DMAC0..3, DMAM0..3, INTNEST"
             )
         if not isinstance(value, int):
             raise EngineBridgeError(
@@ -1221,6 +1233,42 @@ def _normalize_seed_registers(raw: object) -> dict[str, int] | None:
             )
         result[key.upper()] = value & 0xFFFFFFFF
     return result or None
+
+
+def _normalize_seed_presets(raw: object) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise EngineBridgeError("runtime.seed_presets must be a list when present")
+    result: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise EngineBridgeError("runtime.seed_presets entries must be strings")
+        if entry not in ENGINE_BRIDGE_SEED_PRESETS:
+            raise EngineBridgeError(
+                "runtime.seed_presets entries must be one of: "
+                + ", ".join(sorted(ENGINE_BRIDGE_SEED_PRESETS))
+            )
+        result.append(entry)
+    return tuple(result)
+
+
+def _resolve_bridge_seed_registers(
+    explicit_seed_registers: dict[str, int] | None,
+    *,
+    seed_presets: tuple[str, ...],
+    seed_xsp: int | None,
+) -> dict[str, int] | None:
+    if not seed_presets:
+        return explicit_seed_registers
+    merged: dict[str, int] = {}
+    for preset_name in seed_presets:
+        merged.update(ENGINE_BRIDGE_SEED_PRESETS[preset_name])
+    if seed_xsp is not None:
+        merged.pop("XSP", None)
+    if explicit_seed_registers:
+        merged.update(explicit_seed_registers)
+    return merged or None
 
 
 def _validate_request(raw: object, path: Path) -> None:

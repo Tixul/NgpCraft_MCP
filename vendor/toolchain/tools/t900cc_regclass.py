@@ -338,11 +338,10 @@ def operand_candidates(constraints: Iterable[RegConstraint]) -> Tuple[FrozenSet[
 # Forbidden register-transfer encodings: `ld <dst>, <src>` directly
 # in D0..DF r+r family is silicon-broken. The allocator must NEVER
 # emit these; transit must use push <src>; pop <dst> instead.
-# Mapping: (dst, src) tuples that decode to broken r+r forms — 16-bit word
-# via the D0..D7 / D8..DF prefixes, 32-bit long via the E8..EF prefix.
-# (HW 2026-07-03: D8..DF is word/16-bit, E8..EF is long/32-bit.)
+# Mapping: (dst, src) tuples that decode to broken D0..D7 / D8..DF
+# r+r forms.
 KNOWN_BROKEN_TRANSFERS: FrozenSet[Tuple[str, str]] = frozenset({
-    # 16-bit r+r LD (D0..D7 / D8..DF word prefix, sub-op 8B):
+    # 16-bit r+r LD (D0..D7 prefix, sub-op 8B):
     ('HL', 'WA'),   # D0 8B = LD HL, WA (broken)
     ('WA', 'HL'),   # D3 88 family (broken)
     ('BC', 'WA'), ('WA', 'BC'),
@@ -350,7 +349,7 @@ KNOWN_BROKEN_TRANSFERS: FrozenSet[Tuple[str, str]] = frozenset({
     ('HL', 'BC'), ('BC', 'HL'),
     ('HL', 'DE'), ('DE', 'HL'),
     ('BC', 'DE'), ('DE', 'BC'),
-    # 32-bit r+r LD (E8..EF long prefix, sub-op 8B):
+    # 32-bit r+r LD (D8..DF prefix, sub-op 8B):
     ('XHL', 'XWA'), ('XWA', 'XHL'),
     ('XBC', 'XWA'), ('XWA', 'XBC'),
     ('XDE', 'XWA'), ('XWA', 'XDE'),
@@ -359,7 +358,7 @@ KNOWN_BROKEN_TRANSFERS: FrozenSet[Tuple[str, str]] = frozenset({
     ('XBC', 'XDE'), ('XDE', 'XBC'),
     ('XIX', 'XWA'), ('XWA', 'XIX'),
     ('XIZ', 'XWA'), ('XWA', 'XIZ'),
-    # … and many more pairs in the E8..EF (long) family. The complete set
+    # … and many more pairs in the D8..DF family. The complete set
     # is computed via the quirks_db matcher; this hand-list is a
     # readability aid for the common cases.
 })
