@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <vector>
 
 #include "ngpc_core.h"
@@ -58,6 +59,21 @@ constexpr uint32_t kBiosBase             = 0xFF0000;
 constexpr unsigned kIrqVectorIndexVBlank = 11;          // -> 0xFFFF2C  (it IS the INT4 pin)
 constexpr uint8_t  kIrqLevelVBlank       = 4;
 
+/* ⏰ THE RTC ALARM -- vector index 10 (0xFFFF28), the INT0 pin the calendar chip drives.
+ *
+ * Not the power button, which is index 8: the two are separate lines that this project
+ * confused for one, because the name "INT0" is used for index 10 in some register maps
+ * and for index 8 in others. Settled by reading the retail BIOS's vector table: index 10 goes to
+ * 0xFF2856, and that handler is the ONLY code in the 64 KiB that references 0x6FC8 --
+ * the RAM vector the SDK documents as the RTC alarm hook. Index 8 goes to 0xFF1898, the
+ * power/boot handler.
+ *
+ * They are related on hardware, which is what made the confusion plausible: with the
+ * console switched OFF the alarm line is what powers it back on to sound (the SDK's
+ * VECT_ALARMDOWNSET). While a game is running the same alarm arrives here instead --
+ * which is why the SDK says the two alarm calls cannot both be set at once. */
+constexpr unsigned kIrqVectorIndexRtcAlarm = 10;
+
 /* ⚡ INT5 -- THE SOUND CPU'S INTERRUPT TO THE MAIN CPU. Vector index 12 (0xFFFF30).
  *
  * The Z80 raises it by WRITING ITS OWN 0xC000. SNK says so in as many words, and its
@@ -73,8 +89,7 @@ constexpr uint8_t  kIrqLevelVBlank       = 4;
  * VECTOR WAS WRONG. SNK writes "INTx", we read it as INT0, and INT0 is a different
  * pin. The BIOS itself names the real one: it programs INTE45 = 0xDC, which is INT4 at
  * level 4 (that is VBlank) and **INT5 at level 5** -- and then sits on `ei 5 ; halt`,
- * accepting nothing below 5. It is waiting for INT5. (ares agrees, independently:
- * `case 0xc000: return cpu.int5.raise();`.)
+ * accepting nothing below 5. It is waiting for INT5.
  *
  * 🔑 A REFUTATION IS ONLY AS GOOD AS THE THING IT REFUTED. "Writing 0xC000 raises an
  * interrupt" was never the claim that failed; "it raises INT0" was. */
@@ -104,6 +119,28 @@ constexpr uint32_t kAdcCyclesLowSpeed  = 320 * 2;
 /* INTAD is vector value 0x0070 (Table 3.3 (1)) => table entry 0x70/4 = 28. */
 constexpr unsigned kIrqVectorIndexIntAd = 28;
 constexpr uint8_t  kIrqLevelIntAd       = 4;
+/* SERIAL channel 0 == the LINK CABLE. Vector values 0x18/0x19 (ngpcspec.txt IRQ
+ * table; the same numbering as VBlank=0x0B, Timer0=0x10) => table entries at
+ * 0xFFFF60 and 0xFFFF64, which the retail BIOS fills with real handlers. Their
+ * programmable level lives in INTES0 (0x77), which COMINIT sets to 0xEE (both
+ * level 6).
+ *
+ * ⚠️ WE RAISE BY BEHAVIOUR, NOT BY NAME -- the handlers are CROSS-WIRED versus the
+ * SDK's "INTTX0"/"INTRX0" labels, verified by disassembling this BIOS:
+ *   vector 0x18 (SDK "INTTX0", hook 0x6FE4 -> 0xFF2D03 -> 0xFF2C4D):
+ *       `ld (RXring+W),(0x50)` -- it READS SC0BUF into the RX ring. RECEIVE.
+ *   vector 0x19 (SDK "INTRX0", hook 0x6FE8 -> 0xFF2CF9 -> 0xFF2C17):
+ *       `ld (0x50),(TXring+W)` -- it WRITES the next TX byte to SC0BUF. TRANSMIT.
+ * Raising the vector by its SDK name gets you the opposite handler: raising 0x18
+ * on a transmit made the receive handler read our own just-sent byte back into
+ * the RX ring -- a self-loopback (measured: the console received its own pad). */
+constexpr unsigned kIrqVectorSerialReceive  = 0x18;  /* handler FILLS the RX ring   */
+constexpr unsigned kIrqVectorSerialTransmit = 0x19;  /* handler DRAINS the TX ring   */
+/* One byte at 19200 bps, 8N1 (10 bit-times) with the CPU at 6.144 MHz
+ * (515 * 199 * 60): 6_144_000 / 1920 ~= 3200 cycles. APPROXIMATE -- flow control
+ * (RTS) and the 64-byte BIOS rings absorb any drift, so exact baud is not load-
+ * bearing for correctness; see PERF_TIMING_POLICY.md. */
+constexpr int32_t kSerialByteCycles = 3200;
 /* 10-bit full scale. An emulator has no cell, so we model a healthy one; a flat
  * reading would make the BIOS power the console off (see above). */
 constexpr uint16_t kAdcFullScale = 0x03FF;
@@ -147,8 +184,7 @@ constexpr uint32_t kBiosFlashCardType1 = 0x006C59;   /* CS1 -- the development s
  *    RAM kept   -> VECT_SHUTDOWN (0xFFFE00) with XSP = 0x6C00, so the BIOS can finish
  *                  the cleanup it would normally do when you switch cartridges.
  *
- * (Derived here in pass 237 from SNK's own code; ares reaches the identical rule
- * independently -- `ngp/cpu/cpu.cpp::power`, testing `ram[0x2c7a]`.) */
+ * (Derived here in pass 237 from SNK's own code.) */
 constexpr uint32_t kRamStart      = 0x004000;
 constexpr uint32_t kRamSize       = 0x003000;      /* 12 KiB */
 constexpr uint32_t kBiosRamMarker = 0x006C7A;      /* non-zero once it has booted once */
@@ -278,6 +314,21 @@ inline bool irq_priority_register(unsigned vector_index, IrqPriorityReg& out) {
         case 18: out = {0x0074, false}; return true;   // INTT2
         case 19: out = {0x0074, true};  return true;   // INTT3
         case 8:  out = {0x0070, false}; return true;   // INT0
+        /* ⚡ THE RTC ALARM, vector index 10 -- and until now it could never fire, because
+         * a vector with no entry here reads back priority 0 and is dropped on the floor.
+         *
+         * Index 10 is the alarm and index 8 is the power button; they are NOT the same
+         * line, which is what made this look unimplementable at first. Settled by asking
+         * the BIOS: its vector table at 0xFFFF00 puts index 10 at 0xFF2856, and that
+         * handler is the only code in the whole 64 KiB that references 0x6FC8 -- the RAM
+         * vector the SDK documents as "RTC alarm interrupt". Index 8 goes to 0xFF1898,
+         * the power/boot handler. (They ARE related on hardware, just not the same pin:
+         * with the console switched off the alarm line is what powers it back on to
+         * sound -- that is VECT_ALARMDOWNSET. While a game runs it arrives here instead.)
+         *
+         * The level lives in the low nibble of 0x0070, which it shares with INT0 -- the
+         * Ghidra loader independently names that byte "RTC_Alarm_Level". */
+        case 10: out = {0x0070, false}; return true;   // INT0 pin == the RTC alarm
         case 28: out = {0x0070, true};  return true;   // INTAD (shares 0x70 with INT0)
         /* INTE45 (0x71) carries BOTH halves of the pair this project kept apart:
          *   low nibble  = INT4 -- and VBlank IS the INT4 pin
@@ -291,6 +342,13 @@ inline bool irq_priority_register(unsigned vector_index, IrqPriorityReg& out) {
          * not ours to fix. */
         case 11: out = {0x0071, false}; return true;   // INT4  == VBlank
         case 12: out = {0x0071, true};  return true;   // INT5
+        /* Serial channel 0 == the link cable. Both levels live in INTES0 (0x77):
+         * high nibble = the 0x18 vector, low nibble = the 0x19 vector (INT.H:
+         * ITX0M=0x70, IRX0M=0x07). COMINIT writes 0xEE (both level 6), so the
+         * nibble split is moot here, but kept faithful. (The HANDLERS these
+         * vectors run are cross-wired vs their names -- see the vector constants.) */
+        case kIrqVectorSerialReceive:  out = {0x0077, true};  return true;  // vector 0x18
+        case kIrqVectorSerialTransmit: out = {0x0077, false}; return true;  // vector 0x19
         /* Micro-DMA transfer-end levels. The NGPC keeps INTETC01/INTETC23 at 0x79/0x7A
          * (not the generic H1 core's 0xF0/0xF1): the BIOS's INTLVSET routine writes 0x79
          * here -- observed writing 0x09 (level 1) for Ogre Battle's channel-0 raster ISR. */
@@ -311,7 +369,7 @@ constexpr uint8_t  kBiosHandoffInte45   = 0xDC;
 
 /* ⚡ THE REGISTERS THE REAL BIOS LEAVES FOR THE CART. MEASURED ON SILICON, TWICE.
  *
- * `04_MY_PROJECTS/hw_entry_regs` freezes all eight registers in its very first
+ * `hw_entry_regs` freezes all eight registers in its very first
  * instruction (it IS the cart entry point) and prints them. Flashed on a real NGPC:
  *
  *      XIX = 00FF23C3   XWA = 000000DD   XSP = 00006C00   <- STABLE across power-ons
@@ -495,6 +553,21 @@ struct Machine {
     static constexpr uint32_t kScreenWidth  = 160;
     static constexpr uint32_t kScreenHeight = kVisibleScanlines;   /* 152 */
     uint16_t framebuffer[kScreenWidth * kScreenHeight] = {};
+
+    /* 🔍 DEBUG LAYER MASK -- the video twin of `Apu::channel_mask`. A cleared bit drops
+     * one layer from the COMPOSITE only; nothing else changes, because a scroll plane
+     * holds no state of its own to disturb. The silicon has no such register: this is an
+     * inspection tool (which plane owns that text? what does the art look like without
+     * it?), so it MUST default to all-on, or every image gate would be measuring the
+     * mask instead of the core. Deliberately NOT part of a savestate. */
+    static constexpr uint8_t kLayerScr1     = 0x01;
+    static constexpr uint8_t kLayerScr2     = 0x02;
+    static constexpr uint8_t kLayerSprBack  = 0x04;   /* PR.C = 1, behind both planes */
+    static constexpr uint8_t kLayerSprMid   = 0x08;   /* PR.C = 2, between the planes */
+    static constexpr uint8_t kLayerSprFront = 0x10;   /* PR.C = 3, in front of all    */
+    static constexpr uint8_t kLayerAll      = 0x1F;
+    uint8_t layer_mask = kLayerAll;
+
     void render_scanline(uint32_t line);
     void snapshot_raster_line(uint32_t line) {
         if (line < kVisibleScanlines)
@@ -535,12 +608,65 @@ struct Machine {
     bool     adc_busy = false;
     void adc_tick(uint32_t cycles);
 
+    /* --- serial channel 0 (SC0) == THE LINK CABLE, I/O 0x50-0x53 -------------
+     * The NGPC link cable is TLCS-900 serial channel 0, driven by the SNK BIOS
+     * COM routines. Games never touch SC0 directly: they call the BIOS, whose
+     * TX/RX interrupt handlers move bytes between a 64-byte ring in RAM
+     * (0x6C80 TX / 0x6CC0 RX) and SC0BUF (0x50). We model the cable as a byte
+     * pipe with two FIFOs a host bridges (in-process for 2-player-on-one-PC, or
+     * over a socket for online):
+     *   - `serial_tx` : bytes this machine has transmitted (host drains -> peer)
+     *   - `serial_rx` : bytes queued for this machine to receive (host fills)
+     * A byte the BIOS writes to SC0BUF is captured (io_action_write), pushed to
+     * serial_tx after one baud-time, then INTTX0 is raised so the BIOS fetches
+     * the next; a byte in serial_rx is presented at SC0BUF (read8) and INTRX0
+     * raised so the BIOS files it in the ring. Flow control: RTS = port 0xB2
+     * bit0 (0 = ready to receive, set by COMONRTS). Disabled by default -> the
+     * registers stay inert and the cable reads as unplugged, unchanged from
+     * before. See specs/LINK_CABLE.md and reference-ngpc-link-cable-serial-bios. */
+    bool     serial_link_enabled = false;
+    std::deque<uint8_t> serial_tx;
+    std::deque<uint8_t> serial_rx;
+    bool     serial_tx_busy = false;
+    uint8_t  serial_tx_byte = 0;
+    int32_t  serial_tx_cycles = 0;
+    /* CTS0 handshake input (TMP95C061 datasheet 3.11): when SC0MOD<CTSE> (bit6) is
+     * set, the transmitter HALTS a queued byte while CTS0 is HIGH and only shifts it
+     * out -- raising INTTX0 -- once CTS0 goes LOW. CTS0 is not a readable register; it
+     * is a hardware pin wired to the PEER's RTS (any GPIO; on NGPC RTS = 0xB2 bit0).
+     * A host bridging two machines drives this from the peer's RTS (ngpc_serial_set_cts).
+     * Default false (LOW = transferable) so a lone machine / CTSE-disabled game is
+     * unchanged. This is what lets Card Fighters' Clash's mutual handshake sync. */
+    bool     serial_cts_high = false;
+    /* Mutable: read8 is const, but the RX-buffer read is an ACKNOWLEDGE (it clears
+     * the presented byte so the next can arrive -- the hardware's overrun guard). */
+    mutable bool    serial_rx_pending = false;
+    mutable uint8_t serial_rx_byte = 0;
+    int32_t  serial_rx_cycles = 0;
+    /* --- counters, for the debugger's Link tab (ngpc_serial_state) ----------
+     * Bytes crossing the cable are visible from Python, but WHY they are not
+     * crossing is not: a byte can sit in serial_tx_busy because the peer holds
+     * CTS, sit in serial_rx because our own RTS is high, or be presented and
+     * never read because the BIOS's receive interrupt is masked. Counting each
+     * step separates "no cable" from "cable fine, nobody is draining it" --
+     * exactly the question the 2P-greyed-out hunt had to answer by guesswork.
+     * Pure observation: nothing here feeds back into emulation. */
+    uint32_t serial_tx_count = 0;        /* bytes the CPU handed to SC0BUF     */
+    uint32_t serial_wire_count = 0;      /* ...that finished shifting out      */
+    uint32_t serial_rx_queued_count = 0; /* bytes the host pushed at us        */
+    mutable uint32_t serial_rx_read_count = 0;  /* ...that the CPU read back   */
+    uint32_t serial_irq_tx_count = 0;    /* INTTX0 raised (vector 0x19)        */
+    uint32_t serial_irq_rx_count = 0;    /* INTRX0 raised (vector 0x18)        */
+    uint32_t serial_cts_hold_ticks = 0;  /* ticks a byte was held by CTS0 high */
+    uint32_t serial_rts_hold_ticks = 0;  /* ticks RX was held by our own RTS   */
+    void serial_tick(uint32_t cycles);
+
     /* --- the on-board calendar IC (RTC), I/O 0x90..0x97 --------------------
      * A Neo Geo Pocket keeps a real-time clock alive on the coin cell. The BIOS
      * reads it at power-on; a lost/invalid clock is how it decides the coin cell
      * is DEAD -> "SUB BATTERY DEAD" + the first-run wizard, forever (the game
      * never boots). Modelling it as a valid, ticking BCD clock is what lets the
-     * real-BIOS boot reach the cartridge. Layout mirrors ares ngp/cpu (io.cpp):
+     * real-BIOS boot reach the cartridge. Register map (SDK / QUICKREF §3):
      *   0x90 enable(bit0) · 0x91 year · 0x92 month · 0x93 day · 0x94 hour
      *   0x95 minute · 0x96 second · 0x97 weekday(bits0-3) + (year&3)<<4
      * All fields are BCD. Seeded to a valid date at reset so the cell reads good. */
@@ -549,8 +675,25 @@ struct Machine {
         uint8_t enable = 1;
         uint8_t year = 0x24, month = 0x01, day = 0x01;   /* 2024-01-01 */
         uint8_t hour = 0x00, minute = 0x00, second = 0x00, weekday = 0x01;
+        /* --- THE ALARM, at 0x98-0x9A (+ enable in 0x90 bit 1) ------------------
+         * Undocumented: no datasheet and no Ghidra loader has these. Found by
+         * MEASUREMENT -- running VECT_ALARMSET on the real BIOS and logging the I/O
+         * page. The BIOS writes the day to 0x98, the hour to 0x99 and the minute to
+         * 0x9A, then sets 0x90 to 0x03 (bit0 clock + bit1 alarm). Verified by varying
+         * the values passed and watching all three registers follow.
+         *
+         * Compare granularity is day/hour/minute -- there is no alarm second, which
+         * matches the SDK's ALARM struct {Day, Hour, Min, Code}. */
+        uint8_t alarm_enable = 0;
+        uint8_t alarm_day = 0, alarm_hour = 0, alarm_minute = 0;
     } rtc;
     void    rtc_step(uint32_t cycles);
+    /* Wind the clock forward by whole seconds, through the same carry chain the tick
+     * uses -- for the time that passed while the emulator was closed (the coin cell
+     * keeps a real console's clock running when it is switched off). */
+    void    rtc_advance_seconds(uint32_t seconds);
+    void    rtc_tick_one_second();
+    bool    rtc_alarm_due() const;
     uint8_t rtc_read(uint32_t addr) const;
     void    rtc_write(uint32_t addr, uint8_t value);
 
@@ -606,8 +749,8 @@ struct Machine {
     void timer_tick(uint32_t cycles);
 
     /* ⚖️ THE CARTRIDGE FLASH IS SLOW. Every instruction is FETCHED from the cart at
-     * 0x200000, and on silicon the flash bus adds wait-states per byte. This core (and
-     * ares, and BizHawk) fetched the cart for FREE, so cart code ran ~3.4x too fast --
+     * 0x200000, and on silicon the flash bus adds wait-states per byte. This core -- like
+     * every emulator measured alongside it -- fetched the cart for FREE, so cart code ran ~3.4x too fast --
      * MEASURED by hw_calibration/cpu_calib_v1.ngc: on a real NGPC the short, fetch-bound
      * ops (BASE/ADD/SHIFT/MEM) run ~3.4x slower than this core, the execution-bound ones
      * (MUL/DIV) ~2.5x -- the exact signature of a per-fetch-byte penalty, while the raster
@@ -633,6 +776,14 @@ struct Machine {
      * per-frame ldir into char RAM (Cool Boarders -> 0xBC00) is slower on silicon than a
      * CPU model alone predicts. 0 = off. Needs a v3 calibration ROM to confirm. */
     uint32_t vram_wait = 0;
+
+    /* WHICH CONSOLE WE ARE PRETENDING TO BE, for a monochrome cartridge.
+     * false (default) = NGPC: 0x6F91 reads 0x10, so a colour-aware mono game runs its
+     * colourisation code and owns the compat palette. true = the original mono NGP:
+     * 0x6F91 reads the cartridge's own header value and the 12-bit compat palette does
+     * not exist on that silicon, so writes to it are ignored and the BIOS grey ramp
+     * stands. Set BEFORE reset. */
+    bool k1ge_console = false;
     /* Cycles per byte for LDIR/LDDR block copies. Datasheet 7n+1 (default 7); may be a floor
      * like MUL/DIV were. 14 reproduces Cool Boarders' silicon 30fps without touching Fatal
      * Fury. `ngpc_set_ldir_cost` is the knob; pending a clean silicon measurement. */
@@ -755,21 +906,49 @@ struct Machine {
             if (flash_id_read(a, id)) return id;
         }
         /* The RTC's registers answer from the clock, not from the byte the last
-         * write happened to leave in the I/O page. */
-        if (a >= 0x90 && a <= 0x97) return rtc_read(a);
-        /* Port 0xB1 (ares ngp/cpu/io.cpp): bit1 = the CR2032 SUB-BATTERY, bit2 = a
-         * must-be-1 line ("or SNK Gals' Fighter shows a link error"). Leaving them 0
-         * is the whole "SUB BATTERY DEAD" loop -- the BIOS reads a dead coin cell and
-         * never leaves the warning. Both read 1.
+         * write happened to leave in the I/O page. 0x98-0x9A are the alarm's
+         * day/hour/minute -- part of the same chip, so they answer from it too. */
+        if (a >= 0x90 && a <= 0x9A) return rtc_read(a);
+        /* SC0BUF (0x50): when the link is presenting a received byte, reading it
+         * IS the RX handler consuming it -- return it and clear the pending flag
+         * (the overrun guard). Otherwise it is a plain I/O byte. */
+        if (a == 0x000050 && serial_rx_pending) {
+            serial_rx_pending = false;
+            ++serial_rx_read_count;    /* debugger: the CPU really consumed it */
+            return serial_rx_byte;
+        }
+        /* Port 0xB1: bit1 = the CR2032 SUB-BATTERY, bit2 = a must-be-1 line (drop it and
+         * SNK Gals' Fighter reports a link error). Leaving them 0 is the whole
+         * "SUB BATTERY DEAD" loop -- the BIOS reads a dead coin cell and never leaves
+         * the warning. Both read 1.
          *
-         * bit0 is the POWER line read as a LEVEL. ares drives it !power (1 = released),
-         * but MEASURED against this core it must stay 0: with bit0 forced to 1 the BIOS
-         * boot parks blank at 0xFF1127 and never draws its language/clock screens,
-         * whereas at 0 (the I/O page's own value) the boot renders them. This core
-         * models POWER as INT0 rather than the NMI ares uses, and that difference is
-         * exactly why the level polarity it wants is inverted -- the empirical render
-         * wins over copying ares' polarity blind. So force only bits 1 and 2. */
-        if (a == 0x0000B1) return uint8_t(mem[a] | 0x06);
+         * bit0 is the POWER line read as a LEVEL, and it must stay 0 here. MEASURED:
+         * with bit0 forced to 1 the BIOS boot parks blank at 0xFF1127 and never draws
+         * its language/clock screens, whereas at 0 (the I/O page's own value) the boot
+         * renders them. The polarity is model-dependent -- this core models POWER as
+         * INT0 rather than as an NMI, and a core that chose the NMI would want the
+         * opposite level. Trust the render, not a polarity carried over from a
+         * different model. So force only bits 1 and 2. */
+        if (a == 0x0000B1) {
+            /* bit1 = the CR2032 sub-battery (always 1). bit2 = the link-cable DETECT
+             * line: it reads 1 when nothing is plugged (idle) and 0 when a peer console
+             * is connected through the cable. Card Fighters' Clash gates its handshake
+             * transmission on bit2 == 0 (at 0x24065A: ld A,(0xB1); and 0x04; srl 2; the
+             * coroutine does `cp A,1; ret Z`), so it can only ever become the link
+             * initiator once it detects a cable -- with bit2 stuck at 1 it waits forever
+             * ("EITHER PLAYER MUST PUSH A" never advances). Model bit2 from
+             * serial_link_enabled, which the link layer arms exactly when a cable is
+             * wired. With no cable bit2 stays 1 (SNK Gals' Fighter needs that: bit2 = 0
+             * with no peer makes it report a link error). See project memory
+             * project_ngpc_emulator_cfc_link_stall. */
+            uint8_t v = uint8_t(mem[a] | 0x02);
+            /* bit2 is an INPUT line, so force it from the cable state -- never let a
+             * value the game left in the I/O page decide it (a savestate restore can
+             * leave bit2 set in mem). Cable present => 0, absent => 1. */
+            if (serial_link_enabled) v &= uint8_t(~0x04);
+            else                     v |= 0x04;
+            return v;
+        }
         /* Slow cart flash: every byte the CPU reads from a cartridge window costs
          * wait-states. Sequential instruction fetch (inside the fetch window) is cheap;
          * a random data read pays cart_data_wait. Accumulated here and folded into the
@@ -782,6 +961,8 @@ struct Machine {
              * cart_data_wait, which defaults to 0 (free); no fallback to cart_wait. */
             access_wait += is_fetch ? cart_wait : cart_data_wait;
         }
+        if (a >= rlog_lo && a <= rlog_hi) note_read(a, mem[a]);   // disarmed by default
+        if (hygiene_on) check_uninit_read(a);
         return mem[a];
     }
     inline uint32_t read32(uint32_t a) const {
@@ -827,6 +1008,137 @@ struct Machine {
             wlog[wlog_count % kWlogSize] = {pc, a, v};
             ++wlog_count;
         }
+        if (a >= elog_lo && a <= elog_hi) note_event(kEventWrite, a, v, pc);
+        if (hygiene_on) mark_ram_written(a);
+    }
+
+    /* THE EVENT LOG -- WHEN in the frame did that happen?
+     *
+     * A write log says a register changed and who changed it. It cannot say the one
+     * thing that matters for raster work: at which SCANLINE and how far into it. A
+     * mid-frame scroll split, an HBlank HUD, a palette swap on line 100 -- all of
+     * them are correct or broken purely as a function of raster timing, and until
+     * now the only way to check was to guess.
+     *
+     * Every event carries its exact raster position, so the debugger can plot the
+     * frame as a scanline x cycle grid: one pixel per cycle, per line.
+     *
+     * Armed over an address window (the video registers, typically). Off by default. */
+    static constexpr uint8_t kEventWrite = 0;
+    static constexpr uint8_t kEventIrq   = 1;
+
+    struct EventRec {
+        uint32_t pc;
+        uint32_t addr;
+        uint16_t scanline;
+        uint16_t cycle;      /* cycles elapsed INTO that scanline */
+        uint8_t  value;
+        uint8_t  type;       /* kEventWrite / kEventIrq */
+    };
+    static constexpr uint32_t kElogSize = 4096;
+    uint32_t elog_lo = 1;        /* lo > hi  ==  logging off */
+    uint32_t elog_hi = 0;
+    uint64_t elog_count = 0;
+    EventRec elog[kElogSize] = {};
+
+    /* THE HYGIENE COUNTERS -- what a ROM does that hardware tolerates but that is
+     * almost always a bug.
+     *
+     * This core models the machine closely enough to JUDGE a cartridge, not merely
+     * run it, and these are the two findings that need the core's cooperation:
+     *
+     *  - READ BEFORE WRITE. Work RAM comes up as whatever the last game left (or
+     *    garbage on a cold machine). A game that reads a variable it never wrote is
+     *    reading noise; it will look fine on the developer's emulator, whose RAM
+     *    happens to be zeroed, and misbehave on a console that has been playing
+     *    something else. The equivalent check finds real bugs on real games.
+     *    Tracked with one bit per work-RAM byte -- 0x4000..0x7FFF, 2 KB of bitmap.
+     *
+     *  - WRITES THAT GO NOWHERE. A store to unmapped space is discarded by the bus
+     *    and the program never learns. Writes to CART space are NOT counted: that is
+     *    how an AMD flash command latch is addressed, so they are legitimate.
+     *
+     * Both off by default; the analyzer arms them for one boot. */
+    /* ⚠️ USER RAM ONLY -- 0x4000..0x6BFF, not the whole RAM region.
+     *
+     * 0x6C00..0x6FFF is the BIOS SYSTEM PAGE and 0x7000..0x7FFF is the Z80's shared
+     * RAM. Neither belongs to the game: the BIOS fills the system page during its own
+     * boot, and in the hand-off start the analyzer uses that boot never runs. Watching
+     * those ranges reported ~2000 "uninitialised reads" for every ROM, commercial ones
+     * included -- a finding that fires on everything teaches you to ignore it. The
+     * bound matches core/bus.py, which calls 0x4000..0x6BFF the user RAM area. */
+    static constexpr uint32_t kRamLo = 0x004000, kRamHi = 0x006BFF;
+    static constexpr uint32_t kRamSpan = kRamHi - kRamLo + 1;
+
+    struct HygieneRec { uint32_t pc; uint32_t addr; };
+    static constexpr uint32_t kHygSize = 256;
+
+    bool hygiene_on = false;
+    mutable uint64_t uninit_reads = 0;      /* reads of work RAM never written */
+    mutable uint64_t lost_writes = 0;       /* stores to unmapped space */
+    mutable uint32_t hyg_uninit_n = 0;      /* how many samples below are filled */
+    mutable uint32_t hyg_lost_n = 0;
+    mutable HygieneRec hyg_uninit[kHygSize] = {};
+    mutable HygieneRec hyg_lost[kHygSize] = {};
+    mutable uint8_t ram_written[kRamSpan / 8] = {};
+
+    inline void hygiene_reset() {
+        uninit_reads = lost_writes = 0;
+        hyg_uninit_n = hyg_lost_n = 0;
+        for (uint32_t i = 0; i < kRamSpan / 8; ++i) ram_written[i] = 0;
+    }
+
+    inline void mark_ram_written(uint32_t a) const {
+        if (a < kRamLo || a > kRamHi) return;
+        const uint32_t i = a - kRamLo;
+        ram_written[i >> 3] |= uint8_t(1u << (i & 7));
+    }
+
+    inline void check_uninit_read(uint32_t a) const {
+        if (a < kRamLo || a > kRamHi) return;
+        if ((a - fetch_window) < 8u) return;          /* a fetch, not a data read */
+        const uint32_t i = a - kRamLo;
+        if (ram_written[i >> 3] & (1u << (i & 7))) return;
+        ++uninit_reads;
+        if (hyg_uninit_n < kHygSize) hyg_uninit[hyg_uninit_n++] = {cpu.pc, a};
+    }
+
+    inline void note_lost_write(uint32_t a) const {
+        ++lost_writes;
+        if (hyg_lost_n < kHygSize) hyg_lost[hyg_lost_n++] = {cpu.pc, a};
+    }
+
+    /* EXECUTION COVERAGE -- how much of the cartridge actually ran?
+     *
+     * One bit per byte of the cart window, set at the address of every instruction
+     * retired. Without it, "the analyzer looked at this ROM" is an unfalsifiable
+     * claim: a boot that sits on the title screen touches a sliver of the code and
+     * reports just as confidently as one that played a level. With it, the question
+     * "did pressing buttons actually reach more code" has a number.
+     *
+     * Also the foundation for a code/data logger: a byte that has been executed is
+     * code, whatever the disassembler guesses.
+     *
+     * 2 MiB window -> 256 KiB of bitmap. Off by default. */
+    static constexpr uint32_t kCovLo = 0x200000, kCovHi = 0x3FFFFF;
+    static constexpr uint32_t kCovSpan = kCovHi - kCovLo + 1;
+
+    bool coverage_on = false;
+    uint32_t coverage_hits = 0;                  /* distinct addresses executed */
+    std::vector<uint8_t> coverage;               /* allocated on first enable */
+
+    inline void note_exec(uint32_t pc) {
+        if (pc < kCovLo || pc > kCovHi || coverage.empty()) return;
+        const uint32_t i = pc - kCovLo;
+        uint8_t& cell = coverage[i >> 3];
+        const uint8_t bit = uint8_t(1u << (i & 7));
+        if (!(cell & bit)) { cell |= bit; ++coverage_hits; }
+    }
+
+    inline void note_event(uint8_t type, uint32_t a, uint8_t v, uint32_t pc) {
+        elog[elog_count % kElogSize] = {
+            pc, a, uint16_t(scanline), uint16_t(cycle_residue), v, type};
+        ++elog_count;
     }
 
     /* THE WRITE LOG -- who wrote here, and from what code?
@@ -848,6 +1160,99 @@ struct Machine {
     uint32_t wlog_hi = 0;
     uint64_t wlog_count = 0;   /* every write seen, even the ones the ring dropped */
     WriteRec wlog[kWlogSize] = {};
+
+    /* THE READ LOG -- who READ this address?
+     *
+     * The mirror of the write log, and the half that was missing. "Which routine
+     * writes this?" was answerable; "which routine READS this?" was not, and that is
+     * the question you ask about a flag nobody seems to act on, or a table you think
+     * is dead. A debugger that can only watch writes can only see half of any
+     * conversation.
+     *
+     * ⚠️ INSTRUCTION FETCHES ARE NOT LOGGED. Every fetch goes through `read8`, so
+     * logging them all would bury the one data read you care about under thousands
+     * of fetches of the code doing the reading -- and arming a window over ROM would
+     * log essentially every instruction in it. Only reads from OUTSIDE the current
+     * fetch window are recorded, which is exactly the "the program loaded a value"
+     * event. Same test the cart wait-state accounting already uses.
+     *
+     * Off by default (lo > hi): the hot path pays two compares, like the write log. */
+    struct ReadRec { uint32_t pc; uint32_t addr; uint8_t value; };
+    static constexpr uint32_t kRlogSize = 8192;
+    mutable uint32_t rlog_lo = 1;      /* lo > hi  ==  logging off */
+    mutable uint32_t rlog_hi = 0;
+    mutable uint64_t rlog_count = 0;   /* every logged read, including ring-dropped */
+    mutable ReadRec rlog[kRlogSize] = {};
+
+    inline void note_read(uint32_t a, uint8_t v) const {
+        if ((a - fetch_window) < 8u) return;      /* an instruction fetch, not a data read */
+        rlog[rlog_count % kRlogSize] = {cpu.pc, a, v};
+        ++rlog_count;
+    }
+
+    /* THE CALL STACK -- "how did I get here?"
+     *
+     * The one question a breakpoint always raises and that neither a PC nor a
+     * register dump can answer. Every serious console debugger
+     * shows the chain of callers; this core had nothing.
+     *
+     * Kept as a SHADOW stack, updated per instruction, rather than by walking the
+     * real stack afterwards: the T900 pushes no frame pointer, so a value on the
+     * stack that happens to look like a code address is indistinguishable from a
+     * return address. Watching the transitions as they happen is exact.
+     *
+     * Recognition is by SP movement plus the pushed value, not by decoding opcodes
+     * -- the decoder lives in the other language and this must stay on the hot path:
+     *   CALL  SP fell, and the value now on top points just past the instruction we
+     *         were executing (that is what a return address IS).
+     *   RET   SP rose to or past a frame's entry SP; unwind every frame it passed,
+     *         which also handles a routine that pops its own frame and jumps.
+     *
+     * Off by default: enabling costs a couple of compares and one 4-byte read per
+     * call, which is not something a player should pay for. */
+    struct Frame {
+        uint32_t caller_pc;   /* the address of the CALL instruction itself */
+        uint32_t entry_pc;    /* where it went (the routine's first instruction) */
+        uint32_t return_pc;   /* where it will come back to */
+        uint32_t entry_sp;    /* SP just before the call pushed anything */
+    };
+    static constexpr uint32_t kCallDepth = 64;
+    bool callstack_on = false;
+    uint32_t call_depth = 0;
+    uint64_t call_overflow = 0;   /* frames dropped because the array was full */
+    Frame callstack[kCallDepth] = {};
+
+    inline void note_control_flow(uint32_t pc_before, uint32_t sp_before) {
+        const uint32_t sp_now = cpu.regs[7];
+        if (sp_now == sp_before) return;                 /* the common case: no push/pop */
+        if (sp_now < sp_before) {
+            /* Something was pushed. It is a CALL only if the top of the stack now
+             * holds an address just past the instruction we just ran -- a PUSH of
+             * data, or a stack frame being opened, must not become a call.
+             *
+             * ⛔ RAW BYTES, NOT read32(). Going through the normal read path made this
+             * observer generate memory accesses of its own: they landed in the read log
+             * and, worse, tripped the uninitialised-read detector on stack bytes the
+             * PROGRAM never touched. One debug tool was manufacturing findings for
+             * another -- the ROM analyzer reported ten stack addresses as game bugs that
+             * were purely this probe's own reads. An observer must not be observable. */
+            const uint32_t sp = sp_now & kAddrMask;
+            const uint32_t top = (uint32_t(mem[sp]) |
+                                  (uint32_t(mem[(sp + 1) & kAddrMask]) << 8) |
+                                  (uint32_t(mem[(sp + 2) & kAddrMask]) << 16)) & 0x00FFFFFFu;
+            if (top > pc_before && (top - pc_before) <= 8u) {
+                if (call_depth < kCallDepth) {
+                    callstack[call_depth] = {pc_before, cpu.pc, top, sp_before};
+                    ++call_depth;
+                } else {
+                    ++call_overflow;   /* deep recursion: report it, do not corrupt */
+                }
+            }
+        } else {
+            /* The stack shrank: retire every frame whose entry SP it has reached. */
+            while (call_depth && callstack[call_depth - 1].entry_sp <= sp_now) --call_depth;
+        }
+    }
 
     uint32_t rom_entry_point() const {
         if (rom.size() < 0x20) return 0x200000;

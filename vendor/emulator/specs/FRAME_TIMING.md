@@ -194,25 +194,95 @@ but only matters if a game does the (HW-invalid) thing.
 bitmask, separated from `FrameState` so the IRQ controller model can
 grow without churning the timing core.
 
-| Constant                | Value     | Source                                |
-|-------------------------|-----------|---------------------------------------|
-| `IRQ_LEVEL_VBLANK`      | 4         | NGPC_HW_QUICKREF.md § 4               |
-| `VBLANK_VECTOR_ADDRESS` | 0x006FCC  | BIOS install (system page 0x6Fxx)     |
+| Constant                  | Value    | Source                                        |
+|---------------------------|----------|-----------------------------------------------|
+| `IRQ_LEVEL_VBLANK`        | **4**    | SNK SDK `SysPro.txt` (explicit)               |
+| `VBLANK_VECTOR_ADDRESS`   | 0x006FCC | = RAM vector table slot 5 (see below)         |
+| `IRQ_RAM_VECTOR_TABLE_BASE` | 0x006FB8 | SNK SDK `SysPro.txt`                        |
+| `IRQ_VECTOR_TABLE_BASE`   | 0xFFFF00 | Toshiba TMP95C061 manual (hardware vectors)   |
+| `IRQ_VECTOR_INDEX_VBLANK` | 11       | Toshiba Table 3.3 (1): INT4 pin, vector 0x2C  |
+| `K2GE_VBLANK_IRQ_ENABLE_BIT` | 0x80  | K2GE control register 0x008000, bit 7         |
+
+> **CORRECTION (2026-07-10): `IRQ_LEVEL_VBLANK` is 4, not 6.**
+> It had been raised to 6 on 2026-07-03 by *inference* ("the BIOS runs `ei 5`
+> before its init `halt` and relies on VBlank to wake it, so VBlank must be > 5").
+> That inference rested on our mask gate — which was itself **off by one**.
+>
+> Two authoritative sources say 4:
+> - **SNK SDK** (`01_SDK/docs/SysPro.txt`, USER PROGRAM INTERRUPT OPERATION
+>   VECTOR): *"It is forbidden to prohibit Vertical Blanking Interrupt
+>   (**Interrupt level 4**) because the operation has system involvement."*
+> - The reference emulator gates VBlank on `statusIFF() <= 4`, which under the
+>   Toshiba mask rule is exactly "level 4".
+>
+> With the gate fixed, the old premise collapses: `ei 5` *does* mask a level-4
+> VBlank, and the BIOS's init `halt` is woken by a **higher-priority source** (a
+> timer / A-D interrupt whose level the BIOS programs itself via `VECT_INTLVSET`).
+> See DEVLOG pass 184.
+
+### Mask rules (Toshiba TLCS-900/L1 CPU manual, SR bits 12-14 = IFF2:0)
+
+The manual is authoritative and we were wrong on **both** counts before pass 183:
+
+| Rule | Manual | We used to do |
+|---|---|---|
+| **Accept an IRQ of level L** | `L >= IFF` — `110` reads *"enables interrupts with **level 6 or higher**"*, `111` = "level 7 only (non-maskable)" | `L > IFF` (strictly greater) — **off by one** |
+| **Mask after acceptance** | *"the mask register sets a value **higher by 1** than the interrupt level received"* → `IFF = min(L + 1, 7)` | `IFF = L` (left the source's own level unmasked inside its handler) |
+
+`IFF` is initialised to `111` (= 7) by reset — which is what our boot seed uses.
+
+### Vector tables — there are two, and they nest
+
+1. **Hardware vector table**, base **`0xFFFF00`**, entry = `base + vector_value`
+   (Toshiba Table 3.3 (1)). The manual states it outright: the default vector
+   `0028H` resolves to address `FFFF28H`. On NGPC these entries hold **SNK BIOS
+   handlers**.
+2. **User (RAM) vector table**, base **`0x006FB8`**, entry = `base + index * 4`
+   (SNK SDK). The BIOS handler does its work and then chains to the user handler
+   pointer stored here.
+
+**This is where the long-standing "magic" address `0x006FCC` comes from: it is
+simply slot 5 of the RAM table** (`0x6FB8 + 5*4`).
+
+| idx | RAM addr | Source | | idx | RAM addr | Source |
+|----:|---------|--------|---|----:|---------|--------|
+| 0-3 | 6FB8..  | SWI 3..6 | | 7 | 6FD4 | Timer 0 |
+| 4   | 6FC8    | RTC alarm | | 8 | 6FD8 | Timer 1 |
+| **5** | **6FCC** | **Vertical Blanking** | | 9/10 | 6FDC/6FE0 | Timer 2/3 |
+| 6   | 6FD0    | Interrupt from Z80 | | 11/12 | 6FE4/6FE8 | Serial TX/RX |
+|     |         |           | | 14-17 | 6FF0.. | Micro-DMA 0..3 end |
+
+Hardware vector indices actually used (Toshiba Table 3.3 (1), index = vector / 4):
+**11** = INT4 pin (VBlank), **16..19** = INTT0..3 (the 8-bit timers), **28** =
+INTAD (A/D conversion completion).
+
+### Multi-source `IrqState`
 
 ```python
 @dataclass(frozen=True)
 class IrqState:
-    pending_mask: int = 0
+    pending_mask: int = 0                     # legacy VBlank bit (savestate)
+    pending_vectors: frozenset[int] = frozenset()   # keyed by HARDWARE vector index
 
-    def is_vblank_pending(self) -> bool:
-        return bool(self.pending_mask & (1 << IRQ_LEVEL_VBLANK))
-
+    def is_vblank_pending(self) -> bool: ...
     def with_vblank_pending(self) -> "IrqState": ...
     def with_vblank_cleared(self) -> "IrqState": ...
+    def is_vector_pending(self, hw_vector_index: int) -> bool: ...
+    def with_vector_pending(self, hw_vector_index: int) -> "IrqState": ...
+    def with_vector_cleared(self, hw_vector_index: int) -> "IrqState": ...
 ```
 
+Non-VBlank sources (the A/D converter, the timers, the serial ports) are keyed by
+**the chip's own hardware vector index**, so they need no numbering of our own.
+Their priority level is **programmable**: it is read from an INTxx register at
+delivery time (level 0 = source disabled). `IRQ_HW_PRIORITY_REGISTERS` maps
+vector index → (I/O address, nibble) — and those are exactly the nibbles the BIOS
+call `VECT_INTLVSET` writes (see `specs/BIOS_HLE.md`). The A/D shares register
+INTE0AD (`0x0070`) with the INT0 pin: INT0 takes the low nibble, the A/D the high.
+
 `fold_vblank_irq_pending(irq_state, transitions)` walks an
-advancement's `VBlankTransition` tuple and sets bit 4 on every
+advancement's `VBlankTransition` tuple and sets the VBlank bit
+(`1 << IRQ_LEVEL_VBLANK`, i.e. bit 4) on every
 `"enter"` event. `"leave"` transitions do **not** clear the bit —
 the executor will clear on IRQ delivery (Phase 3.2.2b), or via
 explicit ack at the IRQ controller (future).
@@ -252,20 +322,39 @@ visible→VBlank boundary; the bit just becomes set. Phase 3.2.2b
    instructions. Public because the run loops (`build_run_steps`,
    `build_run_until`) call it before each `build_execute_next`.
 
-   Gating per Toshiba TLCS-900/H spec: a pending IRQ at level `L` is
-   delivered when `L > cpu.iff_level`. For VBlank (`L = 4`), that's
-   `cpu.iff_level < 4`. `iff_level == 7` masks everything.
+   **Source-enable gate.** Hardware only raises VBlank while the K2GE control
+   register (`0x008000`) has bit 7 set. That register **powers on at 0xC0**
+   (VBlank + HBlank enabled), so it is enabled out of reset — but software can
+   turn it off, and we now honour that.
+
+   **Mask gate** (Toshiba manual, see § 3.6): a pending IRQ at level `L` is
+   delivered when **`L >= cpu.iff_level`**. For VBlank (`L = 4`) that means
+   `iff_level <= 4`; only `iff_level` 5, 6 or 7 masks it.
 
    Stack frame layout (matches RETI's pop order — PC on top):
    - Push SR first (2 bytes) at `XSP-2..XSP-1`
    - Push PC second (4 bytes) at `XSP-6..XSP-3` (lowest addr = top)
    - `new_xsp = XSP - 6`
 
+   **Vector resolution** — hardware always goes through the hardware table:
+   - **BIOS attached** (the normal, faithful path): read the 4-byte handler at
+     `0xFFFF00 + 11*4 = 0xFFFF2C` and jump to it. That is the **SNK BIOS frame
+     handler**, which does its per-frame work and *then* chains to the user hook
+     at `0x006FCC`. `IrqDeliveryResult.used_hw_vector_table` is `True`.
+   - **No BIOS attached** (fallback): jump via the RAM hook `0x006FCC` directly.
+     This is a **homebrew-only shortcut** — homebrew installs its ISR there and
+     runs BIOS-less — and is **not** what hardware does. Documented, never silent.
+   - If the RAM hook is still `0x00000000`, fall back to the slot address itself.
+
    After delivery:
-   - `cpu.pc = VBLANK_VECTOR_ADDRESS` (0x006FCC)
-   - `cpu.iff_level = IRQ_LEVEL_VBLANK` (4) — masks same-and-lower
-     priority IRQs while in the ISR
+   - `cpu.iff_level = min(L + 1, 7)` — per the Toshiba manual (§ 3.6)
    - VBlank pending bit cleared via `with_vblank_cleared`
+
+   **`try_deliver_pending_vector_irq`** is the sibling for the non-VBlank sources
+   (A/D completion, timers). Same push / gate / mask rules; the level is read from
+   the source's INTxx register (level 0 = disabled), and the highest-priority
+   deliverable source wins (ties broken by the chip's default-priority order,
+   i.e. lowest vector index). The run loops try VBlank first, then this.
 
    Returns an `IrqDeliveryResult` carrying `delivered: bool`,
    `after_cpu`, `after_memory`, `after_irq_state`, and an optional
@@ -318,8 +407,10 @@ Chained workflow now closes the loop:
 # Advance to VBlank (sets pending bit).
 tick-frame rom.ngc --scanlines 160 --save-state /tmp/pre_irq.json
 
-# Step one instruction with iff_level<4 — IRQ delivers, PC jumps to
-# 0x006FCC, pending bit cleared.
+# Step one instruction with iff_level <= 4 — IRQ delivers. With a BIOS
+# attached it vectors through the hardware table (0xFFFF2C -> BIOS frame
+# handler); with no BIOS it falls back to the RAM hook 0x006FCC.
+# Pending bit cleared.
 step-exec rom.ngc --seed-from /tmp/pre_irq.json --save-state /tmp/in_isr.json
 
 # (Inside ISR — modeled cleanup happens here in the game code.)
@@ -330,12 +421,13 @@ step-exec rom.ngc --seed-from /tmp/in_isr.json
 
 ### Known limitations
 
-- **Fetch from writable RAM not modeled**: instruction fetch goes
-  through the read bus only, not the writable overlay. The vector
-  page (0x6Fxx) is in cold-start RAM (0x00 = NOP) ; software relying
-  on a BIOS-installed JMP at the vector won't find it. Workaround for
-  now: vector address resolves directly to the ISR entry. Phase
-  3.2.2c (or BIOS HLE) will install the JMP byte sequence.
+- **Unset-vector fallback still simplified**: instruction fetch now
+  sees the writable runtime overlay, and IRQ delivery prefers the
+  4-byte pointer stored in the user vector slot. The remaining
+  simplification is only for the uninitialized case: a zero vector
+  still falls back to the slot address itself so debugger/bootstrap
+  workflows keep moving. A stricter future slice could surface a more
+  explicit bad-vector failure there.
 - **Other IRQ sources**: only VBlank modeled. RTC alarm, timer 0..3,
   Z80 IRQ all sit dormant in `IrqState.pending_mask` until their
   source detectors land.
@@ -343,19 +435,53 @@ step-exec rom.ngc --seed-from /tmp/in_isr.json
 ## 3.8 Per-instruction cycle accounting (Phase 3.2.3a)
 
 Phase 3.2.3a wires explicit `cycles_consumed` fields through the
-executor result chain. The architecture is in place ; the per-opcode
-table (Phase 3.2.3b) will populate real values.
+executor result chain. Phase 3.2.3b has now started: common
+control-flow / CPU-control opcodes override the shared fallback with
+real Toshiba values, while unpopulated executor branches still use
+the old estimate.
 
 | Constant                            | Value | Note                                |
 |-------------------------------------|-------|-------------------------------------|
-| `ESTIMATED_CYCLES_PER_INSTRUCTION`  | 8     | Flat placeholder, every opcode      |
+| `ESTIMATED_CYCLES_PER_INSTRUCTION`  | 8     | Shared fallback for unpopulated rows |
 | `IRQ_DELIVERY_CYCLES`               | 13    | Toshiba TLCS-900/H IRQ entry cost   |
 
 ### Plumbing
 
 - `ExecutionResult.cycles_consumed: int = ESTIMATED_CYCLES_PER_INSTRUCTION`
-  — every executor returns this default ; per-opcode handlers will
-  override it in Phase 3.2.3b.
+  — executor fallback value. Populated 3.2.3b rows now override it for
+  `NOP`, `EI/DI`, `LDF`, `PUSH/POP SR`, `SWI`, `JP/JR/JRL`, `CALL`,
+  prefixed byte `DJNZ`, `RET/RETD/RETI`, `LINK/UNLK`, `PUSHW #16`,
+  `PUSH R16`, `PUSH R32`,
+  `POP R16`, `POP R32`, prefixed `PUSH/POP r`, `C7 <reg> 04/05`,
+  `jp (XIX+WA)`, `call (XIX)`, `EX F,F'`, the
+  currently executed register/immediate transfer subset (`LD R,r`,
+  `LD r,R`, `LD r,#3`, `LD R,#`, `LD r,#`, `LDA R,mem`), the
+  register/immediate ALU subset (`ADD/ADC/SUB/SBC/AND/XOR/OR/CP`), the
+  unary register subset (`INC/DEC #3,r`, `DAA`, `PAA`, `MIRR`, `BS1F`, `BS1B`, `EXTZ`, `EXTS`), the currently
+  executed memory subset (`LD R,(mem)`, `LD (mem),R`, `LD (mem),#8`,
+  `LDW (mem),#16`, `CP` register/memory forms, `PUSHW (mem)`), the
+  executed ALU-memory subset (`ADD/ADC/SUB/SBC/AND/XOR/OR R,(mem)`,
+  `ADD/ADC/SUB/SBC/AND/XOR/OR (mem),R`, byte/word `(mem),#`,
+  `CP (mem),#`, byte/word `INC/DEC #3,(mem)`), the executed memory
+  bit/carry subset (`BIT #3,(mem)`, `LDCF/ANDCF/ORCF/XORCF`, `STCF`,
+  `RES/SET/CHG/TSET` on memory), the executed memory rotate/shift
+  subset (`RLC/RRC/RL/RR/SLA/SRA/SLL/SRL (mem)`), the executed byte
+  register bit-op subset (`BIT/RES/SET/CHG #4,r`, `TSET #4,r`),
+  `INCF`, `DECF`, the executed shift-immediate register subset
+  (`RLC/RRC/RL/RR/SLA/SRA/SLL/SRL #4,r` with Toshiba `3 + n/4`
+  timing), the executed shift-by-A register subset
+  (`RLC/RRC/RL/RR/SLA/SRA/SLL/SRL A,r` with Toshiba `2` timing),
+  `LDX (#8), #`, and the matching `C7` current-bank byte-slice mirrors
+  of those shift families with the same timing rules. Safe byte
+  `CPL` / `NEG` and their matching `C7` byte-slice mirrors also now use
+  Toshiba `2`-cycle timing. The documented prefixed `MULA rr`
+  special case (`D8..DF : 19`) now also contributes its real Toshiba
+  `19`-cycle cost. The documented prefixed modulo-adjust family
+  (`MINC1/2/4` = `5`, `MDEC1/2/4` = `4`) now contributes its real
+  Toshiba timing as well. The executed carry-flag register subset
+  (`ANDCF/ORCF/XORCF/LDCF/STCF` on safe byte prefixed registers and the
+  matching `C7` byte-slice mirrors) now contributes its Toshiba
+  `3`-cycle timing too.
 - `IrqDeliveryResult.cycles_consumed: int = 0` — set to
   `IRQ_DELIVERY_CYCLES` only on successful delivery ; zero otherwise.
 - `RunStepsResult.total_cycles_consumed`,
@@ -382,14 +508,11 @@ All 4 executor CLI handlers + the 3 chained-save commands pass
 IRQ deliveries advance `frame_state` by their actual 13-cycle cost
 even though they don't fetch an instruction.
 
-### Why this isn't 3.2.3 (the full table) yet
+### Why this still isn't the full 3.2.3b table yet
 
-Populating the per-opcode TLCS-900/H cycle table is a separate
-sub-pass with its own risk profile (touching every executor branch).
-3.2.3a stabilizes the contract — every callsite uses the cycle
-total, every result dataclass carries it, the helper handles both
-modes — so 3.2.3b's per-opcode work becomes "change a default value
-in N executor returns" rather than "rewire the whole CLI surface."
+The contract is stable, and the first timing rows are already wired.
+What remains is the long tail: touching the rest of the executor
+branches family by family so fewer instructions fall back to `8`.
 
 ## 4. CLI
 
@@ -469,7 +592,7 @@ step-exec rom.ngc --seed-from /tmp/next_frame.state.json --count 1000
 | 3.2.2b| Executor-side IRQ delivery (push PC/SR + vector + RETI)    | done    |
 | 3.2.3a| Per-instruction `cycles_consumed` plumbing + IRQ delivery  | done    |
 |       | cost (13) ; cycle-total `_advance_frame_state_for_run`     |         |
-| 3.2.3b| Populate per-opcode cycle counts from TLCS-900/H table     | pending |
+| 3.2.3b| Populate per-opcode cycle counts from TLCS-900/H table     | in-progress |
 | 3.3   | HBlank IRQ + raster-position trigger                        | pending |
 
 Phase 3.0 ships the state model in isolation so the JSON contract

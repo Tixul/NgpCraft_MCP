@@ -130,6 +130,12 @@ void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_
     if (writable)
         for (uint8_t i = 0; i < size; ++i) {
             const uint32_t a = (addr + i) & kAddrMask;
+            /* On the ORIGINAL mono NGP there is no 12-bit colour table: 0x8380..0x83DF
+             * is K2GE silicon the cartridge cannot reach. Emulating that console means
+             * its writes there go nowhere, which leaves the BIOS grey ramp standing --
+             * the difference between "a mono game on an NGPC" and "a mono game on an
+             * NGP". Both are real machines; the setting picks one. */
+            if (m.k1ge_console && a >= 0x008380 && a <= 0x0083DF) { m.note_lost_write(a); continue; }
             m.mem[a] = bytes[i];
             /* VRAM-write wait (see Machine::vram_wait): the K2GE throttles CPU access to
              * display RAM DURING THE ACTIVE DRAWING PERIOD only -- in vblank the bus is
@@ -139,8 +145,9 @@ void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_
             if (m.vram_wait && a >= 0x8000 && a <= 0xBFFF && !m.in_vblank())
                 m.access_wait += m.vram_wait;
             m.note_write(a, bytes[i]);      // the write log; disarmed, this is 2 compares
-            /* The RTC's registers are not plain I/O bytes: a write sets the clock. */
-            if (a >= 0x90 && a <= 0x97) m.rtc_write(a, bytes[i]);
+            /* The RTC's registers are not plain I/O bytes: a write sets the clock --
+             * or, at 0x98-0x9A, the alarm it should go off at. */
+            if (a >= 0x90 && a <= 0x9A) m.rtc_write(a, bytes[i]);
         }
 
     /* The SOUND CPU's control registers are memory-mapped, and writing them is an
@@ -155,6 +162,13 @@ void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_
     if (writable)
         for (uint8_t i = 0; i < size; ++i)
             io_action_write(m, (addr + i) & kAddrMask, bytes[i]);
+
+    /* A store the bus threw away, that was NOT a flash command. The program has no
+     * way to find out, so nothing goes wrong visibly -- it just silently does not
+     * happen. Counted only for genuinely unmapped space: cart-window writes are the
+     * flash command latch and were already handled above. */
+    if (!writable && m.hygiene_on && region_of(addr) == Region::Unmapped)
+        m.note_lost_write(addr);
 
     if (rec && rec->n_writes < NGPC_MAX_ACCESS) {
         ngpc_access_t& a = rec->writes[rec->n_writes++];

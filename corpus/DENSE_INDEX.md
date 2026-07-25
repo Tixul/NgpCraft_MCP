@@ -117,6 +117,7 @@ ISR before a flash write · install VBL ISR + `ei 0` or the joypad byte never up
 **Systems**
 - `wiki/05_Systems/Game-Loop.md` — main loop, VBlank sync, watchdog, frame budget, state machines, VBlank-counter roles.
 - `wiki/05_Systems/Input.md` — joypad polling, edge detection, auto-repeat.
+- `wiki/05_Systems/Link-Cable.md` — serial channel 0, 11 BIOS COM vectors, CTS/RTS handshake, cable-detect (`0xB1` bit2), symmetric loop, session handshake (initiator/responder).
 - `wiki/05_Systems/Storage-and-Saves.md` — flash save, RTC, save-struct design, flash pitfalls.
 - `wiki/05_Systems/Collision.md` — AABB/tile collision, typed enable matrix, codegen pitfalls.
 - `wiki/05_Systems/Fixed-Point-Math.md` — fixed-point (8.x), LUTs, binary->BCD, compression.
@@ -132,6 +133,7 @@ ISR before a flash write · install VBL ISR + `ei 0` or the joypad byte never up
 scroll/parallax/HUD freeze -> Tilemaps, Effects-and-Raster · sprite/OAM/metasprite/flip -> Sprites-and-OAM ·
 palette/color/transparent/fade -> Colors-and-Palettes · DMA/MicroDMA/LDIRW -> DMA, VRAM-Queue ·
 save/flash/RTC/checksum -> Storage-and-Saves · joypad/button/edge -> Input ·
+link/cable/serial/COM/multiplayer/2P/SC0/RTS/CTS/cable-detect -> Link-Cable ·
 VBlank/watchdog/frame budget/state machine -> Game-Loop · interrupt/timer/vector -> Hardware-Registers, BIOS ·
 opcode/encoding/ABI/register -> TLCS900-Reference, Assembly · compiler/C89/far pointer/bug -> Build-Toolchain ·
 PSG/Z80/SFX/music -> Audio · collision/AABB/tile -> Collision · fixed-point/LUT/BCD -> Fixed-Point-Math ·

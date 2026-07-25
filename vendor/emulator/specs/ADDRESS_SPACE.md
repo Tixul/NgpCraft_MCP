@@ -11,10 +11,17 @@ Current source references:
 - `../NgpCraft_toolchain/StarGunner_save_lib_test/src/core/ngpc_flash.c`
 
 Current mapped regions:
-- `0x000000..0x0000FF` : internal CPU I/O page
+- `0x000000..0x0000FF` : internal CPU I/O page — **does not power on at `0x00`**;
+  the TMP95C061 on-chip registers have documented reset values
+  (see `specs/MEMORY_READ.md` § 2.2). Notably `0x60`/`0x61` = the A/D result =
+  the **battery** (`specs/ADC.md`), `0x20`/`0x22`-`0x28` = the timers
+  (`specs/TIMERS.md`), `0x6E` = the cartridge flash `/WE` (`specs/FLASH.md`),
+  `0x70`-`0x7A` = the interrupt priority (INTxx) registers.
 - `0x004000..0x006BFF` : user RAM
 - `0x006C00..0x006FB7` : system-reserved RAM
-- `0x006FB8..0x006FFC` : user vector RAM
+- `0x006FB8..0x006FFC` : **user interrupt vector table** — `0x6FB8 + index * 4`,
+  per the SNK SDK. `0x006FCC` (the VBlank hook) is simply slot 5. The BIOS handler
+  runs first and *chains* to the pointer stored here. See `specs/FRAME_TIMING.md`.
 - `0x006FFD..0x006FFF` : system-reserved RAM tail
 - `0x007000..0x007FFF` : shared Z80 RAM
 - `0x008000..0x008FFF` : K2GE/video registers and palette RAM

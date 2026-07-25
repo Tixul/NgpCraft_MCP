@@ -111,6 +111,50 @@ NGPC_API void ngpc_set_battery_ram(ngpc_t* h, const uint8_t* data, uint32_t len)
     m->battery_ram.assign(data, data + (len > kRamSize ? kRamSize : len));
 }
 
+/* ⚡ AND THE OTHER HALF OF THAT COIN CELL: the clock. See ngpc_core.h for why these two
+ * belong together and for what the BIOS was measured doing to each. */
+NGPC_API void ngpc_get_rtc(ngpc_t* h, ngpc_rtc_t* out) {
+    if (!h || !out) return;
+    const Machine* m = reinterpret_cast<const Machine*>(h);
+    out->enable  = m->rtc.enable;
+    out->year    = m->rtc.year;
+    out->month   = m->rtc.month;
+    out->day     = m->rtc.day;
+    out->hour    = m->rtc.hour;
+    out->minute  = m->rtc.minute;
+    out->second  = m->rtc.second;
+    out->weekday = m->rtc.weekday;
+    out->alarm_enable = m->rtc.alarm_enable;
+    out->alarm_day    = m->rtc.alarm_day;
+    out->alarm_hour   = m->rtc.alarm_hour;
+    out->alarm_minute = m->rtc.alarm_minute;
+    out->counter = m->rtc.counter;
+}
+
+NGPC_API void ngpc_set_rtc(ngpc_t* h, const ngpc_rtc_t* in) {
+    if (!h || !in) return;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->rtc.enable  = uint8_t(in->enable & 1u);
+    m->rtc.year    = in->year;
+    m->rtc.month   = in->month;
+    m->rtc.day     = in->day;
+    m->rtc.hour    = in->hour;
+    m->rtc.minute  = in->minute;
+    m->rtc.second  = in->second;
+    m->rtc.weekday = uint8_t(in->weekday & 0x0Fu);
+    m->rtc.alarm_enable = uint8_t(in->alarm_enable & 1u);
+    m->rtc.alarm_day    = in->alarm_day;
+    m->rtc.alarm_hour   = in->alarm_hour;
+    m->rtc.alarm_minute = in->alarm_minute;
+    m->rtc.counter = in->counter;
+}
+
+/* Wind the clock forward over time the console spent switched off. */
+NGPC_API void ngpc_rtc_advance(ngpc_t* h, uint32_t seconds) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->rtc_advance_seconds(seconds);
+}
+
 NGPC_API uint32_t ngpc_get_framebuffer(ngpc_t* h, uint16_t* out, uint32_t max_pixels) {
     if (!h || !out) return 0;
     Machine* m = reinterpret_cast<Machine*>(h);
@@ -193,8 +237,7 @@ NGPC_API void ngpc_reset(ngpc_t* h, int reset_mode) {
      * The hardware reads its reset vector out of the table at 0xFFFF00 (-> 0xFF204A in
      * the retail BIOS). But if the RAM marker says the console has booted before, it
      * goes to VECT_SHUTDOWN instead, so the BIOS can run the cleanup it would normally
-     * do when you swap cartridges. See machine.hpp, and note that ares lands on exactly
-     * the same rule from the other direction. */
+     * do when you swap cartridges. See machine.hpp. */
     if (reset_mode == kResetBiosBoot) {
         const bool been_here_before = m->mem[kBiosRamMarker] != 0;
         const uint32_t slot = been_here_before ? kVectShutdown : kHwResetVector;
@@ -350,11 +393,20 @@ static void advance_raster(ngpc::Machine& m, uint16_t cycles) {
  * vector index, which is the datasheet's own priority order. */
 static const unsigned kIrqSourceIndices[] = {
     ngpc::kIrqVectorIndexInt0,       /* the POWER button: it is what wakes the BIOS */
+    /* The calendar chip's alarm. A source missing from THIS list can never be delivered
+     * however correctly it is raised -- which is exactly why the alarm did nothing for
+     * so long: the vector existed, the BIOS had a handler for it, and nobody looked. */
+    ngpc::kIrqVectorIndexRtcAlarm,
     ngpc::kIrqVectorIndexInt5,       /* the SOUND CPU interrupting the main one */
     ngpc::kIrqVectorIndexVBlank,
     ngpc::kIrqVectorIndexIntT0, ngpc::kIrqVectorIndexIntT0 + 1,
     ngpc::kIrqVectorIndexIntT0 + 2, ngpc::kIrqVectorIndexIntT0 + 3,
     ngpc::kIrqVectorIndexIntAd,
+    /* Serial channel 0 == the link cable. Absent from this list, INTTX0/INTRX0
+     * could be raised correctly and still never reach the BIOS COM handlers -- the
+     * same trap the RTC alarm sat in. Level-gated by INTES0 (0x77); a machine with
+     * the link disabled never raises them, so this is inert until a cable is set up. */
+    ngpc::kIrqVectorSerialReceive, ngpc::kIrqVectorSerialTransmit,
     /* Micro-DMA transfer-end (INTTC0..3): a channel raises these when its DMAC hits 0,
      * and a game re-arms the channel (and, for Ogre Battle, resets the scroll split) from
      * the completion ISR. micro_dma_service never matches a channel on THESE vectors, so
@@ -396,10 +448,8 @@ static bool deliver_irq(ngpc::Machine& m) {
      * vector 0x10 with a destination of 0x8032. The level gates delivery TO THE CPU; the
      * DMA controller is a DIFFERENT CONSUMER and is not behind that gate.
      *
-     * The evidence is the GAME's own configuration, not an emulator's: if level 0 killed
-     * the DMA too, Puyo Pop's split could never have worked on the silicon it shipped on.
-     * (NeoPop's `TestIntHDMA` checks the DMA vectors first and tests no level anywhere --
-     * it agrees, but it is the corroboration, not the reason.)
+     * The evidence is the GAME's own configuration: if level 0 killed the DMA too, Puyo
+     * Pop's split could never have worked on the silicon it shipped on.
      *
      * Delivering such a request to the CPU instead sends it into a BIOS stub that jumps
      * through a user hook nobody installed, lands at address 0, hits the `swi 7` there,
@@ -442,6 +492,10 @@ static bool deliver_irq(ngpc::Machine& m) {
     c.iff_level = uint8_t(best_level + 1 > 7 ? 7 : best_level + 1);
     c.pc = m.read32(kIrqVectorTableBase + 4u * best_index);
     m.irq_pending &= ~(uint64_t(1) << best_index);
+    /* Log the delivery with its raster position. An interrupt is half of every raster
+     * effect -- seeing the register writes without the IRQ that triggered them shows
+     * the symptom and hides the cause. `addr` carries the vector index. */
+    if (m.elog_lo <= m.elog_hi) m.note_event(ngpc::Machine::kEventIrq, best_index, 0, c.pc);
     return true;
 }
 
@@ -492,8 +546,11 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         ngpc_record_t* rec = want_record ? &out_records[s.emitted] : &scratch;
 
         const uint32_t pc_before = m->cpu.pc;
+        if (m->coverage_on) m->note_exec(pc_before);
+        const uint32_t sp_before = m->callstack_on ? m->cpu.regs[7] : 0u;
         m->fetch_window = pc_before;   // fetch bytes read in read8() get the cheap cart cost
         const uint8_t st = ngpc::step(*m, rec);
+        if (m->callstack_on) m->note_control_flow(pc_before, sp_before);
 
         if (st == NGPC_HALTED) {
             /* HALT is not a dead stop on real hardware: the CPU parks, the video
@@ -535,6 +592,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 m->adc_tick(kCyclesPerScanline);
                 m->rtc_step(kCyclesPerScanline);
                 m->timer_tick(kCyclesPerScanline);
+                m->serial_tick(kCyclesPerScanline);
                 z80_tick(*m, kCyclesPerScanline);
                 m->apu.tick(kCyclesPerScanline);
                 s.total_cycles += kCyclesPerScanline;
@@ -585,6 +643,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         m->adc_tick(rec->cycles);
         m->rtc_step(rec->cycles);
         m->timer_tick(rec->cycles);
+        m->serial_tick(rec->cycles);
         z80_tick(*m, rec->cycles);
         m->apu.tick(rec->cycles);
 
@@ -603,6 +662,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
             m->adc_tick(kIrqDeliveryCycles);
             m->rtc_step(kIrqDeliveryCycles);
             m->timer_tick(kIrqDeliveryCycles);
+            m->serial_tick(kIrqDeliveryCycles);
             z80_tick(*m, kIrqDeliveryCycles);
             m->apu.tick(kIrqDeliveryCycles);
         }
@@ -695,6 +755,166 @@ NGPC_API uint64_t ngpc_write_log_count(ngpc_t* h) {
     return reinterpret_cast<Machine*>(h)->wlog_count;
 }
 
+NGPC_API void ngpc_set_coverage(ngpc_t* h, int enabled) {
+    if (!h) return;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->coverage_on = (enabled != 0);
+    m->coverage_hits = 0;
+    if (enabled) {
+        m->coverage.assign(Machine::kCovSpan / 8, 0);
+    } else {
+        m->coverage.clear();
+        m->coverage.shrink_to_fit();
+    }
+}
+
+NGPC_API uint32_t ngpc_coverage_hits(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->coverage_hits;
+}
+
+NGPC_API uint32_t ngpc_get_coverage(ngpc_t* h, uint8_t* out, uint32_t n) {
+    if (!h) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    const uint32_t have = uint32_t(m->coverage.size());
+    if (!out || n == 0) return have;             /* size query */
+    const uint32_t want = have < n ? have : n;
+    for (uint32_t i = 0; i < want; ++i) out[i] = m->coverage[i];
+    return want;
+}
+
+NGPC_API void ngpc_set_hygiene(ngpc_t* h, int enabled) {
+    if (!h) return;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->hygiene_on = (enabled != 0);
+    m->hygiene_reset();
+}
+
+NGPC_API uint64_t ngpc_uninit_reads(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->uninit_reads;
+}
+
+NGPC_API uint64_t ngpc_lost_writes(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->lost_writes;
+}
+
+static uint32_t copy_hygiene(const Machine::HygieneRec* src, uint32_t have,
+                             ngpc_hygiene_t* out, uint32_t n) {
+    const uint32_t want = have < n ? have : n;
+    for (uint32_t i = 0; i < want; ++i) {
+        out[i].pc = src[i].pc;
+        out[i].addr = src[i].addr;
+    }
+    return want;
+}
+
+NGPC_API uint32_t ngpc_get_uninit_reads(ngpc_t* h, ngpc_hygiene_t* out, uint32_t n) {
+    if (!h || !out || n == 0) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    return copy_hygiene(m->hyg_uninit, m->hyg_uninit_n, out, n);
+}
+
+NGPC_API uint32_t ngpc_get_lost_writes(ngpc_t* h, ngpc_hygiene_t* out, uint32_t n) {
+    if (!h || !out || n == 0) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    return copy_hygiene(m->hyg_lost, m->hyg_lost_n, out, n);
+}
+
+NGPC_API void ngpc_set_event_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
+    if (!h) return;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->elog_lo = lo;
+    m->elog_hi = hi;
+    m->elog_count = 0;
+}
+
+NGPC_API uint64_t ngpc_event_log_count(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->elog_count;
+}
+
+NGPC_API uint32_t ngpc_get_event_log(ngpc_t* h, ngpc_event_t* out, uint32_t n) {
+    if (!h || !out || n == 0) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    const uint64_t total = m->elog_count;
+    const uint64_t held = total < Machine::kElogSize ? total : Machine::kElogSize;
+    const uint32_t want = uint32_t(held < n ? held : n);
+    const uint64_t first = total - want;
+    for (uint32_t i = 0; i < want; ++i) {
+        const Machine::EventRec& e = m->elog[(first + i) % Machine::kElogSize];
+        out[i].pc = e.pc;
+        out[i].addr = e.addr;
+        out[i].scanline = e.scanline;
+        out[i].cycle = e.cycle;
+        out[i].value = e.value;
+        out[i].type = e.type;
+    }
+    return want;
+}
+
+NGPC_API void ngpc_set_callstack(ngpc_t* h, int enabled) {
+    if (!h) return;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->callstack_on = (enabled != 0);
+    if (!enabled) { m->call_depth = 0; m->call_overflow = 0; }
+}
+
+NGPC_API uint32_t ngpc_callstack_depth(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->call_depth;
+}
+
+NGPC_API uint64_t ngpc_callstack_overflow(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->call_overflow;
+}
+
+NGPC_API uint32_t ngpc_get_callstack(ngpc_t* h, ngpc_frame_t* out, uint32_t n) {
+    if (!h || !out || n == 0) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    const uint32_t want = m->call_depth < n ? m->call_depth : n;
+    for (uint32_t i = 0; i < want; ++i) {
+        const Machine::Frame& f = m->callstack[i];
+        out[i].caller_pc = f.caller_pc;
+        out[i].entry_pc = f.entry_pc;
+        out[i].return_pc = f.return_pc;
+        out[i].entry_sp = f.entry_sp;
+    }
+    return want;
+}
+
+NGPC_API void ngpc_set_read_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
+    if (!h) return;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->rlog_lo = lo;
+    m->rlog_hi = hi;
+    m->rlog_count = 0;
+}
+
+NGPC_API uint64_t ngpc_read_log_count(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->rlog_count;
+}
+
+NGPC_API uint32_t ngpc_get_read_log(ngpc_t* h, ngpc_read_t* out, uint32_t n) {
+    if (!h || !out || n == 0) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    const uint64_t total = m->rlog_count;
+    const uint64_t held = total < Machine::kRlogSize ? total : Machine::kRlogSize;
+    const uint32_t want = uint32_t(held < n ? held : n);
+    /* The most recent `want`, oldest first. */
+    const uint64_t first = total - want;
+    for (uint32_t i = 0; i < want; ++i) {
+        const Machine::ReadRec& r = m->rlog[(first + i) % Machine::kRlogSize];
+        out[i].pc = r.pc;
+        out[i].addr = r.addr;
+        out[i].value = r.value;
+    }
+    return want;
+}
+
 NGPC_API uint32_t ngpc_get_write_log(ngpc_t* h, ngpc_write_t* out, uint32_t n) {
     if (!h || !out || n == 0) return 0;
     Machine* m = reinterpret_cast<Machine*>(h);
@@ -743,6 +963,11 @@ NGPC_API void ngpc_set_cart_data_wait(ngpc_t* h, uint32_t cycles_per_byte) {
     reinterpret_cast<Machine*>(h)->cart_data_wait = cycles_per_byte;
 }
 
+NGPC_API void ngpc_set_k1ge_console(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->k1ge_console = (on != 0);
+}
+
 NGPC_API void ngpc_set_vram_wait(ngpc_t* h, uint32_t cycles_per_byte) {
     if (!h) return;
     reinterpret_cast<Machine*>(h)->vram_wait = cycles_per_byte;
@@ -767,10 +992,120 @@ NGPC_API void ngpc_raise_irq(ngpc_t* h, uint32_t vector_index) {
     reinterpret_cast<Machine*>(h)->irq_pending |= (1u << vector_index);
 }
 
+/* --- link cable (serial channel 0) ----------------------------------------
+ * The cable is a byte pipe. A host wires two machines together by draining each
+ * one's transmit FIFO (ngpc_serial_read_tx) and pushing it into the other's
+ * receive FIFO (ngpc_serial_write_rx) -- in-process for two players on one PC,
+ * or across a socket for online. Enable is off by default: the serial registers
+ * stay inert and the cable reads as unplugged, unchanged from before. */
+NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
+    if (!h) return;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    m.serial_link_enabled = (on != 0);
+    /* Counters are per-cable-session: plugging in starts a fresh reading, so the
+     * debugger's totals answer "since this link came up", not "since power-on". */
+    m.serial_tx_count = m.serial_wire_count = 0;
+    m.serial_rx_queued_count = m.serial_rx_read_count = 0;
+    m.serial_irq_tx_count = m.serial_irq_rx_count = 0;
+    m.serial_cts_hold_ticks = m.serial_rts_hold_ticks = 0;
+    if (!on) {
+        m.serial_tx.clear();
+        m.serial_rx.clear();
+        m.serial_tx_busy = false;
+        m.serial_rx_pending = false;
+        m.serial_tx_cycles = 0;
+        m.serial_rx_cycles = 0;
+    }
+}
+
+/* Drain up to `max` bytes this machine has transmitted; returns the count. */
+NGPC_API uint32_t ngpc_serial_read_tx(ngpc_t* h, uint8_t* out, uint32_t max) {
+    if (!h || !out) return 0;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    uint32_t n = 0;
+    while (n < max && !m.serial_tx.empty()) {
+        out[n++] = m.serial_tx.front();
+        m.serial_tx.pop_front();
+    }
+    return n;
+}
+
+/* Queue `n` bytes for this machine to receive from the peer. */
+NGPC_API void ngpc_serial_write_rx(ngpc_t* h, const uint8_t* data, uint32_t n) {
+    if (!h || !data) return;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    for (uint32_t i = 0; i < n; ++i) m.serial_rx.push_back(data[i]);
+    m.serial_rx_queued_count += n;
+}
+
+/* 1 = this machine's RTS is low (ready to receive), 0 = holding the peer off.
+ * A host may consult this to honour flow control before pushing bytes. */
+NGPC_API int ngpc_serial_rts(ngpc_t* h) {
+    if (!h) return 0;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    return (m.mem[0x0000B2] & 0x01) == 0 ? 1 : 0;
+}
+
+/* Drive this machine's CTS0 handshake input (wired to the PEER's RTS on the cable).
+ * high != 0 -> CTS0 HIGH -> if SC0MOD<CTSE> is set, this machine's transmitter is
+ * halted (byte held, no INTTX0) until the peer drops RTS. A host bridging two
+ * machines calls this each pump with the peer's RTS state. See Machine::serial_tick. */
+NGPC_API void ngpc_serial_set_cts(ngpc_t* h, int high) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->serial_cts_high = (high != 0);
+}
+
+/* Read-only snapshot of the whole channel for the debugger's Link tab. Every
+ * field is either a counter incremented where the event happens or a register
+ * read straight out of the I/O page -- no state is touched, so watching costs
+ * nothing and changes nothing. See ngpc_serial_state_t for what each means. */
+NGPC_API void ngpc_serial_state(ngpc_t* h, ngpc_serial_state_t* out) {
+    if (!h || !out) return;
+    const Machine& m = *reinterpret_cast<const Machine*>(h);
+    out->enabled         = m.serial_link_enabled ? 1u : 0u;
+    out->tx_depth        = uint32_t(m.serial_tx.size());
+    out->rx_depth        = uint32_t(m.serial_rx.size());
+    out->tx_busy         = m.serial_tx_busy ? 1u : 0u;
+    out->rx_pending      = m.serial_rx_pending ? 1u : 0u;
+    out->cts_high        = m.serial_cts_high ? 1u : 0u;
+    out->rts_low         = (m.mem[0x0000B2] & 0x01) == 0 ? 1u : 0u;
+    out->ctse            = (m.mem[0x000052] & 0x40) != 0 ? 1u : 0u;
+    out->tx_count        = m.serial_tx_count;
+    out->wire_count      = m.serial_wire_count;
+    out->rx_queued_count = m.serial_rx_queued_count;
+    out->rx_read_count   = m.serial_rx_read_count;
+    out->irq_tx_count    = m.serial_irq_tx_count;
+    out->irq_rx_count    = m.serial_irq_rx_count;
+    out->cts_hold_ticks  = m.serial_cts_hold_ticks;
+    out->rts_hold_ticks  = m.serial_rts_hold_ticks;
+    out->sc0buf          = m.mem[0x000050];
+    out->sc0cr           = m.mem[0x000051];
+    out->sc0mod          = m.mem[0x000052];
+    out->br0cr           = m.mem[0x000053];
+    /* 0xB1 as the GAME sees it: read8 clears bit2 while the link is enabled --
+     * that bit IS the cable-detect the 2-player menus poll, so showing the raw
+     * memory byte here would say "no cable" on a working cable. */
+    out->port_b1         = m.serial_link_enabled ? uint32_t(m.mem[0x0000B1] & ~0x04)
+                                                 : uint32_t(m.mem[0x0000B1]);
+    out->port_b2         = m.mem[0x0000B2];
+}
+
 NGPC_API void ngpc_set_apu_channel_mask(ngpc_t* h, uint32_t mask) {
     if (!h) return;
     // bit0..2 = squares, bit3 = noise, bit4 = DAC. Debug mute/solo only.
     reinterpret_cast<Machine*>(h)->apu.channel_mask = uint8_t(mask & 0x1F);
+}
+
+NGPC_API void ngpc_set_layer_mask(ngpc_t* h, uint32_t mask) {
+    if (!h) return;
+    // bit0 = SCR1, bit1 = SCR2, bit2..4 = sprites by PR.C. Debug show/hide only:
+    // it drops a layer from the composite and touches nothing else. See machine.hpp.
+    reinterpret_cast<Machine*>(h)->layer_mask = uint8_t(mask & Machine::kLayerAll);
+}
+
+NGPC_API uint32_t ngpc_get_layer_mask(ngpc_t* h) {
+    if (!h) return Machine::kLayerAll;
+    return reinterpret_cast<Machine*>(h)->layer_mask;
 }
 
 NGPC_API void ngpc_get_apu_state(ngpc_t* h, ngpc_apu_state_t* out) {

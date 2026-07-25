@@ -133,7 +133,8 @@ The engine writes one UTF-8 JSON request:
   "runtime": {
     "start_mode": "bootstrap" | "savestate",
     "seed_from_savestate": "C:/.../state.json",
-    "seed_registers": {"XIZ": 0},
+    "seed_presets": ["bios-handoff-minimal"],
+    "seed_registers": {"XIZ": 0, "DMAC0": 4660},
     "seed_xsp": 27648,
     "target_pc": 2150400,
     "max_steps": 1000
@@ -158,6 +159,17 @@ The engine writes one UTF-8 JSON request:
 Rules:
 - `format` and `format_version` are required
 - `action`, `project`, `build`, `runtime`, and `artifacts` are required
+- `runtime.seed_presets`, when present, must be a list of known preset names
+  applied before explicit `runtime.seed_registers` / `runtime.seed_xsp`
+- `runtime.seed_registers`, when present, may name:
+  - architectural 32-bit registers `XWA/XBC/XDE/XHL/XIX/XIY/XIZ/XSP`
+  - modeled TLCS-900/H control registers `DMAS0..3`, `DMAD0..3`, `DMAC0..3`, `DMAM0..3`, `INTNEST`
+- the currently supported `runtime.seed_presets` entry is:
+  - `bios-handoff-minimal` -> `XSP = 0x00006C00`, `INTNEST = 0`
+- precedence rule:
+  - preset defaults apply first
+  - explicit `runtime.seed_registers` overrides matching preset entries
+  - explicit `runtime.seed_xsp` overrides the preset-provided `XSP`
 - `ui` is optional and only advisory
 - unknown optional fields MUST be ignored, not rejected
 
@@ -422,8 +434,8 @@ Purpose:
 Expected behavior:
 - builds the current event-log capture via the same path as
   `capture-eventlog` / `smoke-run` (uses `runtime.start_pc`,
-  `runtime.target_pc`, `runtime.max_steps`, `runtime.seed_registers`,
-  `runtime.seed_xsp`, `runtime.start_mode`)
+  `runtime.target_pc`, `runtime.max_steps`, `runtime.seed_presets`,
+  `runtime.seed_registers`, `runtime.seed_xsp`, `runtime.start_mode`)
 - enumerates event-log goldens under
   `<rom-dir>/.ngpc_emu/goldens/`
 - diffs the single captured payload against every stored golden
@@ -552,8 +564,8 @@ Expected behavior:
 - captures one current event log via the same builder as
   `capture-eventlog` / `smoke-run` /
   `check-eventlog-golden-all` (uses `runtime.start_pc`,
-  `runtime.target_pc`, `runtime.max_steps`, `runtime.seed_registers`,
-  `runtime.seed_xsp`, `runtime.start_mode`)
+  `runtime.target_pc`, `runtime.max_steps`, `runtime.seed_presets`,
+  `runtime.seed_registers`, `runtime.seed_xsp`, `runtime.start_mode`)
 - writes the captured event-log JSON under
   `<rom-dir>/.ngpc_emu/goldens/<rom>.<slug>.eventlog.json`
 - the saved golden is the same payload `check-eventlog-golden-all`
@@ -568,7 +580,8 @@ Optional fields:
   the saved event-log payload, plays the same role as `golden_label`
   does for frame goldens)
 - all standard capture-config fields (`runtime.start_pc`,
-  `runtime.target_pc`, `runtime.max_steps`, etc.)
+  `runtime.target_pc`, `runtime.max_steps`, `runtime.seed_presets`,
+  etc.)
 
 Result block (`result.eventlog_golden_save`):
 
@@ -741,10 +754,9 @@ Current engine state:
   - `run/emulator_path`
   - `run/rom_path`
 - `validation_runner.py` tries to locate one external emulator through:
-  - `NGPNG_SMOKE_EMULATOR`
-  - `mednafen`
-  - `race`
-  - `neopop`
+  - the `NGPNG_SMOKE_EMULATOR` environment variable
+  - failing that, a hard-coded list of well-known emulator binary names
+    probed on `PATH`
 
 v1 transition rule:
 

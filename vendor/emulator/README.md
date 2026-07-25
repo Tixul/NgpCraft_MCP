@@ -1,630 +1,610 @@
+
 # NgpCraft Emulator
 
-Emulateur + debugger NGPC moderne pour l'ecosysteme NgpCraft.
+A **Neo Geo Pocket / Neo Geo Pocket Color** emulator: a fast native C++ core
+(TLCS-900H + Z80 + K2GE video) driven by a PyQt6 desktop shell.
 
-Objectif produit:
-- un seul installateur
-- zero PATH a regler
-- creation -> compilation -> execution -> debug dans le meme outil
-- mode standalone, mode integre a `NgpCraft_engine`, et mode headless pour CI
+Its timing is **calibrated against real hardware** — instruction-fetch wait-states on
+the cartridge flash, silicon-measured MUL/DIV and LDIR costs — so self-timed games
+(Cool Boarders Pocket, Densha de Go) run at their true 30 fps instead of the ~2× too
+fast that most emulators show.
 
-Contrainte produit non negociable:
-- toute fonctionnalite majeure doit exister en version standalone
-- le meme coeur doit aussi etre integrable proprement dans `NgpCraft_engine`
-- l'integration engine ne doit pas creer un fork fonctionnel du standalone
+Instruction coverage is checked the same way: a sweep of a 90-cartridge corpus, each
+driven for 400 frames, currently finds **no ROM stopped by a missing opcode**. That sweep
+is a feature you can run yourself — see [ROM analysis](#rom-analysis).
 
-Le projet vise deux usages en meme temps:
-- remplacer le "lanceur d'emulateur externe" actuel de `NgpCraft_engine`
-- fournir un vrai debugger symbol-aware, utile pour le moteur, la toolchain et le hardware bring-up
+<img width="1076" height="761" alt="emulateur01" src="https://github.com/user-attachments/assets/24dd060d-5b35-4ef6-83dd-916a618ba244" />
 
-Formes de livraison attendues:
-- application standalone utilisable seule
-- coeur embarquable dans `NgpCraft_engine`
-- mode headless/CLI pour automatisation, CI et tests
+## Features
 
-Exigence de qualite:
-- pas de "feature vitrine" a moitie cablee
-- une feature marquee comme supportee doit etre reellement exploitable sur NGPC
-- le projet vise un niveau de finition superieur aux integrations NGPC generiques des suites multi-systemes
-- les opcodes casses, comportements non documentes et bugs silicium connus doivent etre reproduits si le hardware reel les manifeste
-- quand le hardware reel plante, l'emulateur doit planter aussi, mais avec un retour de diagnostic utile
-- si un jeu tombe a 20 fps sur hardware, le mode de reference doit reproduire ce slowdown au lieu de le lisser artificiellement
-- les saves in-game persistantes doivent etre gerees serieusement, pas juste les save states
+- **Library** with cover thumbnails (grid / list / compact), live-reflowing — plus
+  **search**, **sort** (name, last played, most played, playtime, recently added, size,
+  with a direction toggle), **favourites** ★ and a **never-played** filter. Play count,
+  playtime and last-played are tracked per game. Covers are rendered from the game itself,
+  or [pick your own](#your-own-cover-art) — one that updates never overwrite.
+- **Console boot** — with a real BIOS, *Boot BIOS* powers the console on for real: the
+  Neo Geo Pocket intro plays and the game then boots on its own, exactly like hardware.
+- **Video**: integer / fit / stretch scaling, scanline / LCD-grid / CRT filters,
+  colour profiles, real fullscreen — which **hides the sidebar and toolbar** for the game
+  alone (optional); **double-click or `Esc`** returns to windowed. The canvas follows the
+  window; size presets `Ctrl+1…5`.
+- **Black-and-white cartridges, in colour** — an NGP game on an NGPC is *colourised*, the way
+  a Game Boy game is on a Game Boy Color. Both machines are selectable — see
+  [Monochrome cartridges](#monochrome-cartridges-on-a-colour-console).
+- **Save states** — 8 slots per game (toolbar or `F2` save / `F4` load / `F3` slot).
+- **In-game saves** — the game's own flash save, stored in the ROM, a separate file, or both.
+- **A console that remembers** — the coin cell keeps its BIOS settings *and* its clock, so
+  the date is still right next time. The **RTC alarm** works too, and goes off on time.
+- **Speed control** — fast-forward (hold `Tab`) and 0.25×…4× (`[` / `]` or the toolbar).
+- **Rewind** — hold `,` (or the ⏪ toolbar button) to run the game backward; release to
+  resume. `.` steps one frame forward. Buffer length configurable (Off / 10 / 20 / 30 s).
+- **Screenshots** (`F12`, folder configurable), **FPS overlay**, and a **player toolbar**
+  that can auto-hide when the mouse goes still and reappear on the next move (optional).
+- **Controller support (beta, not yet hardware-tested)** — cross-platform game pads via
+  SDL2 (Xbox, PlayStation, Nintendo and generic pads on Windows / macOS / Linux),
+  one per player, alongside the keyboard, plus **turbo / autofire** on A and B at 5–20
+  presses per second. ⚠️ *The button mapping has not been validated on a real controller
+  yet — see [Known issues](#known-issues).*
+- **Two players & link cable** — the NGPC link cable is emulated end to end: play two
+  consoles **on one PC** (a second window), over your **LAN**, or **online** (a built-in
+  lobby, or share a direct address). Each player has their own controls. See
+  [Two players & link](#two-players--link-cable).
+- **Fully remappable** — console buttons *and* every in-game hotkey, with a warning when
+  a binding would collide. The console buttons are bound **on a picture of the console**:
+  each field sits next to the button it drives, so you pick the D-pad's *left* rather than
+  a row labelled "Left".
+- **Themes** — follows your desktop's light/dark setting by default, or pick Light or Dark
+  explicitly. Switches live, no restart.
+- **Debug tools** (`F1`) — a real debugger: symbols, instruction stepping, call stack,
+  raster event timeline, read *and* write watchpoints, an editable hex view with access
+  highlighting, RAM search, **show/hide any video layer** on the live picture, a tile
+  viewer that **names every tile's address on hover** (click to copy), a **Load** tab with
+  live green→red gauges for the **sprite (OAM)** and **character-RAM tile** budgets read
+  straight from VRAM, and audio analysis with **VGM export**. See [Debugging](#debugging-f1).
+- **Fan-translation tools** — everything works on **any ROM**, driven by a character
+  table you load (`.tbl`); nothing is game-specific. Four tabs:
+  - **Text** — decode a region into strings, **search** for a phrase by its exact bytes,
+    **scan** a whole region for every string (a script dump you can export to a file), and
+    a **relative search** that finds a word under an *unknown* encoding by its letter
+    spacing (no table needed).
+  - **Crack** — type words you can read on screen and it **builds the table for you**:
+    each word is located by relative search (or pinned with `word @ offset`), and the bytes
+    under it become a `.tbl` you can save or use straight away.
+  - **Pointers** — **find every pointer to an address** (to repoint a moved string) or
+    **locate the pointer tables** themselves. 16/24/32-bit LE, with a base for bank offsets.
+  - **Compare** — byte-**diff against a second ROM**: an existing patch's changed ranges
+    *are* the text, shown decoded on both sides.
 
-Principe d'architecture:
-- `ngpc_emu_core` : coeur natif, deterministe, sans UI
-- `ngpc_emu_frontend` : UI debugger / player
-- `ngpc_emu_headless` : mode batch, trace, capture, regression
-- `ngpc_emu_bridge` : raccord avec `NgpCraft_engine`
-- le sous-systeme audio devra rester assez propre et modulaire pour etre reintegre hors de l'emulateur, notamment comme futur remplacement du core NeoPop encore utilise par l'outil son
+  Every result shows its ROM file offset (`address − 0x200000`).
+- **ROM analysis** — right-click a game to boot it, drive it, and report what is wrong
+  with it. See [ROM analysis](#rom-analysis).
+- **Crash reports** — a ROM fault writes a detailed `crashes/*.txt` (reason, PC, opcode,
+  registers, memory & stack dumps).
+- **Translated interface** — English and French, switchable live, no restart. One JSON
+  file per language in [`lang/`](lang), so adding one is adding a file and needs no
+  code: see [TRANSLATING.md](TRANSLATING.md). Contributions welcome.
 
-## Jalon : le modèle matériel repose désormais sur les docs constructeur (2026-07-10)
+<img width="1073" height="768" alt="emulateur02" src="https://github.com/user-attachments/assets/051d5d43-dc43-4001-8964-7e8b757b057d" />
 
-Passes 180-186. **1314 tests verts.** Le sous-système périphérique/BIOS est passé
-d'un modèle bâti sur des inférences à un modèle où **chaque constante est citée
-d'un document Toshiba ou SNK** (voir `DOC_SOURCES_INDEX.md` § 0).
 
-**Livré :**
-- **BIOS `swi 1` (SYSTEM_CALL)** — dispatch sur RW3, tous les vecteurs
-  déterministes (SHUTDOWN, CLOCKGEARSET, INTLVSET, RTCGET, FLASHWRITE,
-  SYSFONTSET, SYS_SUCCESS, comms sans peer). → `specs/BIOS_HLE.md`
-- **Sauvegardes flash** — les **deux** chemins : BIOS-médié *et* direct (séquence
-  AMD + `/WE`, celui qu'utilise la lib maison du projet). Non-volatile.
-  → `specs/FLASH.md`
-- **SYSFONTSET** — la **vraie font SNK**, lue dans le BIOS attaché. Rien
-  d'embarqué : zéro souci de licence *et* pixel-exact.
-- **Contrôleur d'interruptions multi-source** — table de vecteurs HW
-  (`0xFFFF00`) → handler BIOS, puis chaînage vers le hook RAM (`0x6FB8 + i*4`).
-  → `specs/FRAME_TIMING.md`
-- **A/D converter (la jauge batterie)** et **timers 8 bits 0..3**.
-  → `specs/ADC.md`, `specs/TIMERS.md`
+## Run
 
-**Trois erreurs de fidélité corrigées** par la lecture des docs — dont deux vrais
-bugs : la règle de masque IRQ était *off-by-one* (`L > IFF` au lieu de
-`L >= IFF`), le masque post-acceptation était faux (`IFF = L` au lieu de
-`min(L+1, 7)`), et la page I/O comme les registres K2GE ne resettent **pas** à
-zéro. Détail et rétractation : `HARDWARE_COMPAT_POLICY.md`.
+Requires **Python 3.10+**.
 
-**Non-régression de fidélité** vérifiée contre l'oracle (`oracle_tools/cosim_diff.py`) :
-Big Bang / Cotton / Crush Roller = **0 divergence sur 3 000 pas**.
+```bash
+pip install -r requirements.txt
+python ngpc_shell.py
+```
 
-**Vitesse** : deux optimisations *behaviour-neutral* (cache de la fetch view,
-mémoïsation de `probe()`) → **1 123 → 1 706 instr/s (×1,5)**. Le coût restant est
-structurel et documenté comme cahier des charges du futur **cœur C++** :
-`PERF_TIMING_POLICY.md` § 10.
+On Windows a prebuilt core (`cpp/build/ngpc_core.dll`) is included, so it runs as-is.
 
-## Jalon : première image de cartouche (2026-07-08)
+### Prebuilt download (no Python needed)
 
-`Engine_test_project/menu_test_project` s'exécute désormais de bout en bout (init
-complète -> boucle principale, 5 000 000+ instructions sans honest-stop) et **rend son
-écran de menu** : le splash "NGPC" (rouge) + "craft" (jaune) sur fond noir (SCR1 tilemap
-+ glyphes CHAR + palette). C'est la **première frame de cartouche** produite par
-l'émulateur, et elle est obtenue **100 % en fidélité hardware** : chaque déblocage a été
-tranché sur la vraie NGPC de Wilfried (ROMs de test flashées) ou contre la source
-ground-truth ngdis, honest-stop conservé pour l'état réellement indisponible.
+Grab the build for your platform from the [Releases](../../releases) page and run it —
+nothing to install. ROMs, saves and screenshots live in folders next to the app.
 
-Le déclencheur principal a été le **modèle open-bus** : `hw_test_openbus` (flashé sur
-vrai HW) a prouvé que le TLCS-900/H n'a pas de bus-fault -> une lecture d'adresse
-non-mappée renvoie `0x0000`, une écriture est ignorée, sans hang. L'émulateur modélise
-maintenant ce comportement mesuré au lieu de honest-stopper, ce qui laisse le runtime de
-la cartouche franchir un déréférencement de pointeur vers l'espace non-mappé et
-continuer jusqu'au rendu. Cf. DEVLOG pass 168 pour la chaîne complète (open-bus,
-`mul/div/muls/divs, imm16`, `pushw (r32+d16)`, `inc/dec byte (r32+d8)`).
+**Windows, Linux and macOS are built from this same source** by GitHub Actions
+([`.github/workflows/build.yml`](.github/workflows/build.yml)): each tagged release runs the
+test suite on all three and packages one archive per platform. PyInstaller cannot
+cross-compile, so every build is made on its own machine — which is the whole reason that
+workflow exists.
 
-NB perf : le core CPython est un **prototype/oracle de référence** (fidélité HW =
-la moat du projet), pas le moteur temps réel. ~1000 instr/s aujourd'hui (interprétation
-pure + état immuable copié par instruction) vs ~1 M instr/s nécessaires pour du 60 fps
--> le cœur natif visé (`ngpc_emu_core`, état mutable) fera le temps réel ; le Python
-reste l'oracle qui valide le comportement opcode par opcode.
+> The macOS app is **not code-signed**, so Gatekeeper warns the first time: right-click ▸
+> **Open** to run it anyway.
 
-Choix technique actuel:
-- le vrai coeur final est vise en `C++`
-- le bootstrap, les specs executablees, les outils et certains prototypes peuvent vivre en `Python`
-- le prototype Python actuel n'est pas le coeur final, il prepare le terrain pour le coeur `C++`
+To build it yourself on the platform you are on:
 
-Etat actuel (2026-07-02, **1116 tests verts, 0 skipped**) :
+```bat
+pip install pyinstaller
+build_exe.bat                        :: Windows
+```
 
-- derniers decode/execute follow-ups :
-  - `push/pop r` executes maintenant pour les formes safe du
-    sous-ensemble prefixed register, y compris le byte family `C8..CF`
-    et les formes long `D8..DF` / `E8..EF` qui passent deja le filtre
-    quirk
-  - `push/pop` executes maintenant aussi pour les byte-slices `C7`,
-    avec lecture/ecriture sur la stack writable en largeur 1 byte
-  - `cycles_consumed` utilise maintenant aussi les valeurs Toshiba pour
-    `push/pop r` prefixed et pour `C7 <reg> 04/05`
-  - `cpl` / `neg` executes maintenant pour les formes prefixed byte
-    safe et pour les mirroirs `C7` current-bank byte-slice
-  - `daa` executes maintenant pour les formes prefixed byte safe et
-    pour le miroir `C7` current-bank byte-slice, avec blocage honnete
-    si les flags d'entree `C/H/N` ne sont pas connus
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `DAA r`
-    (`4` cycles) pour les formes prefixed byte et pour `C7 <reg> 10`
-  - `paa` executes maintenant pour les formes prefixed `word/long`
-    definies (`D8..DF` / `E8..EF : 14`), avec stop honnete
-    `silicon-undefined` sur les formes byte non definies
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `PAA r`
-    (`4` cycles) pour les formes `word/long` executees
-  - `djnz` executes maintenant pour le sous-ensemble prefixed byte safe
-    (`C8..CF : 1C : d8`), avec split branche prise / non prise
-  - les formes prefixed long `djnz` non definies stoppent maintenant
-    honnetement en `silicon-undefined`
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `DJNZ`
-    (`6` si branche prise, `4` sinon) pour ce sous-ensemble execute
-  - `mirr` decode/execute maintenant comme cas special `D8..DF : 16`
-    sur registres 16-bit (`WA..SP`), avec reversal des 16 bits et
-    drapeaux inchanges
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `MIRR r`
-    (`3` cycles) pour ce cas special word-only
-  - `bs1f` / `bs1b` decode/execute maintenant comme cas speciaux
-    `D8..DF : 0E/0F` sur source 16-bit et destination fixe `A`
-  - si la source vaut zero, `bs1f/bs1b` stoppent honnetement en
-    `silicon-undefined` car la doc locale rend `A` indefini
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba
-    `BS1F/BS1B` (`2` cycles)
-  - `mula` decode/execute maintenant comme cas special `D8..DF : 19`
-    sur destination 32-bit (`XWA..XSP`), avec lecture signee 16-bit
-    depuis `(XDE)` et `(XHL)` puis decrement de `XHL`
-  - le cas de recouvrement `mula XHL` suit l'ordre documente:
-    somme ecrite dans `XHL`, puis `XHL -= 2`
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba
-    `MULA rr` (`19` cycles)
-  - `minc1/2/4` et `mdec1/2/4` decode/execute maintenant comme cas
-    speciaux word-only `D8..DF : 38/39/3A/3C/3D/3E`
-  - l'immediat desassemble reste la valeur encodee `# - step`, puis
-    l'execution reconstruit la vraie fenetre modulo `#` et la valide
-    comme puissance de deux documentee avant d'agir
-  - `cycles_consumed` utilise maintenant aussi les lignes Toshiba
-    `MINC*` (`5` cycles) et `MDEC*` (`4` cycles)
-  - `andcf/orcf/xorcf/ldcf/stcf` sur registres prefixes byte
-    (`C8..CF`) decode/execute maintenant, avec index immediat `#4`
-    ou dynamique `A & 0x0F`
-  - les formes byte hors plage (`bit >= 8`) restent honnetes:
-    `stcf` ne change rien, les autres stoppent en `silicon-undefined`
-  - les miroirs `C7` current-bank byte-slice de cette famille
-    decode/execute maintenant avec la meme semantique
-  - les formes registre long restent non definies, et les formes word
-    `D0..D7` continuent a etre arretees par le garde-fou
-    `silicon-broken` deja documente
-  - `extz/exts` sur registre byte prefixe et `unlk/extz/exts` sur
-    byte-slices `C7` ne tombent plus sur un stop generique:
-    ils s'arretent maintenant honnetement en `silicon-undefined`
-  - `ldc` prefixed decode maintenant les CR connus avec leurs noms
-    symboliques locaux (`DMAS0/DMAD0/DMAC0/DMAM0/INTNEST`) au lieu de
-    laisser seulement `CR_0xNN`
-  - le fichier des control registers TLCS-900/H est maintenant modele
-    dans l'etat CPU (`DMAS0..3`, `DMAD0..3`, `DMAC0..3`, `DMAM0..3`,
-    `INTNEST`) avec valeurs inconnues tant qu'aucun chemin execute ne
-    les initialise
-  - `ldc` prefixed execute maintenant pour ce sous-ensemble:
-    - ecritures et lectures reelles sur `DMAS/DMAD/DMAC/DMAM/INTNEST`
-    - stop honnete `requires-known-control-register` si une lecture vise
-      un CR encore inconnu
-  - le miroir `C7` byte-slice de `ldc` execute maintenant aussi pour les
-    CR byte (`DMAMn`) ; les cibles non-byte par ce chemin restent
-    arretees honnetement en `silicon-undefined`
-  - `INTNEST` suit maintenant aussi les chemins IRQ deja modeles:
-    increment sur delivery si sa valeur etait connue, decrement sur
-    `reti` si sa valeur etait connue
-  - la couche BIOS hand-off de `EmulatorSession` initialise maintenant
-    aussi `INTNEST=0` comme invariant de session UI ; le bootstrap brut
-    garde toujours ce control register inconnu
-  - savestate v5 persiste maintenant aussi ce fichier TLCS-900/H des
-    control registers
-  - `cpu-info` et `registers` exposent maintenant aussi ce fichier de
-    control registers en sortie humaine et JSON
-  - `--seed-reg` accepte maintenant aussi le sous-ensemble modele de
-    control registers TLCS-900/H (`DMAS*`, `DMAD*`, `DMAC*`, `DMAM*`,
-    `INTNEST`) dans les commandes CLI et via l'engine bridge
-  - l'engine bridge accepte maintenant aussi `runtime.seed_presets` avec
-    `bios-handoff-minimal`, pour reproduire le handoff minimal
-    `XSP=0x6C00` + `INTNEST=0` sans recopier ces seeds a la main
-  - `halt` execute maintenant dans un modele borne:
-    `PC` avance a l'adresse sequentielle suivante, puis l'execution
-    s'arrete explicitement en `cpu-halted` jusqu'a modelisation d'une
-    vraie reprise par interruption
-  - `rcf/scf/ccf/zcf` executes maintenant aussi:
-    `cf` suit la semantique Toshiba, `n` est remis a `0`, et
-    `ccf/zcf` gardent le `H` documente comme indetermine sous forme
-    inconnue (`None`) au lieu d'inventer une valeur
-  - les formes fixes `push/pop A` et `push/pop F` executes maintenant
-    aussi, avec timings Toshiba `3/4` cycles et un encodage honnete du
-    byte `F` depuis les six flags modeles
-  - le premier sous-ensemble block-memory non-repeat execute maintenant
-    aussi sur les formes word decodees:
-    `LDI/LDD` avec paires implicites `(XDE+/-, XHL+/-)` ou
-    `(XIX+/-, XIY+/-)`, et `CPI/CPD` avec accumulateur implicite
-    `WA` sur `(R32+/-)`
-  - `CPI/CPD` preservent honnetement `CF`, mettent `V` a `1` tant que
-    `BC != 0` apres decrementation, et bloquent encore les cas alias
-    `XBC` ou ordre de side effects non source
-  - le sous-ensemble block-memory *repeat* execute maintenant aussi:
-    `LDIR/LDDR` recopient `BC` items sur les memes paires implicites
-    jusqu'a `BC == 0` (`H/N/V=0`, `S/Z/C` preserves), et `CPIR/CPDR`
-    comparent `A/WA` jusqu'a un match (`Z=1`) ou `BC == 0`
-    (`S/Z/H` du dernier compare, `V = BC != 0`, `N=1`, `CF` preserve).
-    Le repeat est applique atomiquement: si un acces memoire manque avant
-    le point d'arret honnete, l'instruction bloque
-    (`runtime-memory-unavailable`) sans muter d'etat. `BC=0` au depart
-    boucle sur le pass complet `0x10000` (ordre decrement-puis-test)
-  - correction fidelite decodeur: `0x95 0x11` etait decode `ldirw
-    (XDE+),(XHL+)`; la source autoritative ngdis selectionne la paire via
-    `w = first & 7`, donc `0x95` (w=5) est `(XIX+),(XIY+)`
-  - la famille `0xF3` ARI secondary-indexed **mode=1** `(r32+d16)` decode
-    et execute maintenant tous les stores (immediate `imm8`/`imm16` +
-    registre `R8`/`R16`/`R32`), plus juste `LDA`; miroir du mode=3
-    `(r32+r16)`. `EA = base + signed(d16)`, bloque honnetement sur base ou
-    source inconnue. Debloque ~6.5k instructions de plus au boot de
-    `a_test_battle.ngc` (arret honnete ensuite sur `ld XBC,XWA` silicon-broken)
-  - `CALL [cc,] (r32)` register-indirect decode+execute pour toute la famille
-    `0xB0..0xB7` (op `0xE0..0xEF`), conditionnel inclus; avant seul `B4 E8`
-    = `call (XIX)` etait gere. Taken => push return + `PC = r32`; conditionnel
-    faux => fall-through. Miroir de `JP (r32)`
-  - `0xC3`/`0xD3`/`0xE3` ARI secondary-indexed **mode=1** `(r32+d16)` decode
-    et execute maintenant les loads `ld R8/R16/R32, (r32+d16)` + `cp
-    (r32+d16), imm8` (miroir lecture du pass 138, avant seul mode=3
-    `(r32+r16)`)
-  - `cp R8/R16/R32, (mem)` (op `0xF0..0xF7`) secondary-indexed decode+execute
-    pour les deux modes (`(r32+d16)` et `(r32+r16)`) : compare `R - mem`,
-    pose les flags de soustraction, n'ecrit rien
-  - `inc/dec #n, (mem)` (op `0x60..0x6F`, `n=0->8`) secondary-indexed RMW
-    decode+execute pour les deux modes : lit, applique `+/- n`, reecrit ;
-    pose `S/Z/V/H`+`N`, preserve la retenue. Ferme entierement la famille
-    secondary-indexed mode=1 sur les prefixes `C3`/`D3`/`E3`
-  - `ld R32, (r32)` long register-indirect (`0xA0..0xA7` op `0x20..0x27`)
-    decode+execute : lit 4 octets a `(r32)` dans R32. Complete la taille long
-    a cote des familles byte (`0x80`)/word (`0x90`) deja gerees
-  - `bit #n, (r32+d8)` (`0xB8..0xBF` op `0xC8..0xCF`) decode+execute : lit un
-    octet a `r32 + signed(d8)`, pose `Z = NOT bit` (`H=1`, `N=0`), n'ecrit rien
-  - `bit #n` sur l'addressing F3 secondary-indexed `(r32+d16)`/`(r32+r16)`
-    (op `0xC8..0xCF`) decode+execute : meme semantique read-only. menu_test
-    decode maintenant proprement jusqu'a son frontier d'execution reel
-  - **RENVERSEMENT HW (2026-07-02, quirk DB v7)** : les copies `ld r+r` 32-bit
-    (`D8..DF` sub-op `0x88..0x8F`/`0x98..0x9F`) ne sont **PAS** silicon-broken
-    et s'executent maintenant (copie registre). Contre-preuve : la cartouche
-    commerciale **mr_robot boote sur vraie NGPC** en executant `ld XBC, XWA`
-    (`D8 89`), et le compilateur officiel CC900 emet la meme famille. Les ALU
-    r+r restent bloquees (conservateur) ; les copies `ld` 16-bit (`D0..D7`)
-    restent bloquees mais marquees « meme famille, tres probablement sures ».
-    ⚠️ **Doute ouvert** (banniere en tete de `HARDWARE_COMPAT_POLICY.md`) :
-    pourquoi le `D8 8B` avait-il ete attribue crash ? Mini-ROM de test HW du
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba
-    `ANDCF/ORCF/XORCF/LDCF/STCF r` (`3` cycles), y compris en miroir `C7`
-  - `cycles_consumed` utilise maintenant aussi la ligne Toshiba `LDC`
-    (`3` cycles) pour les formes prefixed et `C7` executees
-  - les mirroirs `C7` current-bank byte-slice de
-    `rlc/rrc/rl/rr/sla/sra/sll/srl #4,r` et `A,r` executent
-    maintenant aussi, avec le meme blocage honnete sur `CF`
-  - `rlc/rrc/rl/rr/sla/sra/sll/srl A,r` execute maintenant,
-    avec count = low nibble de `A` et blocage honnete sur `CF`
-    inconnu pour `rl` / `rr`
-  - `ldx (#8), #` decode + execute maintenant comme store direct byte,
-    avec tolérance Toshiba sur les bytes de padding
-  - `rl #4,r` / `rr #4,r` execute maintenant quand `CF` est connu,
-    avec blocage honnete si `CF` reste inconnu
-  - `incf` / `decf` executes maintenant pour la rotation de banque
-    visible, via le meme flush/reload que `ldf`
-  - `ld R8/R16/R32, (-R32)` pour la tranche pre-decrement simple
-  - `call (abs24)` / `call CC, (abs24)` via `F2`
-  - `add/adc/sub/sbc/and/xor/or/cp (abs24), imm8` via `C2`
-  - `ld/ldw (abs8), #imm` et `ld[w] (abs8), (abs16)` via `F0`
-  - `cp R16, (abs24)` et `pushw (abs24)` via `D2`
-  - exécution des formes prefixed WORD r+r `mul/muls/div/divs` via `D8..DF 0x40..0x5F`
-    (HW-cleared 2026-07-06, `hw_test_muldiv` : `div WA, BC` / `D9 50` s'exécute et est
-    correct — ne restent silicon-broken que shift-by-A `0xF8..0xFF` et le trou `0xB8..0xBF`)
-  - **OPEN BUS modélisé (HW-mesuré, `hw_test_openbus` 2026-07-08)** : une lecture
-    d'adresse hors de toute région mappée renvoie `0x0000`, une écriture est
-    silencieusement ignorée, et rien ne hang (le TLCS-900/H n'a pas de trap de
-    bus-fault). Honest-stop conservé pour l'in-region non-backé (région BIOS sans
-    image BIOS = seule classe qui bloque encore). C'est mesuré sur silicium, pas inventé.
-  - exécution word `mul/muls/div/divs R, imm16` via `D8..DF 0x08/0x09/0x0A/0x0B`
-    (réparé 2026-07-08 : cassé depuis le resize D8..DF→word ; `divs HL, 0x64`)
-  - `pushw (r32+d16)` via `D3` (famille word-mémoire ARI, op 0x04)
-  - `inc/dec byte (r32+d8)` RMW indexé via `0x88..0x8F` op 0x60..0x6F
-  - `opcode-coverage` distingue maintenant les vrais trous de decode des
-    bytes immediatement apres une instruction deja connue `silicon-broken`
-- derniers timing follow-ups :
-  - `cycles_consumed` couvre maintenant aussi le sous-ensemble
-    registre/immediat deja execute :
-    `LD`, `LDA`, `ADD/ADC/SUB/SBC/AND/XOR/OR/CP`, `INC/DEC`, `EXTZ/EXTS`
-  - `cycles_consumed` couvre aussi le sous-ensemble memoire deja execute :
-    `LD R,(mem)`, `LD (mem),R`, `LD (mem),#8`, `LDW (mem),#16`,
-    `CP` registre/memoire et `PUSHW (mem)`
-  - `cycles_consumed` couvre aussi les chemins ALU/memoire deja executes :
-    `ADD/ADC/SUB/SBC/AND/XOR/OR R,(mem)`, `... (mem),R`,
-    `ADD/SUB/AND/XOR/OR (mem),#`, `CP (mem),#`, `INC/DEC #3,(mem)`
-  - `cycles_consumed` couvre aussi les operations bit/carry memoire deja
-    executees : `BIT`, `LDCF/ANDCF/ORCF/XORCF`, `STCF`,
-    `RES/SET/CHG/TSET` sur `(mem)`
-  - `cycles_consumed` couvre aussi les rotate/shift memoire deja executes :
-    `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL` sur `(mem)`
-  - `cycles_consumed` couvre aussi le sous-ensemble bit ops registre byte
-    deja execute : `BIT/RES/SET/CHG/TSET #4,r`
-  - `cycles_consumed` couvre aussi `INCF` / `DECF` (`2` cycles Toshiba)
-  - `cycles_consumed` couvre aussi les shifts immediats registre executes :
-    `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL #4,r` via la formule Toshiba `3 + n/4`
-  - `cycles_consumed` couvre aussi les formes registre `A,r` de
-    `RLC/RRC/RL/RR/SLA/SRA/SLL/SRL` (`2` cycles Toshiba)
-  - `cycles_consumed` couvre aussi les mirroirs `C7` byte-slice des
-    formes shift immediates et `A,r`, avec les memes couts Toshiba
-  - `cycles_consumed` couvre aussi `cpl` / `neg` et leurs mirroirs
-    `C7` byte-slice (`2` cycles Toshiba)
-  - `cycles_consumed` couvre aussi `LDX (#8), #` (`8` cycles Toshiba)
-  - les miroirs `C7` current-bank byte-slice de ces familles suivent la
-    meme table Toshiba au lieu du fallback global `8`
-- corpus check courant :
-  - `python ngpc_emu.py opcode-coverage ..\NgpCraft_toolchain\StarGunner_save_lib_test\bin\main.ngc --bytes 4096 --json`
-  - resultat actuel : `4093 / 4096` bytes decoded (`99.9%`), `0` unknowns,
-    `0` unsupported-decoded, `3` silicon-broken fallout
+```bash
+pyinstaller --noconfirm --clean NgpCraftEmulator.spec    # any platform
+```
 
-Doctrine + roadmap :
-- roadmap detaillee dans `ROADMAP.md`
-- politique de fidelite materielle dans `HARDWARE_COMPAT_POLICY.md`
-- politique de fidelite timing/perf dans `PERF_TIMING_POLICY.md`
-- politique de gestion des sauvegardes dans `SAVE_POLICY.md`
-- contexte de reprise session dans `AGENT_CONTEXT.md`
-- index local des sources dans `DOC_SOURCES_INDEX.md`
-- devlog local dans `DEVLOG.md`
-- manuel anglais evolutif dans `USER_MANUAL_EN.md`
+The spec branches on the host OS (core library name, icon format, macOS `.app` bundle), so
+the same file produces the right thing everywhere.
 
-Strategie BIOS / flash / saves (HLE-only, **jamais de dump SNK distribue**) :
-- Master index cross-projets : `../Doc de dev/Final/BIOS_FLASH_SAVES_STRATEGY.md`
-- Spec HLE detaillee : `specs/BIOS_HLE.md` (table SWI + workflow gap-filling)
-- Politique saves : `SAVE_POLICY.md` (§9 references pour implementation)
-- Lib `ngpc_flash` MIT existante (toolchain) sert de reference pour le protocole AMD flash + pattern append-only
+### Building the core (other platforms / from source)
 
-Format specs lockes (chaque format en JSON strict, rejet implicit upgrade) :
-- savestate v2 (`specs/SAVESTATE.md`)
-- event log v2 (`specs/EVENT_LOG.md`, ajoute `memory_reads` aux events)
-- watchpoints v3 (`specs/WATCHPOINTS.md`, kind=write/read/access + byte-value filter)
-- breakpoints v1 (`specs/BREAKPOINTS.md`)
-- symbols .map v1 (`specs/SYMBOLS.md`)
-- quirks v3 + matcher v4 (`specs/QUIRKS.md`, `core/quirks_db.json` `2026-05-26.v6`)
-- contrat d'integration engine (`specs/ENGINE_INTEGRATION_CONTRACT.md`)
-- K2GE inspecteurs (palette / OAM / tilemap / tile pixels, `specs/K2GE_*.md`)
+```bash
+cd cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
 
-CPU + memoire (M1 + M1d livres) :
-- SR Phase 1+2 partielle : 6 flags TLCS-900/H complets (S/Z/V/H/C/N), `iff_level` 3-bit mask, `rfp` 2-bit bank pointer, helpers `encode_sr_from_state`/`decode_sr_to_fields` (layout `T900_DENSE_REF.md` §31). `ei n` / `di` cables sur `iff_level`. PUSH SR / POP SR (0x02/0x03) opcodes consomment encode/decode SR end-to-end.
-- M1d Phase 1 : pre-init cold-start 32 256 B de RAM/VRAM on-chip a `0x00` (Work RAM 0x4000..0x6FFF, system page, Z80 RAM, K2GE, SCR1/2, CHAR_RAM). CPU I/O page laissee `unbacked` intentionnellement.
-- Frontier StarGunner stable : **25 072 instructions honnetes** depuis bootstrap → silicon-broken `D8 89 ld XBC, XWA` a 0x20D180.
+This produces `cpp/build/ngpc_core.{dll,so,dylib}`, which the shell loads automatically.
 
-Debugger (P0 ROADMAP §8) — **8/9 livres, seul `screenshots` depend M2 Phase 1** :
-- step/run/pause/reset, breakpoints adresse+symbole, watchpoints memoire/IO (kind=write/read/access + byte-value filter), affichage registres CPU, disasm live (single via `decode-next` + range delegate a `NgpCraft_Disasm`), chargement `.map`, inspecteur memoire brut (`memory-dump`), savestates (v2), inspecteurs VRAM/OAM/palettes (palette + OAM + tilemap statiques + tile pixels rendus en ASCII grayscale 4-niveaux).
+## Games & BIOS
 
-Visuel (M2 Phase 0.5, pass 19) :
-- **Premier rendu graphique** via `tile-view <rom> <tile-id>` qui decode CHAR_RAM 2bpp + rend 8×8 en ASCII grayscale. `--plane <sprite|scr1|scr2> --palette N` colorise chaque pixel via la palette K2GE. Sert de rasterizer kernel reutilisable pour M2 Phase 1 framebuffer.
+No ROMs are included — provide your own. A **BIOS is optional**: the emulator ships a small
+**clean-room HLE BIOS** (`hle_bios/`) and uses it automatically when you have no `bios.bin`,
+so games run out of the box.
 
-Prototype actuel:
-- `ngpc_emu.py info <rom>` : lit le header minimal d'une ROM `.ngp/.ngc`
-- `ngpc_emu.py reset-info <rom>` : construit l'etat machine bootstrap minimal
-- `ngpc_emu.py addr-info <rom> <address>` : sonde une adresse dans l'espace memoire minimal
-- `ngpc_emu.py cpu-info <rom>` : affiche le premier conteneur d'etat CPU
-- `ngpc_emu.py peek <rom> <address>` : lit des octets via le bus read-only minimal
-- `ngpc_emu.py fetch-next <rom>` : lit une fenetre brute a partir du `PC` bootstrap
-- `ngpc_emu.py decode-next <rom>` : decode une instruction dans le sous-ensemble TLCS-900 minimal actuellement supporte
-- `ngpc_emu.py execute-next <rom>` : execute une instruction du premier sous-ensemble reel actuellement representable par l'etat CPU
-- `ngpc_emu.py step-exec <rom>` : execute exactement une instruction reelle avec support explicite de reprise `--seed-from` et persistance `--save-state`
-- `ngpc_emu.py step-exec <rom> --seed-checkpoint <name> --save-checkpoint <name>` : meme workflow mais via checkpoints nommes au lieu de chemins JSON bruts
-- `ngpc_emu.py step-exec <rom> --seed-session <name> --save-session <name>` : meme workflow mais avec un frontier courant persistant gere comme session nommee
-- `ngpc_emu.py run-steps <rom>` : execute un petit nombre d'instructions en conservant l'etat CPU et l'overlay memoire writable entre les pas
-- `ngpc_emu.py trace-exec <rom> --seed-from <state.json> --save-state <next.json>` : capture un petit bloc d'execution reelle puis persiste directement le frontier final
-- `ngpc_emu.py run-steps <rom> --seed-from <state.json> --save-state <next.json>` : reprend un petit run depuis un savestate et persiste directement l'etat final capture
-- `ngpc_emu.py checkpoint save|list|load|delete ...` : couche de checkpoints nommes au-dessus des savestates v1 stockes sous `.ngpc_emu/checkpoints/`
-- `ngpc_emu.py session save|list|load|delete ...` : couche de sessions nommees au-dessus d'un checkpoint courant gere automatiquement sous `.ngpc_emu/sessions/`
-- `ngpc_emu.py session snapshot save|list|load|restore|delete ...` : snapshots legers d'une session pour garder quelques frontiers utiles sans quitter le workflow nomme
-- `ngpc_emu.py savestate save <rom> <output.json> [--run-until <target_pc>] [--seed-reg ...] [--note ...]` : capture un snapshot machine-state v1
-- `ngpc_emu.py savestate load <input.json> [--rom <rom>]` : relit un savestate v1, valide format/version et (si --rom) verifie le hash ROM
-- `ngpc_emu.py run-until-exec <rom> <target_pc> --seed-from <state.json>` : reprend l'execution depuis un savestate (CPU + overlay) au lieu du bootstrap
-- `ngpc_emu.py run-until-exec <rom> <target_pc> --save-state <output.json>` : persiste directement l'etat final d'un run-until comme nouveau savestate v1
-- `ngpc_emu.py run-until-exec <rom> <target_pc> --auto-tick-addr <addr> --auto-tick-period <n>` : mode diagnostic non-reference qui incremente un compteur writable pour laisser sortir des waits type `_ngpc_vsync`
-- `ngpc_emu.py eventlog capture <rom> <output.json> [--run-until <target_pc>] [--seed-from <state.json> | --seed-checkpoint <name> | --seed-session <name>]` : capture un event log v1 stable pour diff/CI/regression
-- `ngpc_emu.py eventlog inspect <input.json> [--rom <rom>] [--limit <N>]` : recharge un event log v1, verifie optionnellement le hash ROM et affiche son resume
-- `ngpc_emu.py eventlog diff <left.json> <right.json>` : signale la premiere divergence entre deux logs captures sur le meme hash ROM
-- `ngpc_emu.py eventlog check <rom> <golden.json> [...]` : capture un run frais puis le compare immediatement a un golden event-log ; code de sortie `0` si identique, `1` si divergence, avec `--save-current` pour archiver le log courant
-- `ngpc_emu.py eventlog golden-save|golden-load|golden-list|golden-delete|golden-check ...` : registre nomme de goldens event-log sous `.ngpc_emu/goldens/`, pour sortir du bricolage de chemins JSON en regression/CI
-- premiere tranche M1c livree dans les tests : 3 micro-ROMs CPU synthetiques stables (arithmetique, pile, controle de flux), chacune validee par `eventlog golden-save/golden-check`
-- `ngpc_emu.py engine-bridge <request.json>` : execute une requete bridge `NgpCraft_engine` et repond en JSON structure sur `stdout`
-- `ngpc_emu.py trace-preview <rom>` : affiche une premiere trace lineaire statique basee sur le decodeur courant
-- `ngpc_emu.py step-preview <rom>` : affiche une premiere prevision statique de `step into` basee sur les metadonnees du decodeur
-- `ngpc_emu.py next-preview <rom>` : affiche une premiere prevision statique de `step over` / `next`
-- `ngpc_emu.py run-until-preview <rom> <target>` : affiche une premiere prevision statique de `run until` en chainant `step into` ou `next`
+- Put `.ngc` / `.ngp` files in **`roms/`** (or pick any folder with **Choose ROM folder**,
+  in the Library).
+- **BIOS (optional).** With none supplied, the built-in clean-room BIOS runs the games — no
+  intro or setup screens, but the games play (and Library covers render). A **real** Neo Geo
+  Pocket BIOS is recommended for maximum fidelity: place it as **`bios.bin`** next to the app
+  (or set the path in **Settings ▸ Console (BIOS)**) and it takes over automatically. Only a
+  real BIOS enables the **console boot** (intro + language/clock screens) and the **link
+  cable**. The real BIOS always wins when present — the two never mix.
 
-Debugger M4 P0 (passes 11-14) :
-- `ngpc_emu.py memory-dump <rom> <addr> [--count N] [--width W] [--seed-from state.json] [--json]` : hexdump-style multi-row inspector avec ASCII column ; `--seed-from` overlay savestate writable cells
-- `ngpc_emu.py registers <rom> [--seed-from state.json] [--json]` : vue rich des 8 R32 (décomposition R16/R8 — XWA → WA → W/A), PC, SR raw, IFF level, RFP, 6 flags
-- `ngpc_emu.py watchpoint add <rom> <addr> [--kind write|read|access] [--size N] [--label L] [--value BYTE] [--json]` : registre per-ROM `.ngpc_emu/watchpoints/`. Workflow "find opcode writing V to A" = `add --value V` + `check`.
-- `ngpc_emu.py watchpoint list|remove|clear|check <rom> [...]`
-- `ngpc_emu.py breakpoint add <rom> <addr> [--label L] [--json]` ou `add-symbol <rom> <name> --map <map>` : registre per-ROM `.ngpc_emu/breakpoints/`. Symbol-name shortcut résout via `.map`, stocke address pure.
-- `ngpc_emu.py breakpoint list|remove|clear|check <rom> [...]`
+> **A few commercial games want a real `bios.bin`.** *Metal Slug — 2nd Mission* checks that
+> the console really booted through its BIOS, and quietly disables **fire and jump** when it
+> decides it did not. With the real BIOS both start modes satisfy the check. Under the HLE
+> BIOS the game still runs and looks perfect; you simply can never shoot or jump.
 
-M2 Phase 0 inspecteurs (passes 16-18) — lecture statique de l'état VRAM/OAM/palette :
-- `ngpc_emu.py palette-info <rom> [--kind all|sprite|scr1|scr2|background|window] [--seed-from state.json] [--json]` : décode la palette RAM `0x8200..0x83FF` en couleurs 0BGR 12-bit (5 plans : sprite/scr1/scr2/background/window, 16 palettes × 4 couleurs).
-- `ngpc_emu.py oam-info <rom> [--visible-only] [--seed-from state.json] [--json]` : 64 sprites × 4 bytes `0x8800..0x88FF` + CP.C `0x8C00..0x8C3F`. Decode tile (9-bit), flip, P.C plane bit, PR.C priority (0=hidden, 1=behind-scr, 2=middle, 3=front), chain bits, palette code.
-- `ngpc_emu.py tilemap-info <rom> [--plane scr1|scr2] [--non-empty] [--list] [--seed-from state.json] [--json]` : SCR1 `0x9000` / SCR2 `0x9800`, 32×32 tiles × 2B. Vue par défaut = grille ASCII compacte (`.` empty, `0-9 a-z A-Z +` compress tile #).
+### Two ways to start a game
 
-M2 Phase 0.5 — premier rendu visuel (pass 19) :
-- `ngpc_emu.py tile-view <rom> <tile-id> [--plane sprite|scr1|scr2 --palette N] [--seed-from state.json] [--json]` : rend un tile 8×8 CHAR_RAM en ASCII 4-niveaux grayscale (` ░▒█`). `--plane + --palette` résout chaque pixel via la palette K2GE (hex_rgb24 par pixel dans JSON). Premier vrai rendu graphique de l'émulateur + rasterizer kernel pour la future Phase 1 framebuffer.
-- parseur dans `core/rom.py`
-- espace d'adresses minimal dans `core/bus.py`
-- lecture memoire read-only minimale dans `core/memory.py`
-- conteneur CPU minimal dans `core/cpu.py`
-- etat machine bootstrap dans `core/machine.py`
-- helper de fetch minimal dans `core/fetch.py`
-- helper de decode minimal dans `core/decode.py`
-- helper de premier executeur minimal dans `core/execute.py`
-- premier registre local de quirks hardware dans `core/quirks.py`
-- helper de premier run stateful minimal dans `core/run_steps.py`
-- helper de premiere trace d'execution reelle dans `core/trace_exec.py`
-- helper de premier event log stable dans `core/event_log.py`
-- helper de premier bridge engine structure dans `core/engine_bridge.py`
-- test unitaire minimal dans `tests/test_rom.py`
+- **Instant hand-off** *(default — leave "Console boot" OFF)*: the cartridge is handed the
+  exact state the BIOS boot would have left, so the game starts immediately. The BIOS image
+  is still used behind the scenes (saves, system calls); the game just boots straight in.
+- **Console boot** *(Settings ▸ Console (BIOS) ▸ "Play the console boot")*: the real BIOS powers on,
+  plays its **NEO·GEO POCKET intro**, and then boots the game on its own — exactly like
+  turning on the hardware. A brand-new console configures itself the first time (the BIOS
+  first-boot setup is auto-completed with defaults and remembered), so you always get
+  *intro → game*, every launch, with no setup screen to click through. Needs a real
+  `bios.bin`.
 
-Le decodeur minimal couvre maintenant aussi:
-- premiers opcodes prefixes registre/ALU utiles sur le bootstrap reel
-- premiers acces indexes `(r32+d8)`
-- premiers warnings de quirk CPU connus, sans modifier le resultat decode
-- correction de largeur pour la famille ALU `D8..DF`, alignee sur la reference locale
-- premieres metadonnees de controle de flux: type, cible directe et `falls through`
+The **Boot BIOS** button (Library) boots the BIOS by itself, with no cartridge — the
+console's own language/clock screens, one of the NGPC's signature features.
 
-La trace minimale actuelle couvre maintenant aussi:
-- une marche sequentielle sur `N` instructions a partir d'une adresse ou du `PC` bootstrap
-- un format de record simple avec bytes, asm, warning et raison d'arret
-- un mode strictement statique qui ne pretend pas suivre le vrai flux d'execution
-- une option d'arret sur controle de flux pour obtenir des previews de bloc plus lisibles
-- une premiere variante runtime `trace-exec`, distincte des previews statiques
+### Your own cover art
 
-Le stepping minimal actuel couvre maintenant aussi:
-- un premier `step into` statique
-- un premier `step over` / `next` statique
-- un premier `run until` statique borne, avec mode `over` ou `into`
-- une cible preview resolue pour les cas directs simples
-- un resultat explicitement non resolu pour les branches conditionnelles, retours et cas runtime-dependants
-- une detection de cycle et une limite de pas pour eviter de pretendre suivre un flux non justifiable
+Library covers are rendered automatically (the emulator boots each game and keeps its
+best-looking frame), and that render is a **cache**: it lives in `thumbnails/` and is
+thrown away whenever a new version renders covers differently.
 
-L'execution minimale actuelle couvre maintenant aussi:
-- un premier `execute-next` avec vraie mutation d'etat CPU
-- un premier `step-exec` dedie pour une seule instruction reelle, utilisable proprement en workflow savestate -> step -> savestate
-- `NOP`, sauts directs inconditionnels et chargements immediats representables
-- premiers `inc` / `dec` prefixes sur registres quand la vue source est representable par le modele CPU courant
-- un premier modele writable minimal pour la pile courante
-- `pushw`, `push`, `pop`, `call`, `ret` et `retd` quand le pointeur de pile est connu et que l'effet reste representable
-- un seed manuel des 8 registres 32-bit et du sous-ensemble modele de control registers TLCS-900/H via `--seed-reg`, avec `--seed-xsp` conserve comme raccourci pratique
-- un preset `--seed-bios-handoff-minimal` qui reproduit maintenant le meme contexte minimal que la session UI (`XSP=0x6C00`, `INTNEST=0`) sans inventer l'etat DMA
-- un premier `run-steps` borne qui conserve `CPU` et overlay memoire entre instructions dans une seule invocation
-- `run-steps` peut maintenant aussi reprendre depuis un savestate (`--seed-from`) et sauvegarder directement son etat final (`--save-state`)
-- `trace-exec` peut maintenant aussi reprendre depuis un savestate (`--seed-from`) et sauvegarder directement le frontier final (`--save-state`)
-- `run-until-exec` peut maintenant sauvegarder directement son etat final en savestate v1 (`--save-state`)
-- premiere couche de checkpoints nommes:
-  - `checkpoint save/list/load/delete`
-  - `step-exec`, `run-steps`, `trace-exec`, `run-until-exec` acceptent maintenant aussi `--seed-checkpoint` / `--save-checkpoint`
-- premiere couche de sessions nommees:
-  - `session save/list/load/delete`
-  - `step-exec`, `run-steps`, `trace-exec`, `run-until-exec` acceptent maintenant aussi `--seed-session` / `--save-session`
-  - `session snapshot save/list/load/restore/delete` ajoute un petit historique manuel au-dessus du frontier courant
-- `eventlog capture` accepte maintenant aussi `--seed-checkpoint` pour rester compatible avec les workflows nommes de replay/diff/regression
-- `eventlog capture` accepte maintenant aussi `--seed-session` pour rejouer/capturer directement depuis le frontier courant d'une session
-- `eventlog check` ajoute une premiere brique golden-trace/CI au-dessus du format stable:
-  - reprend les memes seeds/options de capture que `eventlog capture`
-  - compare directement contre un golden existant
-  - renvoie `0` si aucun ecart, `1` sinon
-  - peut sauver le log courant via `--save-current` pour inspection post-echec
-- le registre nomme de goldens event-log existe maintenant aussi:
-  - `eventlog golden-save <rom> <name> [...]`
-  - `eventlog golden-list <rom>`
-  - `eventlog golden-load <rom> <name>`
-  - `eventlog golden-delete <rom> <name>`
-  - `eventlog golden-check <rom> <name> [...]`
-  - il repose sur le meme format stable `eventlog v1`, pas sur un format parallele
-- premiere tranche du corpus micro-ROMs CPU stable:
-  - `arith-add-wa`
-  - `arith-sub-wa-zero`
-  - `arith-and-wa-zero`
-  - `arith-xor-wa-zero`
-  - `arith-or-wa-sign`
-  - `arith-add-wa-carry-zero`
-  - `arith-add-wa-overflow-sign`
-  - `arith-sub-wa-borrow-sign`
-  - `arith-sub-wa-overflow`
-  - `arith-adc-wa-carry-in`
-  - `arith-sbc-wa-borrow-in`
-  - `arith-add-wa-half-carry`
-  - `arith-sub-wa-half-borrow`
-  - `arith-add-w-carry-zero`
-  - `arith-or-a-sign`
-  - `arith-add-xwa-carry-zero`
-  - `arith-sub-xwa-overflow`
-  - `arith-adc-w-carry-in`
-  - `arith-sbc-w-borrow-in`
-  - `arith-adc-xwa-carry-in`
-  - `arith-sbc-xwa-borrow-in`
-  - `arith-add-w-half-carry`
-  - `arith-sub-w-half-borrow`
-  - `arith-add-xwa-half-carry`
-  - `arith-sub-xwa-half-borrow`
-  - `arith-cp-w-zero-no-writeback`
-  - `arith-cp-xwa-zero-no-writeback`
-  - `arith-cp-w-borrow-sign-no-writeback`
-  - `arith-cp-w-overflow-no-writeback`
-  - `arith-cp-xwa-borrow-sign-no-writeback`
-  - `arith-cp-xwa-overflow-no-writeback`
-  - `shift-rlc-w-carry-sign`
-  - `shift-sra-w-carry-zero`
-  - `shift-rrc-xwa-carry-sign`
-  - `shift-srl-xwa-carry-zero`
-  - `bitops-res-set-abs16-builtin`
-  - `bitops-set-res-abs16-overlay`
-  - `memory-ld-abs16-imm8-overlay`
-  - `memory-ld-abs16-a-overlay`
-  - `memory-ldw-abs24-imm16-overlay`
-  - `memory-ld-abs16-xwa-overlay`
-  - `stack-push-pop-wa-roundtrip`
-  - `stack-push-pop-xiz-roundtrip`
-  - `stack-link-unlk-xwa-roundtrip`
-  - `stack-link-unlk-xbc-positive-frame`
-  - `stack-link-xiy-large-frame-silicon-broken`
-  - `stack-call-ret`
-  - `control-jr-z`
-  - ces cas vivent aujourd'hui dans la suite de tests et passent via le workflow golden nomme
-  - le volet arithmetique couvre maintenant une premiere tranche stable de `Z/S/C/V/H` sur variantes `byte/word/long`, y compris `ADC/SBC` avec carry-in/borrow-in seedes
-  - le sous-volet `CP` couvre aussi maintenant le non-writeback, plus des premiers cas `borrow/sign/overflow` sur `byte` et `long`
-  - un premier sous-corpus `shift/rotate` existe maintenant aussi sur `byte` et `long`
-  - un premier sous-corpus `res/set abs16` existe aussi sur la memoire writable/systeme
-  - un premier sous-corpus `ld/ldw` store existe aussi sur `abs16/abs24`
-  - un premier sous-corpus `push/pop` explicite existe aussi sur pile writable
-  - un premier sous-corpus `link/unlk` explicite existe aussi pour les frames de pile
-  - ce sous-corpus inclut maintenant un stop quirk honnete sur `link XIY, N>=5`
-- le mode diagnostic non-reference `auto-tick` est maintenant coherent sur tout le workflow `run-until` :
-  - `run-until-exec`
-  - `eventlog capture`
-  - `savestate save --run-until`
-  - `checkpoint save --run-until`
-  - `session save --run-until`
-  - utile pour sortir proprement d'une boucle d'attente sur compteur writable sans annoncer a tort que les IRQ/VBlank sont modelises
-- `checkpoint list` masque maintenant les checkpoints internes geres par les sessions pour eviter de melanger frontiers utilisateur et artefacts de plomberie
-- premiers `lda R32, (abs24)`, `ld (r32+d8), R32` et copies `ld R32, R32` sur le chemin bootstrap officiel outille par `NgpCraft_Disasm`
-- premiers `cp` registre-registre et `cp (r32+d8), R32` avec mutation du sous-ensemble de flags modele
-- premiers `jr` / `jrl` conditionnels quand les flags requis sont connus
-- premier `ld R32, (r32+d8)` alimente par l'overlay writable ou le bus
-- premiere tranche `abs16` byte-memory utile sur la ROM stable:
-  - `cp (abs16), imm8`
-- premiere tranche post-increment byte-memory utile sur la ROM stable:
-  - `ld R8, (r32+)`
-  - `ld (r32+), R8`
-  - `ld (r32+), imm8`
-- premiere tranche pre-decrement utile sur le smoke ROM stable:
-  - `ld R8, (-r32)`
-  - `ld R16, (-r32)`
-  - `ld R32, (-r32)`
-- le bloc de sortie bootstrap decode maintenant aussi `pop XIZ` a `0x0020D0AC`
-- premier backing lisible minimal pour la memoire systeme officielle:
-  - `0x6F86`
-  - `0x6F91`
-- premiere lecture honnete de la flash cart non programmee dans la fenetre 2 MB:
-  - `0x200000..0x3FFFFF` au-dela de la taille fichier lit maintenant `0xFF`
-  - ce fallback couvre la zone de save `0x3FA000..0x3FBFFF` du smoke ROM stable
-- premiere tranche de stores absolus utiles sur la ROM officielle:
-  - `ld (abs24), R8`
-  - `ld (abs24), imm8`
-  - `ld (abs16), R32`
-  - `ld (abs16), imm8`
-  - `res bit, (abs16)`
-  - `set bit, (abs16)`
-- sur `main.ngc`, `run-steps --address 0x20D0D8 --seed-xsp 0x4100 --seed-reg XWA=0x11223344 --count 64` pousse maintenant jusqu'a `0x0020D16A`
-- backing lisible K2GE `0x8000..0x8FFF` (power-on default 0x00) — permet les RMW `res`/`set` sur les registres video:
-  - `res 7, (0x8030)`, `ld (0x8020), 0x00`, `ld (0x8021), 0x00`, `res 7, (0x8012)` tous executes
-- compact small-immediate register load `ld r, #3` (catalog: C8+zz+r : A8+#3):
-  - `ld XWA, 0` (D8 A8) execute; premier cas observe sur la ROM stable
-- `exts r` / `extz r` executes (sign/zero-extend 16→32 bits)
-- ALU-immediate (`add/sub/and/xor/or/cp r, #N`) executes via prefixed family
-- `(r32)` register-indirect stores executes:
-  - `ld (r32), imm8` (Bx 00 xx)
-  - `ldw (r32), imm16` (Bx 02 xx xx)
-- `ei 0` / `di` executent: IFF tracked dans NgpcCpuState, interrupt dispatch non modelise
-- les formes `D0..D7` confirmées silicon-broken s'arretent maintenant avec un frontier explicite:
-  - `silicon-broken` dans `execute-next`
-  - `stopped-on-silicon-broken` dans `run-until-exec` et `trace-exec`
-- les formes immediates documentees comme sures restent executables
-- le registre local de quirks repose maintenant sur un fichier versionne:
-  - `core/quirks_db.json` (`2026-04-22.v3`)
-  - 3 entrees : `cpu.d0_d7_non_immediate`, `cpu.d8_df_register_to_register`, `cpu.link_xiy_large_frame`
-  - chaque entree porte une liste non vide `sources` (attribution par-rule)
-  - les payloads CLI / JSON exposent cette attribution aux cotes de l'ID et de la version
-  - la famille D8..DF `r+r` ALU (sauf CP F0..F7 et les immediates) est maintenant
-    egalement classee `silicon-broken`, conformement a USER_MANUAL_EN.md §12.1
-- sur `main.ngc`, `run-until-exec 0x00220000 --seed-xsp 0x6C00 --seed-reg XIZ=0` atteint maintenant **25 072** instructions honnetes (regression volontaire depuis 27 556 suite a l'ajout du rule D8..DF `r+r`, policy-correct)
-- le frontier honnete courant devient:
-  - `0x0020D180 D8 89` (`stopped-on-silicon-broken`) - `ld XBC, XWA` silicon-broken D8..DF `r+r` ALU (USER_MANUAL_EN.md §12.1)
-- frontiers historiques:
-  - `0x0020CD4D D7 FA` — `rl A, SP`, frontier v2 avant le rule D8..DF `r+r` (2026-04-22)
-  - `0x0020E27F DB 7E` — `scc NZ, XHL`, execute honnetement depuis la session SCC (2026-04-20)
-  - `0x0020D199 ret` — `stack-data-unavailable`, adresse de retour non presente dans l'overlay seede
-- une limite honnete quand l'etat CPU ne permet pas encore de representer un write 8/16-bit
-- un refus explicite des alias `SP`/`XSP`, des effets memoire/IO generaux, de la majorite des flags/SR et des cas encore non modelises
+A cover is a real boot, so it needs a BIOS — but the built-in clean-room HLE BIOS counts,
+so covers render **out of the box**, no `bios.bin` required. Point at a real `bios.bin` in
+Settings and covers re-render through it (maximum fidelity). A game that never reaches a
+real screen is left uncovered and retried next launch, so a blank frame is never cached.
 
-Sources a exploiter des le depart:
-- `../NgpCraft_toolchain`
-- `../NgpCraft_Disasm`
-- `../NgpCraft_engine`
-- `../NgpCraft_gb2ngp`
-- `../Doc de dev/Final/Doc final uniformise eng`
-- `../../01_SDK`
+To use your own image instead, right-click a game ▸ **Choose cover image…**. The file is
+copied into **`covers/`** — a folder the emulator only ever *reads*. Nothing regenerates
+it, no update replaces it, and overwriting the install to upgrade keeps it, because
+`covers/` is your data and ships in no archive. Right-click ▸ **Back to the auto cover**
+undoes it.
+
+You can also drop files in yourself: `covers/<ROM file name>.png` (also `.jpg`, `.bmp`,
+`.gif`, `.webp`) — e.g. `covers/Faselei! (Europe).png`. Any size works; it is scaled to
+the card. If two ROMs in your library share a file name (every NgpCraft project builds a
+`main.ngc`), use `covers/<name>.<8-hex tag>.png` to pin a cover to one of them — picking
+the image through the menu does this for you.
+
+> Placing an image directly in `thumbnails/` used to look like it worked, then lost your
+> cover on the next update that changed the render. `thumbnails/` is the cache; `covers/`
+> is yours.
+
+## Monochrome cartridges on a colour console
+
+A Neo Geo Pocket game is black and white. Put one in an NGPC and it comes up **in colour** —
+the same trick a Game Boy Color plays on a Game Boy cartridge. Both halves of that are
+modelled here.
+
+**The game colourises itself.** The console tells a cartridge which machine it is sitting in,
+and a colour-aware mono game reads that and takes a different code path. *Samurai Shodown!*
+paints its own palette — green bamboo, fighters near their canonical colours — where on an
+original NGP it stays in eight greys. Getting that byte wrong is invisible until you compare
+against hardware: with it, the game writes some 3 600 palette entries in the first 20 seconds;
+without it, sixteen. *(Confirmed against a real NGPC, cartridge flashed.)*
+
+**Everything else gets the console's theme.** A mono game that is *not* colour-aware is tinted
+by the BIOS instead, using the colour **you** chose on the console's own setup screens. The
+BIOS keeps that palette in coin-cell RAM, so it survives across launches and the emulator
+hands it to the cartridge exactly as the hardware does.
+
+> To choose it, use the **Boot BIOS** button and go through the setup. Launching a *game*
+> auto-completes that setup with defaults on purpose — nobody wants to fill in a
+> questionnaire to start playing — which also means it never asks you for a colour.
+
+**Which machine to be** — *Settings ▸ Graphics ▸ "Black-and-white NGP games"*:
+
+- **NGPC (K2GE) — colourised** *(default)* — what this emulator is.
+- **NGP (K1GE) — monochrome** — the original handheld. The cartridge is told it is in a mono
+  console, and the 12-bit palette it would colourise through does not exist on that silicon,
+  so it stays grey **of its own accord** — the game never runs its colour code. This is not a
+  filter laid over the picture afterwards.
+
+Takes effect the next time a game is started.
+
+## Saves
+
+Three different things, kept separate:
+
+- **Save states** — an instant snapshot of the whole machine, 8 slots per game. Toolbar
+  buttons, or `F2` save / `F4` load / `F3` change slot. Stored in `savestates/`.
+- **The console's own memory** — not a game's at all: the language, colour and date the
+  BIOS remembers, kept by the coin cell. See [The console's clock](#the-consoles-clock).
+- **In-game saves** — the game's OWN save (RPG progress, high scores, options), written by
+  the cartridge's flash. Choose how it is stored in **Settings ▸ General ▸ "In-game save"**:
+  - **In the ROM (.ngc)** — written back into the cartridge file itself, exactly like the
+    flash chip on a real cartridge. The save travels with the ROM. *(default)*
+  - **Separate file** — a `saves/<rom>.flash` beside it; the ROM is never modified.
+  - **Both** — into the ROM and a `.flash` backup.
+
+  Commercial games reach the flash through the **BIOS**, so they need a real `bios.bin`.
+  Homebrew that drives the flash directly (e.g. save-library test ROMs) saves without one.
+
+  **Cart flash size** (Settings ▸ General) — the emulator presents a flash chip of a given
+  capacity to the game. A real cartridge's flash chip is a standard 4 / 8 / 16 Mbit part and
+  is often **bigger than the ROM burned on it**, and the game saves in the chip's top block —
+  which can sit far above the ROM data. Delta Warp, for example, is a 512 KB ROM yet writes
+  its record save at a ~1 MB offset; on a chip sized to the ROM that block is missing and the
+  game shows *"SAVE ERROR"*. The capacity is not just a size: a game erases by **block
+  number**, and the number→address table is different on each chip (block 17 is `0xFA000` on
+  an 8 Mbit card, `0x110000` on a 16 Mbit one), so the wrong capacity sends the erase to the
+  wrong place and the save fails on the *second* write — the first one lands on erased flash
+  and works, which is what makes it look fine at first.
+
+  Which chip a cart carries cannot be read off the ROM image (Delta Warp is 512 KB on an
+  8 Mbit part; StarGunner is smaller still on a 16 Mbit one). So **Auto** lets the cartridge
+  answer: on every three-card table in SNK's SDK the save block is the second 8 KB block from
+  the top, so `capacity = save address + 0x6000`, and the first time a game programs its save
+  the chip re-presents itself at the matching capacity. The `.ngc` grows to the chip size on
+  first save (use **Separate file** to leave the ROM untouched). Set it explicitly
+  (4 / 8 / 16 Mbit) only to override that.
+
+## The console's clock
+
+A Neo Geo Pocket carries a **calendar chip** and a **coin cell**, and that one battery keeps
+*both* the BIOS settings (language, colour) *and* the clock alive. The emulator models it the
+same way, so the two are saved together — `saves/system.ram` and `saves/system.rtc`. Pull one
+and you would have a console that runs its first-boot setup while still insisting it knows the
+date, which is why the reset below clears both.
+
+The clock **runs while you play** and, by default, **keeps running while the emulator is
+closed** — shut it for three days and the console comes back three days later, exactly as the
+coin cell does on hardware. Choose in **Settings ▸ Console (BIOS) ▸ "Clock while the emulator
+is closed"**:
+
+- **Keeps running** *(default)* — what real hardware does.
+- **Follow the PC's clock** — set from your computer at every launch. Always right, but it
+  overrides whatever date you set on the BIOS screen.
+- **Stops, and resumes where it left off** — time freezes with the emulator. Not hardware
+  behaviour, but it is **reproducible**, which is what you want when debugging or when a
+  game's in-world clock should stay put.
+
+> A **brand-new** console has a flat cell, and the BIOS treats that exactly as hardware does:
+> it resets the date to 1998-01-01 on the first boot. That is not a bug — it is the
+> dead-battery path. From the second launch on, the BIOS trusts the chip and never touches it.
+
+**The alarm works.** A game that sets one through the BIOS (`VECT_ALARMSET`) gets its
+interrupt at the minute it asked for, and an alarm that came due **while the console was
+switched off** fires on the next launch. The alarm setting is coin-cell state too, so it
+survives a restart.
+
+**Reset the console** (same panel) is pulling the battery out: the console forgets its
+language, colour and date, and runs its first-boot setup again like a machine out of the box.
+It asks first. **Your games and their saves are not touched** — those live in the ROM and
+`.flash` files.
+
+## Controls (default)
+
+| Key | Action |
+|-----|--------|
+| Arrows / X / C / Enter | D-pad / A / B / Option |
+| `Esc` | Exit fullscreen if fullscreen, else pause menu · `P` pause · `F5` reset |
+| `F2` / `F4` / `F3` | save / load state · change slot |
+| `Tab` (hold) · `[` / `]` | fast-forward · slower / faster |
+| `F12` · `F11` · `Ctrl+1…5` | screenshot · fullscreen · window size 1×…5× |
+| hold `,` · `.` | rewind while held (release to resume) · step one frame forward |
+| `F1` · `H` | debug tools · toggle player toolbar |
+
+**Everything above is rebindable** in **Settings ▸ Controls** (the console buttons) and
+**Settings ▸ Hotkeys** (the rest). `Ctrl+1…5` is the one exception — it needs a modifier,
+so it can never shadow a console button. Because the hotkeys are matched *before* the
+joypad, binding a console button to a hotkey's key would silently kill that button; both
+panels detect that and say so instead of letting you wonder.
+
+**Controller (beta)** (Settings ▸ Controls) — a game pad is read alongside the keyboard
+via **SDL2**, so it works on Windows, macOS and Linux and with most brands (Xbox,
+PlayStation, Nintendo, generic). The d-pad *and* left stick move, A/X and B/Y are the two
+console buttons, Start or Back is Option. Player 1 uses controller 1, player 2 controller 2
+(the *Controller #* selector). Requires `pygame`; without it, Windows falls back to XInput
+and elsewhere the keyboard is unaffected. ⚠️ **Not yet validated on real hardware** — the
+button mapping may need adjusting; please report what your controller does.
+
+**Turbo** — A and B can autofire while held, at 5 / 10 / 15 / 20 presses per second. The
+rate is counted in *console frames*, so it stays the same under fast-forward.
+
+## Two players & link cable
+
+The NGPC's link cable is emulated as what it really is — a byte pipe between two
+independent consoles — so there is no rollback or lockstep to worry about. From the
+player toolbar's **🔗** button:
+
+- **Two players — this PC** — opens a second window. Player 2 loads their **own** cartridge
+  (its flash save loads normally); each player has their own controls (keyboard or pad),
+  routed by player regardless of which window has focus.
+- **Online lobby…** — connect to a lobby server, set a nickname, and **create** or **join**
+  a game (public, or private with a password). The list shows each game's title, server
+  name and creator. Needs a server — run the tiny one in [`server/`](server/README.md)
+  (pure stdlib, deploy free) or your own.
+- **Host / Join (direct address)** — the simplest path: one player hosts on a port, the
+  other dials `ip:port`. Works on a LAN directly; over the internet it needs the host to
+  be reachable (port-forwarding, or a zero-config option like **Tailscale**/**playit.gg**).
+  The host dialog auto-detects your public IP, gives a ready-to-share line, and **explains
+  the risks of opening a port** honestly.
+
+Both players must run a **compatible game** (same title), exactly like real hardware.
+
+## Debugging (F1)
+
+Built for people writing NGPC games by hand. Everything below is saved **per ROM**, so
+your map of a game survives across sessions.
+
+### Symbols
+
+Drop your linker map beside the ROM (`game.map` next to `game.ngc`) and it is loaded
+automatically — the disassembly, the breakpoints, the CPU panel and the analysis reports
+all show `player_update+2E` instead of `20A31C`, and you can **type a symbol name
+anywhere an address is asked for**. Both map formats are read: the clean-room `t900ld`
+form and the **Toshiba `tulink`** map the official cc900 chain emits (bare hex addresses,
+long names wrapped onto the next line).
+
+### Stepping and the disassembly
+
+- **Step** `F7` · **Step over** `F8` · **Step out** `Shift+F8` · **Run to cursor** `F4` —
+  real instruction-level stepping. Step-over runs a call to completion and uses the stack
+  pointer to know it is genuinely back, so recursion does not fool it.
+- The listing is **navigable**: `Ctrl+G` or the *Go to* box (address or symbol), page
+  up/down, and a *follow PC* toggle. Click the left gutter (or `F9`) to **arm a breakpoint
+  on that line**.
+- An undecodable byte shows as `??` and the listing resyncs and carries on, instead of
+  stopping dead and hiding the rest of the routine.
+
+### Call stack
+
+How execution got here — the chain of callers with their return addresses, and
+double-click to jump to any frame. Tracked as a shadow stack while the debug window is
+open (about 1 % of emulation speed, nothing while you are just playing): a call is
+recognised by the return address landing on the stack and a return by the stack unwinding
+past it, so a plain `push` is never mistaken for a call.
+
+### Events — the raster timeline
+
+Every video-register write and every interrupt, plotted at the **scanline and cycle** it
+happened on. This is the view for raster work: a mid-frame scroll split, an HBlank HUD or
+a palette swap on a given line is correct or broken purely as a function of timing, and no
+write log can show that.
+
+### Watch, breakpoints, memory
+
+- **Watch** — name memory addresses and see their live value (1/2/4 bytes, hex or
+  signed/unsigned). Each row can also:
+  - **break on value** — pause when it hits a condition (`=`, `≠`, `<`, `>`, `change`);
+  - **break on write** — pause when *any* code writes it, naming the **PC that did it**;
+  - **break on read** — the same for reads, which answers "does anything actually *use*
+    this?" (instruction fetches are excluded, so it means the code really loaded the value);
+  - **lock** — freeze the address to a value each frame (test "what if HP never drops").
+- **Breakpoints** — pause when PC reaches an address (or a symbol name), with an optional
+  guard written in C:
+
+  ```
+  a == $44 && fz            [$4812] == 0 && pc < $202000            {_score} > 1000
+  ```
+
+  Registers (`a wa xhl pc sp`…), flags (`fz fc fs fh fv fn`), memory (`[x]` 1 byte, `{x}`
+  2, `[x,4]` 4), symbols, and `&& || ! + - * & | << >>`. A condition that does not compile
+  is **named as you type** — it still fires (a guard that silences a breakpoint you asked
+  for would be worse), but you are told why instead of wondering. Old
+  `ADDR.size OP VALUE` conditions keep their original meaning.
+- **Memory** — an **editable** hex grid: click a byte, type two hex digits. Symbol names
+  work in the address box. **Highlight accesses** tints bytes the game just read (blue) or
+  wrote (red), fading over about a second. The core has one read-log and one write-log
+  window, so while highlighting is on it owns them and read/write watchpoints are
+  suspended — the panel says so rather than letting them silently clobber each other.
+- **RAM Search** — find *where* a value lives: start a search, let the game change it, then
+  filter. Absolute (`=` `≠` `>` `<` `≥` `≤`), relative (`changed`, `=prev`, `▲`, `▼`),
+  **by amount** (`+N` `−N` `±N` — "a hit always costs 3 HP" is a far sharper filter than
+  "it decreased"), and **by change count** — tick *count changes*, hold right for six
+  frames, then ask for the addresses that changed exactly six times. **Undo** takes back a
+  bad pass, and **unaligned** finds a 16/32-bit value that does not sit on a multiple of
+  its size. Double-click a hit to name and watch it.
+- **Trace to file** — every instruction with, optionally, the registers it wrote and every
+  memory address it read or wrote.
+- **Audio** — live per-channel monitor (3 square + noise): period → frequency → **note**,
+  L/R volume, plus an oscilloscope of the output and the sound Z80's state. **Mute / solo**
+  any channel to isolate it, watch the raw chip-write log, and **record the music** — save it
+  as a **`.vgm`** (Furnace / VGM players) or as a **`.ngps` song** for the NGPC sound creator.
+- **Layers** — the same idea, applied to the picture: **show or hide** each of the five
+  video layers (scroll plane 1, scroll plane 2, and sprites split by priority) **while the
+  game runs**, with a *solo* button per layer. On this machine text and artwork are always
+  on separate layers — the chip has no other way to put one over the other — so this is how
+  you find out which plane a HUD, a dialogue box or a title logo actually lives on, without
+  editing a byte of VRAM. **Export PNG** saves what you are looking at at **160×152, one
+  file pixel per console pixel**: no scaling, no screen filter, and the 4-bit colour is
+  written back losslessly, so a title screen's background comes out as a clean plate you can
+  edit and re-import. Hiding a layer changes the *picture* and nothing else — no machine
+  state, no timing — so ticking everything back on restores the frame bit for bit.
+- Plus the live viewers: CPU, palette, tiles, sprites — each with an Export button. In the
+  **Tiles** view, **hover any tile** to read its index, its **VRAM address**, which planes
+  reference it, and its 16 raw bytes; **click to copy** that block, or select it from the
+  status line — the numbers you need to poke or replace a tile.
+
+### Load — live resource gauges
+
+Green→red bars for what a game actually runs out of on this hardware, updating as it plays:
+
+- **Sprites (OAM)** — active entries of the 64 the hardware has;
+- **Char RAM** — distinct tiles referenced, of 512 in character RAM.
+
+Both are read straight from VRAM, so they are exact counts. A third bar, **Frame rate**,
+is the honest CPU-headroom signal: it shows whether the game finishes its work in time
+(60 = keeping up), inferred from the sprite table changing, and reads grey on a still
+screen where nothing updates. A raw CPU-cycle percentage is deliberately *not* shown — on
+this machine the slow cartridge bus keeps the CPU busy every frame, so it would read ~100%
+always and tell you nothing; whether the game holds 60 is the number that matters.
+
+### Fan-translation — Text · Crack · Pointers · Compare
+
+Tools for translating a game, all working on **any ROM**: they read live memory through a
+character table **you** load (`.tbl`, the romhacking-standard format), and every result
+shows its **ROM file offset** (`address − 0x200000`) so a hit maps straight back to a byte
+in the cartridge file. Nothing here is specific to one game.
+
+- **Text** — load a `.tbl`, then **decode** any region into readable strings, **search**
+  for a phrase by the exact bytes it encodes to, or **scan** a whole region for every
+  string at once and export it — a script dump to translate offline. A **relative search**
+  finds a word under an *unknown* encoding by the spacing between its letters, needing no
+  table at all — the first tool when you are cracking a game from scratch.
+- **Crack** — type words you can read on screen and it **builds the table for you**: each
+  is located by relative search (or pinned with `word @ offset` when a common word matches
+  in many places), and the real bytes under it become a `.tbl` you can edit, save, or use
+  in the Text tab straight away. It reads the actual bytes, so a non-linear encoding cracks
+  as easily as an alphabetical one.
+- **Pointers** — **find every pointer to an address** (the entries to patch when a string
+  moves) or **locate the pointer tables** themselves. Pointer width 16 / 24 / 32-bit LE,
+  with a base added to the stored value for bank-relative offsets, and a tolerance to catch
+  a pointer into the middle of a string.
+- **Compare** — byte-**diff the running cartridge against a second `.ngc`**. An existing
+  translation is an oracle: the ranges it changed *are* the text, and with a table loaded
+  they are shown decoded on both sides.
+
+> These tools **find and read**; they do not write the ROM. Injecting the translated text
+> and repointing it back into a `.ngc` is a separate build step — this is the discovery and
+> verification side of that workflow.
+
+## ROM analysis
+
+Right-click a game in the Library ▸ **Analyze ROM…**. Because the core models the machine
+closely enough to *judge* a cartridge rather than merely run it, it can check a build the
+way hardware would. Two passes, about a second:
+
+**Static** — the header a real console validates before it will boot a cart (the copyright
+string, the 24-bit entry vector, the mode byte), the image size against real 4/8/16 Mbit
+flash parts, and how much of the image is erased padding. This is the "it works in my
+emulator but the console does nothing" class, and it costs nothing to check.
+
+**Dynamic** — it boots the ROM at its entry vector with cartridge wait-states modelled, and
+**plays**: a fixed script presses A, Option, B and directions, held for several frames and
+released, so it gets past a title screen into real code. It then reports:
+
+- **globals read before they were written** — work RAM holds whatever the previous game
+  left, so such a variable returns the last game's data on hardware while reading zero on
+  most emulators. The report gives the **frame of the first write**, which is what makes
+  the finding triageable: written by the same instruction that read it is usually a counter
+  and harmless; written much later, or never, means real code ran on a value that did not
+  exist yet;
+- **stack bytes read before written** (locals used before assignment) — reported
+  *separately*, because it is much weaker evidence than a global;
+- **writes into unmapped space**, which the bus discards without the program ever knowing;
+- crashes, whether the cartridge code ever ran, and whether the game fits the frame budget;
+- **code reached** — how many distinct instruction addresses executed, so "the analyzer
+  looked at this ROM" is a number instead of a claim.
+
+### ⚠️ What the analysis cannot tell you
+
+**This is a dredging tool, not a proof of correctness. Read its output as leads, not
+verdicts.**
+
+- **The robot plays blind.** It presses buttons on a fixed schedule with no idea what is on
+  screen. It roughly **doubles to triples** the code reached (measured: +119 %, +213 %,
+  +100 % on three games) — but a game that needs a real sequence, a menu navigated or a
+  password entered, will simply not be reached. A large majority of most cartridges is
+  never executed, and **anything never executed is never checked**.
+- **"No findings" means "nothing found on the path that ran."** It is not a clean bill of
+  health.
+- **A finding is a signal, not a diagnosis.** When one report was traced back to its source
+  code, of the issues it raised: some were real and harmless (a counter incremented from an
+  uninitialised value, used only differentially), one was real and worth fixing (a flag
+  polled by the vblank interrupt for seven frames before anything wrote it) — and some were
+  **the debugger's own instrumentation contaminating the measurement**, since fixed. Expect
+  to have to confirm things yourself; the disassembler and symbols are there for that.
+- **Unmapped writes are usually not yours to fix.** Several commercial carts do it from what
+  looks like one shared SDK routine, and in every case measured nothing ever reads the
+  address back. It only matters if something depends on the value.
+- **A stop is not always the ROM's fault.** If the core meets an instruction it does not
+  implement, the report says so *and names the emulator*, because reporting it as a
+  cartridge defect would send you hunting a bug in your own game.
+- **None of this is hardware-validated.** The checks follow the documented behaviour of the
+  machine and this core's model of it. A real console is the arbiter.
+
+## Rewind — how it works and its limits
+
+Rewind keeps a ring of recent frame snapshots so you can step **back** (`,`) and **forward**
+(`.`) through what just happened. Buffer length is set in **Settings ▸ General ▸ Rewind
+buffer**: **Off**, or 10 / 20 / 30 seconds. Each snapshot is ~48 KB, so the cost is roughly
+**10 s ≈ 29 MB, 20 s ≈ 58 MB, 30 s ≈ 86 MB** of RAM held while a game runs (Off = no cost).
+The default is 10 s.
+
+What it restores is the same thing a **save state** restores: the CPU plus the whole working
+image (I/O, RAM, VRAM). That means the **visible frame and game memory come back exactly**,
+but a few pieces of hardware timing that live only inside the core — the sound chip's stream,
+the timers, the scanline position — are **not** snapshotted and re-sync on the next frame. So
+rewind is frame-accurate for *what you saw and what's in memory*, but audio may click at the
+seam and cycle-exact timing right after a rewind is approximate. It's a "what did I just see?"
+tool, not a deterministic TAS engine.
+
+## Known issues
+
+- **Controller support is not yet validated on real hardware.** The cross-platform SDL2
+  pad backend (Windows/macOS/Linux, most brands) is wired up and degrades safely when no
+  pad is present, but it has **not been tested with a physical controller** — the default
+  button mapping (A/X→A, B/Y→B, Start/Back→Option, d-pad + left stick → directions) may
+  need adjusting per model. Treat it as **beta / awaiting validation**; reports of what
+  your controller actually does are welcome.
+- **Cool Boarders Pocket freezes on the end-of-race *REWARD* screen** when **Cart flash size**
+  is **Auto**. That screen saves, and this is a genuine 8 Mbit cartridge that saves in *its
+  own* top block — but Auto presents any under-filled cart as 16 Mbit, which changes the
+  block numbering, sends the erase somewhere else, and leaves the save block never cleared. A
+  flash cell only goes down, so the write can never take, and the BIOS waits for it forever.
+  **Set Cart flash size to 8 Mbit** and it saves and moves on. Auto's rule only recognises a
+  save in the *second* 8 KB block from the top; this game uses the first, so it never
+  self-corrects. Other genuine 8 Mbit carts that save the same way will behave the same.
+- **A save state can carry an old fault back with it.** A state is the whole machine
+  including work RAM, so anything a fix corrects *at boot* is restored to its broken value by
+  a state captured before the fix. Two known cases, both fixed for a fresh run and both still
+  reproducible from an old state — **start a new run to see the fix**:
+  - *Metal Slug — 2nd Mission*, fire and jump dead in-game: its copy-protection flag lives in
+    work RAM. (The hand-off now leaves character RAM as a real BIOS boot does, which is what
+    the game checks.)
+  - *Delta Warp*, `"SAVE ERROR!"` on the second save onward: the flash card type the BIOS
+    reads lives in work RAM at `0x6C58`. (The chip now takes its capacity from where the game
+    actually saves — see **Cart flash size** above.)
+
+If you hit a bug, a ROM fault auto-writes a `crashes/*.txt` report (reason, PC, opcode,
+registers, memory & stack) — attach it, ideally with a save state, when reporting.
+
+## Thanks
+
+The emulator speaks more than one language because people sent theirs in.
+
+- **Português (Portugal)** — [@spotanjo3](https://github.com/spotanjo3)
+  ([#1](https://github.com/Tixul/Ngpcraft_emulator/issues/1))
+
+Adding yours is adding one JSON file, no Python required, and an unfinished one is
+mergeable — see [TRANSLATING.md](TRANSLATING.md). You get credited here, in the file
+itself, and as a co-author of the commit.
+
+## Legal
+
+This is a clean-room emulator. It ships **no copyrighted ROMs or BIOS**. Neo Geo Pocket
+is a trademark of SNK; this project is not affiliated with SNK.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

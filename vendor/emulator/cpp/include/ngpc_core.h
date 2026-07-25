@@ -178,6 +178,45 @@ NGPC_API void        ngpc_reset(ngpc_t*, int reset_mode);
  * NULL/0 for a dead cell (a blank RAM, and a BIOS that boots as if brand new). */
 NGPC_API void        ngpc_set_battery_ram(ngpc_t*, const uint8_t* data, uint32_t len);
 
+/* THE CALENDAR IC, at I/O 0x90-0x97 -- and it runs off THE SAME COIN CELL as the RAM
+ * above. That is not a detail: one cell keeps both alive, so a console that remembers
+ * your language necessarily remembers the time too, and the two must be saved and
+ * restored TOGETHER. The clock is machine state, not memory, so `ngpc_read_mem` cannot
+ * reach it and a plain RAM dump silently leaves it behind -- which is exactly how it
+ * came to be re-seeded to a hardcoded date at every launch.
+ *
+ * MEASURED against the retail BIOS (both paths):
+ *   - blank cell   -> the BIOS REWRITES the chip to 1998-01-01 00:00:00 at 0xFF20FD
+ *                     (stop clock, set fields, restart) -- a dead battery, reset the date.
+ *   - configured   -> the BIOS does not touch it. NOT ONE WRITE.
+ * So on a configured console whatever we hand over is what the console believes, forever;
+ * the BIOS will never correct it. Restoring the real one is the whole fix.
+ *
+ * All fields are packed BCD, exactly as the registers read. `counter` is the sub-second
+ * cycle accumulator -- internal, not visible to software, carried so a round-trip through
+ * a save is lossless. Hand the clock over BEFORE `ngpc_reset` in BIOS-boot mode, like the
+ * battery RAM: the BIOS reads it during its own boot. */
+typedef struct {
+    uint8_t  enable;                       /* register 0x90 bit 0 */
+    uint8_t  year, month, day;             /* 0x91 0x92 0x93 */
+    uint8_t  hour, minute, second;         /* 0x94 0x95 0x96 */
+    uint8_t  weekday;                      /* 0x97 bits 0-3 (the leap phase is derived) */
+    /* The alarm is coin-cell state too: a real console you set an alarm on still has it
+     * set tomorrow. Same chip, same battery, same save. 0x90 bit1 + 0x98/0x99/0x9A. */
+    uint8_t  alarm_enable;
+    uint8_t  alarm_day, alarm_hour, alarm_minute;
+    uint32_t counter;                      /* cycles accumulated toward the next second */
+} ngpc_rtc_t;
+
+NGPC_API void        ngpc_get_rtc(ngpc_t*, ngpc_rtc_t* out);
+NGPC_API void        ngpc_set_rtc(ngpc_t*, const ngpc_rtc_t* in);
+
+/* Wind the clock forward by whole seconds, through the same BCD carry chain the running
+ * clock ticks through -- month ends and leap years included. This is how time the console
+ * spent SWITCHED OFF gets caught up: a real coin cell keeps the calendar running while the
+ * machine is dark, so a save restored a week later should come back a week later. */
+NGPC_API void        ngpc_rtc_advance(ngpc_t*, uint32_t seconds);
+
 /* THE PICTURE. 160 x 152 raw 12-bit 0BGR colours, drawn ONE LINE AT A TIME as the beam
  * passed -- so a game that streams VRAM mid-frame comes out the way the silicon draws it,
  * not smeared with the frame's final state. Copies out; returns the number of pixels. */
@@ -305,6 +344,51 @@ typedef struct {
  * register, the compatibility palette) has to be hand-synthesised instead. */
 NGPC_API void ngpc_raise_irq(ngpc_t*, uint32_t vector_index);
 
+/* --- link cable (serial channel 0) ----------------------------------------
+ * The NGPC link cable is TLCS-900 serial channel 0, driven by the BIOS COM
+ * routines. The cable is a byte pipe: a host wires two machines together by
+ * draining each one's transmit FIFO and pushing it into the other's receive
+ * FIFO (in-process for two-players-on-one-PC, or over a socket for online).
+ * Enable is off by default (registers inert, cable unplugged). */
+NGPC_API void     ngpc_serial_set_enabled(ngpc_t*, int on);
+NGPC_API uint32_t ngpc_serial_read_tx(ngpc_t*, uint8_t* out, uint32_t max);
+NGPC_API void     ngpc_serial_write_rx(ngpc_t*, const uint8_t* data, uint32_t n);
+NGPC_API int      ngpc_serial_rts(ngpc_t*);
+NGPC_API void     ngpc_serial_set_cts(ngpc_t*, int high);
+
+/* A read-only snapshot of the serial channel, for the debugger's Link tab.
+ * How many bytes crossed is already visible to the host that relays them; what
+ * is NOT visible is why they did not -- a byte held by the peer's CTS, a byte
+ * queued while our own RTS is high, a byte presented and never read because the
+ * BIOS receive interrupt is masked. These counters name the stage each byte is
+ * stuck at. Observation only: reading this changes nothing. */
+typedef struct {
+    uint32_t enabled;         /* link armed (cable "plugged in")                */
+    uint32_t tx_depth;        /* bytes transmitted, waiting for the host to relay */
+    uint32_t rx_depth;        /* bytes the host queued, not yet presented        */
+    uint32_t tx_busy;         /* a byte is shifting out (or held by CTS)         */
+    uint32_t rx_pending;      /* a byte sits in SC0BUF, unread by the CPU        */
+    uint32_t cts_high;        /* peer says "not ready" (our CTS0 input)          */
+    uint32_t rts_low;         /* WE say "ready to receive" (0xB2 bit0 == 0)      */
+    uint32_t ctse;            /* game enabled the CTS gate (SC0MOD bit6)         */
+    uint32_t tx_count;        /* bytes the CPU wrote to SC0BUF                   */
+    uint32_t wire_count;      /* ...that finished shifting out                   */
+    uint32_t rx_queued_count; /* bytes the host pushed at us                     */
+    uint32_t rx_read_count;   /* ...that the CPU actually read back              */
+    uint32_t irq_tx_count;    /* INTTX0 raised (vector 0x19 on this BIOS)        */
+    uint32_t irq_rx_count;    /* INTRX0 raised (vector 0x18 on this BIOS)        */
+    uint32_t cts_hold_ticks;  /* ticks a byte was held by CTS0 high              */
+    uint32_t rts_hold_ticks;  /* ticks RX was held by our own RTS                */
+    uint32_t sc0buf;          /* I/O 0x50..0x53 and the two port bits, as read   */
+    uint32_t sc0cr;
+    uint32_t sc0mod;
+    uint32_t br0cr;
+    uint32_t port_b1;         /* bit2 = cable-detect the games poll             */
+    uint32_t port_b2;         /* bit0 = RTS                                      */
+} ngpc_serial_state_t;
+
+NGPC_API void ngpc_serial_state(ngpc_t*, ngpc_serial_state_t* out);
+
 /* The prescaler's phi-T1 period, in CPU cycles. THE SOURCES CONTRADICT EACH OTHER
  * BY A FACTOR OF 32 and neither yields a musical tempo, so this is a knob, not a
  * constant, until an ear or a capture settles it:
@@ -320,6 +404,16 @@ NGPC_API void ngpc_set_timer_base(ngpc_t*, uint32_t cycles_per_phi_t1);
 NGPC_API void ngpc_get_apu_state(ngpc_t*, ngpc_apu_state_t* out);
 /* Debug channel mute mask: bit0..2 squares, bit3 noise, bit4 DAC (0x1F = all on). */
 NGPC_API void ngpc_set_apu_channel_mask(ngpc_t*, uint32_t mask);
+
+/* Debug LAYER mask -- the video counterpart of the channel mute above.
+ *   bit0 SCR1 · bit1 SCR2 · bit2 sprites PR.C=1 · bit3 PR.C=2 · bit4 PR.C=3
+ * 0x1F = everything on, which is the default and the only value any fidelity gate
+ * may run under. Clearing a bit removes that layer from the composed picture and
+ * changes nothing else -- no machine state, no timing, no savestate content. It is
+ * how you answer "which plane is this text on?" without editing VRAM. */
+#define NGPC_LAYER_ALL 0x1Fu
+NGPC_API void ngpc_set_layer_mask(ngpc_t*, uint32_t mask);
+NGPC_API uint32_t ngpc_get_layer_mask(ngpc_t*);
 NGPC_API uint32_t ngpc_get_audio(ngpc_t*, int16_t* out, uint32_t frames);
 NGPC_API uint64_t ngpc_audio_dropped(ngpc_t*);
 
@@ -367,6 +461,117 @@ NGPC_API void     ngpc_set_write_log(ngpc_t*, uint32_t lo, uint32_t hi);
 NGPC_API uint64_t ngpc_write_log_count(ngpc_t*);
 /* Copies up to `n` of the MOST RECENT records, oldest first. Returns how many. */
 NGPC_API uint32_t ngpc_get_write_log(ngpc_t*, ngpc_write_t* out, uint32_t n);
+
+/* -------------------------------------------------------------- read log --
+ * Who READ this address? ABI v11. The write log's missing half: a debugger that
+ * only watches writes can see what sets a flag but never what acts on it.
+ *
+ * Same shape and same rules as the write log. ONE difference, and it matters:
+ * instruction fetches are NOT recorded. They all go through the same read path, so
+ * logging them would drown the one data read you are hunting -- and arming a window
+ * over ROM would log every instruction in it. Only reads from outside the current
+ * fetch window are logged. Pass lo > hi to disarm. */
+typedef struct {
+    uint32_t pc;      /* the PC the core held as the read went through */
+    uint32_t addr;
+    uint8_t  value;   /* the byte handed back */
+} ngpc_read_t;
+
+NGPC_API void     ngpc_set_read_log(ngpc_t*, uint32_t lo, uint32_t hi);
+NGPC_API uint64_t ngpc_read_log_count(ngpc_t*);
+/* Copies up to `n` of the MOST RECENT records, oldest first. Returns how many. */
+NGPC_API uint32_t ngpc_get_read_log(ngpc_t*, ngpc_read_t* out, uint32_t n);
+
+/* ------------------------------------------------------------ call stack --
+ * "How did I get here?" ABI v12.
+ *
+ * A shadow stack maintained per instruction: a CALL is recognised by SP falling
+ * with a return address landing on top, a RET by SP climbing back past a frame's
+ * entry. Exact, unlike walking the real stack afterwards -- the T900 keeps no
+ * frame pointer, so a stack word that looks like a code address is indistinguish-
+ * able from an actual return address once the moment has passed.
+ *
+ * Off by default; enable only while a debugger is attached. Frame 0 is the
+ * OUTERMOST caller, so the innermost is at index (depth - 1). */
+typedef struct {
+    uint32_t caller_pc;   /* address of the CALL instruction */
+    uint32_t entry_pc;    /* the routine it entered */
+    uint32_t return_pc;   /* where it will return to */
+    uint32_t entry_sp;    /* SP before the call pushed anything */
+} ngpc_frame_t;
+
+/* ------------------------------------------------------------ event log --
+ * WHEN in the frame did that happen? ABI v12.
+ *
+ * The write log says a register changed and who changed it; it cannot say at which
+ * SCANLINE. For raster work -- a mid-frame scroll split, an HBlank HUD, a palette
+ * swap on a given line -- the timing IS the behaviour, and it was invisible.
+ *
+ * Every event carries its exact raster position, so a debugger can plot a frame as
+ * a scanline x cycle grid. Armed over an address window (typically the video
+ * registers at 0x8000..0x83FF); interrupt deliveries are logged whenever the window
+ * is armed at all, with `addr` holding the vector index. Pass lo > hi to disarm. */
+#define NGPC_EVENT_WRITE 0
+#define NGPC_EVENT_IRQ   1
+
+typedef struct {
+    uint32_t pc;
+    uint32_t addr;      /* the address written, or the vector index for an IRQ */
+    uint16_t scanline;
+    uint16_t cycle;     /* cycles elapsed into that scanline (0..514) */
+    uint8_t  value;
+    uint8_t  type;      /* NGPC_EVENT_* */
+} ngpc_event_t;
+
+NGPC_API void     ngpc_set_event_log(ngpc_t*, uint32_t lo, uint32_t hi);
+NGPC_API uint64_t ngpc_event_log_count(ngpc_t*);
+NGPC_API uint32_t ngpc_get_event_log(ngpc_t*, ngpc_event_t* out, uint32_t n);
+
+/* -------------------------------------------------------------- hygiene --
+ * What a ROM does that hardware tolerates but that is almost always a bug. ABI v13.
+ *
+ * The core models the machine closely enough to JUDGE a cartridge, not just run it.
+ * Two findings need its cooperation:
+ *
+ *   UNINITIALISED READS -- work RAM comes up holding whatever the previous game
+ *   left. A variable that is read before it is ever written is reading noise: fine
+ *   on a developer's emulator with zeroed RAM, wrong on a console that has been
+ *   playing something else.
+ *
+ *   LOST WRITES -- a store to unmapped space is discarded by the bus and the program
+ *   never learns. (Cart-window writes are NOT counted: those are flash commands.)
+ *
+ * Off by default. Enabling resets both. */
+typedef struct {
+    uint32_t pc;      /* the code that did it */
+    uint32_t addr;
+} ngpc_hygiene_t;
+
+/* ------------------------------------------------------------- coverage --
+ * How much of the cartridge actually executed. ABI v13.
+ *
+ * One bit per byte of the 0x200000..0x3FFFFF window, set at the address of every
+ * instruction retired. Turns "the analyzer looked at this ROM" from an unfalsifiable
+ * claim into a number -- and makes it possible to tell whether driving the input
+ * during an analysis reaches more code or merely takes longer. */
+NGPC_API void     ngpc_set_coverage(ngpc_t*, int enabled);
+NGPC_API uint32_t ngpc_coverage_hits(ngpc_t*);      /* distinct addresses executed */
+/* Copies the raw bitmap (kCovSpan/8 bytes). Pass n=0 to query the size. */
+NGPC_API uint32_t ngpc_get_coverage(ngpc_t*, uint8_t* out, uint32_t n);
+
+NGPC_API void     ngpc_set_hygiene(ngpc_t*, int enabled);
+NGPC_API uint64_t ngpc_uninit_reads(ngpc_t*);
+NGPC_API uint64_t ngpc_lost_writes(ngpc_t*);
+/* Up to `n` distinct early samples of each, so a report can name the code. */
+NGPC_API uint32_t ngpc_get_uninit_reads(ngpc_t*, ngpc_hygiene_t* out, uint32_t n);
+NGPC_API uint32_t ngpc_get_lost_writes(ngpc_t*, ngpc_hygiene_t* out, uint32_t n);
+
+NGPC_API void     ngpc_set_callstack(ngpc_t*, int enabled);
+NGPC_API uint32_t ngpc_callstack_depth(ngpc_t*);
+/* Frames dropped because the shadow stack was full -- non-zero means the view is
+ * truncated, not wrong. */
+NGPC_API uint64_t ngpc_callstack_overflow(ngpc_t*);
+NGPC_API uint32_t ngpc_get_callstack(ngpc_t*, ngpc_frame_t* out, uint32_t n);
 
 /* ------------------------------------------------------------- debugging -- */
 NGPC_API int ngpc_set_breakpoints(ngpc_t*, const uint32_t* pcs, uint32_t n);

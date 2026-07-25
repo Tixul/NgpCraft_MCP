@@ -35,10 +35,12 @@ in both directions:
 
 from __future__ import annotations
 
+import ctypes
 import sys
+import time
 from pathlib import Path
 
-from core import flash_file, native
+from core import flash_file, native, rom_loader
 from core.frame_timing import CYCLES_PER_SCANLINE, SCANLINES_PER_FRAME
 from core.renderer import RenderedFrame, render_frame
 
@@ -74,6 +76,125 @@ def default_save_path(rom_path: Path) -> Path:
 # slot. This is the coin-cell-backed RAM the BIOS keeps its settings in.
 SYSTEM_RAM_PATH = SAVE_DIR / "system.ram"
 
+# ⚡ AND THE OTHER HALF OF THE SAME COIN CELL: THE CLOCK.
+#
+# One CR2032 keeps the RAM above alive AND runs the calendar IC. On hardware they are a
+# single battery domain -- a console that still knows your language necessarily still
+# knows the date. We were persisting only the RAM half, so every launch re-seeded the
+# clock to the core's hardcoded 2024-01-01 while the language survived: half a coin cell.
+#
+# It went unnoticed because the clock is machine state, NOT memory, so it never rode
+# along in the RAM dump the way settings do (it is unreachable through `read`).
+#
+# MEASURED against the retail BIOS: on a CONFIGURED console the BIOS does not write the
+# chip even once -- it trusts it and will never correct it -- so a wrong clock stays
+# wrong forever. On a BLANK cell it rewrites 1998-01-01 itself, which is the authentic
+# dead-battery behaviour and is left alone.
+#
+# A separate file rather than bytes appended to system.ram: that file is a raw 12 KiB RAM
+# image every other tool reads positionally, and growing it would break that contract.
+SYSTEM_RTC_PATH = SAVE_DIR / "system.rtc"
+_RTC_BLOB_SIZE = ctypes.sizeof(native.RtcState)
+
+# ---------------------------------------------------------------- clock modes
+# What the console's clock should do while the emulator is CLOSED. There is no single
+# right answer, which is why it is a setting rather than a decision baked in here.
+#
+# HARDWARE  what a real console does: the coin cell keeps the calendar running, so shut
+#           it for three days and it comes back three days later. The default.
+# HOST      the clock is set from the PC's own clock at every launch. Always right, never
+#           drifts, and ignores whatever the player set on the BIOS date screen.
+# PAUSED    time stops with the emulator and resumes exactly where it left off. Not what
+#           hardware does, but it is REPRODUCIBLE -- the one to pick for debugging, or to
+#           keep a game's in-world clock where you left it.
+CLOCK_HARDWARE = "hardware"
+CLOCK_HOST = "host"
+CLOCK_PAUSED = "paused"
+CLOCK_MODES = (CLOCK_HARDWARE, CLOCK_HOST, CLOCK_PAUSED)
+
+# A guard on the catch-up, not a policy: if the saved stamp is nonsense (a PC clock that
+# jumped, a file copied from another machine) we would otherwise wind the chip forward one
+# second at a time for an unbounded number of steps. Ten years is far past any real gap.
+_MAX_CATCHUP_SECONDS = 10 * 365 * 24 * 3600
+
+
+def _to_bcd(value: int) -> int:
+    return (((value // 10) & 0x0F) << 4) | (value % 10)
+
+
+def host_clock_state() -> "native.RtcState":
+    """The PC's wall clock, in the packed BCD the chip's registers use."""
+    t = time.localtime()
+    st = native.RtcState()
+    st.enable = 1
+    st.year = _to_bcd((t.tm_year - 2000) % 100)
+    st.month = _to_bcd(t.tm_mon)          # tm_mon is already 1-12
+    st.day = _to_bcd(t.tm_mday)
+    st.hour = _to_bcd(t.tm_hour)
+    st.minute = _to_bcd(t.tm_min)
+    st.second = _to_bcd(min(t.tm_sec, 59))   # a leap second would not be valid BCD
+    st.weekday = (t.tm_wday + 1) % 7      # Python Mon=0..Sun=6 -> the chip's Sun=0..Sat=6
+    st.counter = 0
+    return st
+
+
+def read_rtc_file(path: Path) -> "tuple[native.RtcState, int | None] | None":
+    """The clock as the console was last switched off, plus the PC timestamp of that
+    moment (None for a file written before stamps existed, or if it is unusable).
+
+    Returns None when there is nothing saved -- a brand-new console -- in which case the
+    core's own seed stands, exactly as a fresh coin cell would.
+    """
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return None
+    # A file is the struct, optionally followed by the 8-byte stamp. Older files were
+    # written before the struct grew its alarm fields and before stamps existed; they are
+    # short, and the fields they are missing are exactly the ones that default to zero
+    # (no alarm armed, no known stamp), so a short read is safe to accept.
+    if len(blob) in (_RTC_BLOB_SIZE, _RTC_BLOB_SIZE + 8) or len(blob) < _RTC_BLOB_SIZE:
+        padded = blob[:_RTC_BLOB_SIZE].ljust(_RTC_BLOB_SIZE, b"\x00")
+        state = native.RtcState.from_buffer_copy(padded)
+        stamp = (int.from_bytes(blob[_RTC_BLOB_SIZE:], "little", signed=True)
+                 if len(blob) == _RTC_BLOB_SIZE + 8 else None)
+        return state, stamp
+    return None
+
+
+def write_rtc_file(path: Path, state: "native.RtcState") -> None:
+    """Save the clock, stamped with the PC's time -- the stamp is what lets the next
+    launch work out how long the console was switched off."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(bytes(state) + int(time.time()).to_bytes(8, "little", signed=True))
+    tmp.replace(path)
+
+
+def apply_saved_clock(machine, path: Path, mode: str) -> None:
+    """Put the console's clock back, per the chosen mode. One place, so the game path,
+    the BIOS-only path and any reboot all behave identically."""
+    if mode == CLOCK_HOST:
+        machine.set_rtc(host_clock_state())
+        return
+
+    saved = read_rtc_file(path)
+    if saved is None:
+        # Nothing saved yet. In hardware mode start from the PC's clock, so a console
+        # being used for the first time is simply right rather than starting in 2024.
+        if mode == CLOCK_HARDWARE:
+            machine.set_rtc(host_clock_state())
+        return
+
+    state, saved_at = saved
+    machine.set_rtc(state)
+    if mode != CLOCK_HARDWARE or saved_at is None:
+        return
+    elapsed = int(time.time()) - saved_at
+    if 0 < elapsed <= _MAX_CATCHUP_SECONDS:
+        machine.rtc_advance(elapsed)          # the coin cell kept running while it was off
+
+
 # INT0 is the POWER BUTTON (pass 235). The BIOS boots, arms it, and sleeps.
 INT0_POWER = 8
 
@@ -103,6 +224,8 @@ class NativeSession:
         self,
         rom_path: str | Path,
         *,
+        rom_bytes: bytes | None = None,
+        from_archive: bool = False,
         bios_path: str | Path | None = None,
         save_path: str | Path | None = None,
         autosave: bool = True,
@@ -110,13 +233,29 @@ class NativeSession:
         sidecar: bool = False,
         flash_size: int = 0,
         real_bios: bool = False,
+        clock_mode: str = CLOCK_HARDWARE,
+        k1ge_console: bool = False,
     ):
         if not native.available():
             raise RuntimeError(
                 "the native core is not built. `cmake --build cpp/build` first."
             )
         self.rom_path = Path(rom_path)
-        self._rom = self.rom_path.read_bytes()
+        # The ROM can arrive as a bare .ngc/.ngp, or packed in a .zip/.7z. The caller
+        # may pass the already-unpacked bytes (the shell does, so it can size the flash
+        # chip first); otherwise we unpack here, so every entry point -- thumbnails,
+        # CLI, tests -- gets archive support for free.
+        if rom_bytes is None:
+            loaded = rom_loader.load(self.rom_path)
+            self._rom = loaded.data
+            from_archive = loaded.from_archive
+        else:
+            self._rom = bytes(rom_bytes)
+        # An archive is read-only: a game's flash save can never be written back into
+        # the .zip/.7z, so it goes to the standard sidecar .flash instead.
+        self.from_archive = from_archive
+        if from_archive:
+            save_to_rom = False
         self._orig_rom = self._rom          # pristine baseline for a full sidecar diff
         bios = Path(bios_path).read_bytes() if bios_path else None
         self.machine = native.NativeMachine(self._rom, bios=bios)
@@ -130,6 +269,9 @@ class NativeSession:
         # The console's 12 KiB of RAM is kept alive by a coin cell -- that is where the
         # BIOS remembers your language and the date -- so it is handed over BEFORE the
         # reset, which consults the marker inside it to tell a first boot from a resume.
+        # Which machine a monochrome cartridge thinks it is in. Set BEFORE either reset
+        # path below, because the reset is what stamps 0x6F91.
+        self.machine.set_k1ge_console(k1ge_console)
         self.real_bios = real_bios and bios is not None
         self.ram_path = SYSTEM_RAM_PATH
         self._power_pressed = False
@@ -139,13 +281,44 @@ class NativeSession:
         # BIOS->cart hand-off can boot the game from a clean slate yet still persist the
         # real config. `None` = a blank (first-boot) console.
         self.system_ram_baseline: bytes | None = None
+        # The clock rides the same coin cell (see SYSTEM_RTC_PATH). Unlike the RAM
+        # baseline it is restored in BOTH modes: work RAM in hand-off mode belongs to the
+        # game and must not be written back as console settings, but the clock is never
+        # the game's scratch -- it is the console's, and it should keep running across
+        # launches the way the hardware's does.
+        self.rtc_path = SYSTEM_RTC_PATH
+        self.clock_mode = clock_mode if clock_mode in CLOCK_MODES else CLOCK_HARDWARE
+        # The console's own settings -- language, date, colour theme -- live in the coin
+        # cell, and the player configured them once through Boot BIOS. Load that cell here
+        # for BOTH boot modes: the fast hand-off is meant to skip the BIOS INTRO, not the
+        # player's settings. (Only the WRITE-BACK differs -- see commit_system_ram: a game's
+        # work RAM must never be persisted back as console settings.)
+        if self.ram_path.exists():
+            self.system_ram_baseline = self.ram_path.read_bytes()
+
         if self.real_bios:
-            if self.ram_path.exists():
-                self.system_ram_baseline = self.ram_path.read_bytes()
+            if self.system_ram_baseline is not None:
                 self.machine.set_battery_ram(self.system_ram_baseline)
+            # BEFORE the reset, like the RAM: the BIOS reads the chip during its own boot.
+            # With a configured cell it leaves what it finds; with a blank one it resets
+            # the date to 1998-01-01 itself, which is the real dead-battery behaviour.
+            apply_saved_clock(self.machine, self.rtc_path, self.clock_mode)
             self.machine.reset(real_bios=True)
         else:
             self.machine.reset(bios_handoff=True)
+            # ⚡ AFTER the reset here, and that order is load-bearing. The hand-off reset
+            # BOOTS THE REAL BIOS internally to capture the character RAM it leaves behind,
+            # and it does so on a blank coin cell -- so the BIOS takes that boot's
+            # dead-battery path and stamps 1998-01-01 over the chip. Restoring before the
+            # reset would hand the player's clock straight to that warm-up to be wiped.
+            apply_saved_clock(self.machine, self.rtc_path, self.clock_mode)
+            # The player's language/date, laid back over the hand-off for the same reason as
+            # the clock above: the fast boot skips the intro, not the settings. The warm-up
+            # ran on a blank cell (its captured char RAM stays deterministic); here we put
+            # the configured BIOS system page back so a dual-language cart (Match of the
+            # Millennium) reads the language the console was set to, not the power-on default.
+            self._restore_bios_settings_page()
+            self._apply_bios_colour_theme()
 
         # Present the cart as a bigger flash chip than the (under-filled) ROM, so a homebrew
         # that saves in the chip's top block has that block. The working image becomes the
@@ -178,7 +351,7 @@ class NativeSession:
         # THE SAVE. The cartridge is the save -- a game erases a block of its own ROM
         # and programs its slot back in -- so restoring one means putting those bytes
         # back into the cart image, which is what taking the cartridge out and putting
-        # it back in does. `.flash` is NeoPop's format, and Mednafen's, and RACE's.
+        # it back in does. `.flash` is the format the scene already shares.
         #
         # ⚠️ Saving needs the BIOS: a game reaches the flash through `swi 1`, and with
         # no BIOS image that vector reads back zero. No BIOS, no saves -- exactly as
@@ -228,6 +401,21 @@ class NativeSession:
         tmp = self.ram_path.with_suffix(".tmp")
         tmp.write_bytes(self.system_ram_baseline)
         tmp.replace(self.ram_path)
+        return True
+
+    def commit_rtc(self) -> bool:
+        """The clock, as the console is switched off. Its other half -- the settings --
+        goes out through `commit_system_ram`.
+
+        Saved in BOTH modes, unlike the RAM baseline: that one is skipped in hand-off mode
+        because work RAM there is the GAME's and writing it back would invent settings.
+        The clock is never the game's -- no cartridge writes the calendar chip -- so what
+        is in it is always the console's own time, and it is always the right thing to keep.
+        """
+        try:
+            write_rtc_file(self.rtc_path, self.machine.rtc())
+        except OSError:
+            return False
         return True
 
     def commit_save(self) -> bool:
@@ -316,12 +504,19 @@ class NativeSession:
         cartridge = [(base, self.machine.read(base, size))
                      for base, size in self._cart_windows()]
         coin_cell = self.machine.battery_ram() if self.real_bios else None
+        # The clock is coin-cell state too, and rebooting the console does not reset the
+        # date any more than it forgets your language. It has to be carried across by
+        # hand: a hand-off reset boots the BIOS internally on a blank cell and that boot
+        # stamps 1998-01-01 over the chip (see __init__).
+        clock = self.machine.rtc()
 
         if self.real_bios:
             self.machine.set_battery_ram(coin_cell)   # consulted BY the reset, so first
+            self.machine.set_rtc(clock)
             self.machine.reset(real_bios=True)
         else:
             self.machine.reset(bios_handoff=True)
+            self.machine.set_rtc(clock)               # after: the warm-up would wipe it
 
         for base, data in cartridge:
             self.machine.flash_restore(base, data)
@@ -350,7 +545,7 @@ class NativeSession:
         # The BIOS boots, arms INT0, and sleeps. INT0 is the POWER BUTTON, and until it
         # is pressed the machine is behaving perfectly -- it is off. We press it once, on
         # the player's behalf, because they already asked for the console to come on by
-        # launching the emulator. (ares does the same thing, for the same reason.)
+        # launching the emulator.
         if (self.real_bios and not self._power_pressed
                 and summary.stop_status == native.STATUS_HALTED):
             self.machine.raise_irq(INT0_POWER)
@@ -385,12 +580,73 @@ class NativeSession:
         """
         return render_frame(self.video_memory(), self.machine.raster_log())
 
+    # The compat palette lives at 0x8380..0x83FF and, for a MONOCHROME cartridge, holds
+    # the COLOUR THEME the player picked in the BIOS's own setup screens -- the NGPC's
+    # Game Boy Color trick. The BIOS keeps its master copy in battery-backed RAM at
+    # 0x6DD8 and blits it across when a dirty flag is set (its routine at 0xFF4FDF:
+    # `lda XIY,(0x6DD8) / lda XIX,(0x8380) / ld BC,0x40 / ldirw`).
+    #
+    # In hand-off mode we never run that code AND never restore the coin cell -- the
+    # game deliberately boots on a zeroed slate so the picture is deterministic. So the
+    # theme has to be fetched from the saved cell by hand, and ONLY the theme: restoring
+    # the whole 12 KiB would put the BIOS's work RAM back under the game and undo that
+    # determinism. Without this the core's built-in grey ramp stands and the player's
+    # choice -- a green ramp, say -- silently does nothing.
+    _THEME_ADDR, _THEME_LEN = 0x006DD8, 0x80
+
+    def _apply_bios_colour_theme(self) -> None:
+        try:
+            cell = self.ram_path.read_bytes()
+        except OSError:
+            return
+        off = self._THEME_ADDR - native.RAM_START
+        theme = cell[off:off + self._THEME_LEN]
+        # A console that never completed the BIOS setup leaves this all zero, which as a
+        # palette is an all-black screen -- keep the core's grey ramp for that case.
+        if len(theme) == self._THEME_LEN and any(theme):
+            self.machine.write(0x008380, theme)
+
+    # The BIOS SYSTEM PAGE (0x6C00-0x6FFF) holds the console's own settings: the LANGUAGE
+    # and date the player set, plus BIOS scratch. Sibling to _apply_bios_colour_theme, which
+    # cherry-picks the theme the same way -- except a game reads the language byte straight
+    # from this page, so we restore the whole page rather than blit one field. In hand-off
+    # mode nothing else puts the coin cell back, so without this a game reads whatever the
+    # power-on default left, and a dual-language SNK cart boots Japanese. Laid back on top of
+    # the hand-off EXCEPT the bytes the hand-off itself owns for the inserted cartridge:
+    #   0x6C58/0x6C59  the flash card-type the BIOS learnt (0 = "no cart" -> the save fails)
+    #   0x6F91/0x6F92  the colour machine-type reset stamps per the console's own mode
+    #   0x6FB8-0x6FFF  the user interrupt vector table the hand-off seeds
+    # Game work RAM (0x4000-0x6BFF) is untouched, so the boot stays as deterministic as it
+    # was: only the OS settings page is restored.
+    _SETTINGS_PAGE = (0x006C00, 0x007000)
+    _SETTINGS_SKIP = ((0x006C58, 0x006C5A), (0x006F91, 0x006F93), (0x006FB8, 0x007000))
+
+    def _restore_bios_settings_page(self) -> None:
+        base = self.system_ram_baseline
+        if base is None:
+            return
+        page_start, page_end = self._SETTINGS_PAGE
+        addr = page_start
+        for skip_start, skip_end in self._SETTINGS_SKIP:
+            if addr < skip_start:
+                self._write_from_baseline(base, addr, skip_start)
+            addr = max(addr, skip_end)
+        if addr < page_end:
+            self._write_from_baseline(base, addr, page_end)
+
+    def _write_from_baseline(self, base: bytes, start: int, end: int) -> None:
+        """Copy [start, end) of the saved coin cell into live RAM (addresses, not offsets)."""
+        chunk = base[start - native.RAM_START:end - native.RAM_START]
+        if chunk:
+            self.machine.write(start, chunk)
+
     def close(self) -> None:
         # The save is committed BEFORE the machine goes away, and a failure to write it
         # is not something to swallow on the way out of a `with` block.
         if self.autosave:
             self.commit_save()
             self.commit_system_ram()
+            self.commit_rtc()
         self.machine.close()
 
     def __enter__(self) -> "NativeSession":

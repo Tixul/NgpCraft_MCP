@@ -1,234 +1,227 @@
-# Savestate v2
+# Savestate v5
 
 Purpose:
 - define the on-disk format for an emulator machine-state snapshot
-- close the M0 gate item `savestate v1` that the ROADMAP flags as
-  `a faire`
-- v2 (2026-05-20) extends v1 additively with `iff_level`, `rfp` and
-  flag `nf` to match the modeled SR shape from `CPU_STATE.md`. Per
-  §6 the loader rejects unknown versions deliberately; v1 files are
-  considered legacy artefacts and are not auto-upgraded.
-- make the snapshot distinct from the cartridge-persistent in-game save
-  defined in `SAVE_POLICY.md`
-- keep the format honest about what the current emulator actually models;
-  do not invent fields for subsystems that do not yet exist
+- keep the snapshot clearly distinct from cartridge-persistent saves
+- document only the state the emulator actually models
+- lock a format that can survive the future C++ core rewrite
 
 Current source references:
-- `../SAVE_POLICY.md` (section 2: savestate vs. persistent save distinction)
-- `../HARDWARE_COMPAT_POLICY.md` (§4.1 reference vs. diagnostic separation)
+- `../SAVE_POLICY.md`
+- `../HARDWARE_COMPAT_POLICY.md`
 - `CPU_STATE.md`
 - `RESET_STATE.md`
 - `EXECUTE.md`
 - `ADDRESS_SPACE.md`
 
-Current scope:
-- a savestate is a point-in-time snapshot of the reference emulator state
-- it is not a cartridge save: ROM-side flash persistence is covered
-  separately by `SAVE_POLICY.md`
-- v1 captures only the subsystems that the current emulator prototype
-  actually models
-- v1 is designed for the Python prototype; it must survive the eventual
-  C++ core rewrite without a format break
+Current format version:
+- `2026-07-01.v5`
+
+Backward-compat versions currently accepted by the loader:
+- `2026-05-25.v4`
+- `2026-05-20.v3`
+- `2026-05-20.v2`
+
+`v5` adds `cpu.control_registers` (the modeled TLCS-900/H control-register
+file subset).
 
 ## 1. Format envelope
 
-Savestate files are UTF-8 JSON with the following root object:
+Savestates are UTF-8 JSON with the following root shape:
 
-```
+```json
 {
   "format": "ngpc-emu-savestate",
-  "format_version": "2026-05-20.v2",
+  "format_version": "2026-07-01.v5",
   "created_at_utc": "<ISO-8601 timestamp>",
   "emulator": {
     "project": "NgpCraft_emulator",
     "prototype": "python",
-    "commit": "<short SHA when known, null otherwise>"
+    "commit": null
   },
-  "rom": { ... },
-  "cpu": { ... },
-  "memory": { ... },
-  "quirks": { ... },
-  "note": "<free-form operator note, optional>"
+  "rom": { "...": "..." },
+  "cpu": { "...": "..." },
+  "memory": { "...": "..." },
+  "quirks": { "...": "..." },
+  "frame_state": { "...": "..." },
+  "irq_state": { "...": "..." },
+  "note": "<free-form operator note or null>"
 }
 ```
 
-Mandatory top-level fields: `format`, `format_version`, `rom`, `cpu`,
-`memory`.
+Mandatory top-level fields:
+- `format`
+- `format_version`
+- `rom`
+- `cpu`
+- `memory`
 
 ## 2. ROM identity
 
-```
+```json
 "rom": {
   "path_when_saved": "<absolute path, informational only>",
-  "file_size": <int>,
-  "sha256": "<64-char hex digest of the ROM file bytes>",
-  "header_title": "<title string as decoded by core/rom.py>",
-  "header_entry_point": <int>,
-  "header_mode_raw": <int>
+  "file_size": 123456,
+  "sha256": "<64-char hex digest>",
+  "header_title": "<decoded cart title>",
+  "header_entry_point": 2097216,
+  "header_mode_raw": 16
 }
 ```
 
-A loader MUST verify that a ROM is currently available whose sha256 hash
-matches `rom.sha256`. Path is informational only; matching is by content
-hash, never by filename.
-
-Versioning promise:
-- a v1 savestate always carries the ROM hash
-- loaders refuse to load a savestate against a mismatching ROM
-- this is the minimum correctness guardrail before anything else
+Rules:
+- matching is by `sha256`, never by filename
+- loaders must reject a savestate when an explicitly supplied ROM hash does not match
+- `path_when_saved` is informational only
 
 ## 3. CPU state
 
-```
+```json
 "cpu": {
-  "pc": <int>,
-  "register_bank": "<bank id or null>",
-  "sr_raw": <int or null>,
+  "pc": 2097216,
+  "register_bank": null,
+  "sr_raw": null,
   "flags": {
-    "sf": <bool or null>,
-    "zf": <bool or null>,
-    "vf": <bool or null>,
-    "hf": <bool or null>,
-    "cf": <bool or null>,
-    "nf": <bool or null>
+    "sf": null,
+    "zf": null,
+    "vf": null,
+    "hf": null,
+    "cf": null,
+    "nf": null
+  },
+  "alt_flags": {
+    "sf": null,
+    "zf": null,
+    "vf": null,
+    "hf": null,
+    "cf": null,
+    "nf": null
   },
   "registers": {
-    "xwa": <int or null>,
-    "xbc": <int or null>,
-    "xde": <int or null>,
-    "xhl": <int or null>,
-    "xix": <int or null>,
-    "xiy": <int or null>,
-    "xiz": <int or null>,
-    "xsp": <int or null>
+    "xwa": null,
+    "xbc": null,
+    "xde": null,
+    "xhl": null,
+    "xix": null,
+    "xiy": null,
+    "xiz": null,
+    "xsp": null
   },
-  "iff_enabled": <bool or null>,
-  "iff_level": <int or null>,
-  "rfp": <int or null>
+  "control_registers": {
+    "dmas": [null, null, null, null],
+    "dmad": [null, null, null, null],
+    "dmac": [null, null, null, null],
+    "dmam": [null, null, null, null],
+    "intnest": null
+  },
+  "iff_enabled": null,
+  "iff_level": null,
+  "rfp": null,
+  "register_banks": null
 }
 ```
 
-Same shape as the current `NgpcCpuState` / `StatusFlags` /
-`GeneralRegisters32` containers exposed by `core/cpu.py`:
-- unknown fields are saved as `null`
-- a loader MUST preserve the unknown/known distinction instead of
-  filling nulls with zero
-- `iff_enabled` is kept as a derived legacy convenience; `iff_level`
-  (0..7, SR bits 12..14) is canonical, and `iff_enabled` is True iff
-  `iff_level < 7`
-- `rfp` is the Register File Pointer (0..3, SR bits 8..10)
-- `nf` is the Add/Subtract flag (SR bit 1)
-
-`register_bank` is kept nullable; the canonical bank index is `rfp`.
+Rules:
+- same logical shape as `NgpcCpuState` / `StatusFlags` / `GeneralRegisters32`
+- unknown fields remain `null`; the loader must not silently replace them with zero
+- `iff_level` is canonical; `iff_enabled` is a legacy convenience mirror
+- `rfp` is the Register File Pointer
+- `flags` is the visible TLCS-900/H flag set `F`
+- `alt_flags` is the alternate TLCS-900/H flag set `F'`
+- `control_registers` mirrors the currently modeled TLCS-900/H control-register file subset:
+  - `dmas[0..3]` / `dmad[0..3]` are 32-bit DMA source/destination registers
+  - `dmac[0..3]` are 16-bit DMA count/control registers
+  - `dmam[0..3]` are 8-bit DMA mode registers
+  - `intnest` is the 16-bit interrupt nesting counter
+- when loading older `v3` / `v2` savestates that do not carry `alt_flags`, the loader restores all six shadow flags as unknown
+- when loading older `v4` / `v3` / `v2` savestates that do not carry `control_registers`, the loader restores the whole control-register file as unknown
+- `register_banks` is optional and, when present, is a 4-entry list of 16 byte slots per bank (`0..255` or `null`)
 
 ## 4. Memory
 
-```
+```json
 "memory": {
   "writable_overlay": {
-    "0x004000": <int>,
-    "0x004001": <int>,
-    ...
+    "0x004000": 170,
+    "0x004001": 187
   }
 }
 ```
 
-- the overlay is the writable runtime overlay produced by the current
-  executor (`after_memory` in `ExecutionResult`)
-- keys are lowercase `0xNNNNNN` hex strings padded to 6 digits
+Rules:
+- the overlay is the runtime writable overlay produced by the executor
+- keys are padded hexadecimal addresses
 - values are single bytes `0..255`
-- the overlay only contains cells that have been written during the
-  session; unwritten cells stay out of the savestate
+- only cells actually written during the session are stored
 
-Not captured in v1:
-- K2GE register RAM snapshot beyond what the overlay contains
-- VRAM, OAM, palette
-- BIOS workspace beyond what is already modeled by
-  `core/memory.py._build_builtin_readable_bytes()`
-- shared Z80 RAM beyond the overlay
+## 5. Quirk snapshot
 
-These subsystems are intentionally excluded because the emulator does
-not model them yet. Pretending to save them would violate the
-reference-hardware-faithful rule in `HARDWARE_COMPAT_POLICY.md §2`.
-
-## 5. Quirk database snapshot
-
-```
+```json
 "quirks": {
   "database_version": "2026-04-22.v3",
-  "matched_on_last_step": { ... } or null
+  "matched_on_last_step": null
 }
 ```
 
-- `database_version` records which `core/quirks_db.json` was active
-- `matched_on_last_step` echoes the `matched_quirk` payload from the
-  last executed instruction when one was active, so diagnostic tools
-  can inspect why execution stopped without replaying the full trace
+Rules:
+- records which `core/quirks_db.json` version was active
+- optionally stores the last matched quirk payload for diagnostics
 
-## 6. Versioning rule
+## 6. Timing and IRQ state
 
-- the first shipped version was `2026-04-22.v1`
-- current version is `2026-05-20.v2` — adds `iff_level`, `rfp`, `flags.nf`
-- future schema changes bump the `format_version` string
-- loaders MUST reject a savestate whose `format` is not
-  `ngpc-emu-savestate`
-- loaders MUST reject a `format_version` they do not recognize; the
-  project deliberately does not define implicit upgrade paths at this
-  stage
-- when the Python prototype migrates to the C++ core, the format must
-  be copied byte-for-byte before any field is added or removed; the
-  rewrite itself does not get to break the format
+```json
+"frame_state": {
+  "scanline": 0,
+  "frame_count": 0
+},
+"irq_state": {
+  "pending_mask": 0
+}
+```
 
-## 7. Proposed CLI (not implemented in v1 yet)
+Rules:
+- `frame_state` carries the modeled K2GE timing frontier used by the current timing pipeline
+- `irq_state.pending_mask` carries the currently pending IRQ bits in the minimal IRQ model
+- when loading older `v2` savestates that omit these sections, the loader restores documented reset values
 
-- `python ngpc_emu.py savestate save <rom> <state.json> [--from <source>]`
-  - `--from bootstrap` (default): writes a savestate derived from the
-    current reset-info bootstrap
-  - `--from run-until-exec <target_pc>` and related forms: writes a
-    savestate derived from the final state of one run
+## 7. Versioning rule
+
+Version history:
+- `2026-04-22.v1` - initial shipped format
+- `2026-05-20.v2` - adds `iff_level`, `rfp`, `flags.nf`
+- `2026-05-20.v3` - adds `frame_state`
+- `2026-05-25.v4` - adds `cpu.alt_flags`
+- `2026-07-01.v5` - adds `cpu.control_registers`
+
+Rules:
+- loaders must reject any payload whose `format` is not `ngpc-emu-savestate`
+- loaders must reject unknown `format_version` values
+- bounded backward compatibility is explicit, not implicit:
+  - current implementation accepts `v5`, `v4`, `v3`, and `v2`
+  - anything else is rejected
+- moving from the Python prototype to a future C++ core does not by itself justify a format break
+
+## 8. CLI status
+
+This format is already used by the implemented CLI:
+- `python ngpc_emu.py savestate save <rom> <state.json>`
 - `python ngpc_emu.py savestate load <state.json>`
-  - prints a summary of the loaded machine state
-  - rejects mismatched ROM, unknown format, or unknown version
 - `python ngpc_emu.py run-until-exec <rom> <target_pc> --seed-from <state.json>`
-  - seeds CPU state and memory overlay from a savestate instead of
-    from manual `--seed-reg` / `--seed-xsp` flags
+- `step-exec`, `run-steps`, `trace-exec`, named checkpoints, and named sessions all reuse the same savestate payload shape
 
-These commands are deliberately left out of v1 implementation; this spec
-only locks the format so that the implementation session can focus on
-wiring without re-opening format questions.
+## 9. Relation to other policies
 
-## 8. Relation to other policies
+- `SAVE_POLICY.md` governs cartridge-persistent saves; a savestate is not a cartridge save
+- `HARDWARE_COMPAT_POLICY.md` still applies: a savestate must not paper over behavior the reference emulator would honestly refuse
+- runtime traces and event logs are separate formats; a savestate is a point-in-time snapshot, not a history
 
-- `SAVE_POLICY.md` describes cartridge-persistent save handling; a
-  savestate is NOT a substitute for it and a savestate loader MUST NOT
-  overwrite a cartridge save file
-- `HARDWARE_COMPAT_POLICY.md` applies: a savestate must never be used
-  to paper over an execution that real hardware would refuse
-- `TRACE.md` and `TRACE_EXEC.md` cover runtime traces; a savestate is a
-  single point, not a history, and must not be confused with a trace
+## 10. Not modeled yet
 
-## 9. Not modeled yet
-
-- interrupt latency state, IRQ priority scheduler snapshot
+These remain intentionally out of scope until the corresponding subsystem is first-class in the emulator:
+- cycle-exact interrupt latency and scheduler internals beyond `pending_mask`
 - DMA channel progress
-- K2GE scanline counter, VBlank state
-- audio sample generator state
-- timer reload values
-- BIOS scratchpad that the emulator does not touch
-- any information required for a cycle-exact reload that the emulator
-  does not yet track
-
-These gaps are expected and deliberate. Each one should graduate into
-the savestate format only after the corresponding subsystem becomes a
-first-class citizen of the reference emulator.
-
-## 10. Next extensions (likely v2+)
-
-- add `event_log` cross-reference once `EVENT_LOG.md` lands
-- add `cpu.scanline_cycle`, `cpu.frame_index` when the timing model
-  exists
-- add `dma.channels` when DMA is emulated
-- add `audio` block when the PSG / noise generator is emulated
-- add `video.vblank_state` and related when K2GE timing is modeled
-- consider a compact binary representation once JSON becomes the main
-  bottleneck of headless regression workflows
+- full raster/video internals beyond `frame_state`
+- audio generator state
+- timer reload internals
+- BIOS scratchpad state the emulator does not yet model
+- any additional data required for a cycle-exact reload

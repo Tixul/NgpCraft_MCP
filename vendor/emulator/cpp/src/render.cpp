@@ -136,10 +136,9 @@ void Machine::render_scanline(uint32_t line) {
      *    (4-6), and this core enforced that. But real games disagree: Ogre
      *    Battle Gaiden's intro writes a blue into 0x83E0[0], sets BGC = 0x00
      *    (D7=0), and expects a blue sky -- a black one would be a broken intro
-     *    on the silicon it shipped on. NeoPop's author hit the same wall and
-     *    left the note in the source: "Background colour Enabled? HACK: 01 AUG
-     *    2002 - Always on!", commenting out the very `(bgc & 0xC0) == 0x80`
-     *    check we had. So the backdrop is the palette entry, unconditionally;
+     *    on the silicon it shipped on. The game is the authority over the manual
+     *    here: the `(bgc & 0xC0) == 0x80` gate this core used to apply has to go.
+     *    So the backdrop is the palette entry, unconditionally;
      *    a game that wants black simply leaves 0x83E0[index] black (the empty-
      *    memory cold start still resolves to 0, i.e. black). The enable bits do
      *    not gate the colour. */
@@ -205,12 +204,19 @@ void Machine::render_scanline(uint32_t line) {
         }
     }
 
+    /* 🔍 The debug layer mask (machine.hpp) gates COMPOSITION, never the line buffer
+     * above: sprite 0 still wins its pixel whether or not its priority group is shown,
+     * so hiding the front sprites reveals the SCROLL PLANE underneath -- not whatever
+     * sprite lost the pixel. Anything else would be inventing an image the chip cannot
+     * produce, and the point of this tool is to show what is really there. */
     auto blit_sprites = [&](unsigned want_prc) {
+        if (!(layer_mask & (kLayerSprBack << (want_prc - 1u)))) return;
         for (unsigned x = 0; x < kScreenWidth; ++x)
             if (owner_value[x] && owner_prc[x] == want_prc) row[x] = owner_color[x];
     };
 
     auto draw_plane = [&](bool scr1) {
+        if (!(layer_mask & (scr1 ? kLayerScr1 : kLayerScr2))) return;
         const uint32_t map  = scr1 ? kScr1Map : kScr2Map;
         const unsigned soh  = scr1 ? g.s1so_h : g.s2so_h;
         const unsigned sov  = scr1 ? g.s1so_v : g.s2so_v;

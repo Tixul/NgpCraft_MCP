@@ -41,7 +41,7 @@ extension byte after the sub-op).
 | `0x99` | 21   | byte mem op on (XBC+d8) (= ARID family C) | Partial existing |
 | `0xF0` | 20   | long mem op on (abs8) / B0+mem family | Partial existing |
 | `0xE1` | 16   | `decode_zz_r` long variant ? | Needs verification |
-| `0xD8` | 16   | word ALU register prefix bank-working (R16; HW 2026-07-03 — not long) | Partial broken-marker |
+| `0xD8` | 16   | long ALU register prefix bank-working | Partial broken-marker |
 | `0xE3` | 15   | `decode_zz_r` long variant ? | Needs verification |
 | `0xE8` | 15   | long ALU register prefix (other variant) | Partial existing |
 | `0xF3` | 15   | mem op on absolute (secondary indexed) | Partial F3 handling exists |
@@ -151,9 +151,9 @@ mis-classified `0xC7` as "byte mem op on (XSP)" when it's actually
 ## Doctrine
 
 - **Source every opcode encoding from ngdis** — it's the in-project
-  authoritative reference (per `T900_DENSE_REF.md`) ; NeoPop ruled
-  out for cycle counts but ngdis is fine for encoding tables since
-  it's a direct port of the Toshiba spec.
+  authoritative reference (per `T900_DENSE_REF.md`) ; figures that
+  merely circulate are ruled out for cycle counts, but ngdis is fine
+  for encoding tables since it's a direct port of the Toshiba spec.
 - **Tests round-trip** : for each new opcode, decode → re-encode
   bytes → assert equality + execute → assert observable state
   change matches expected effect from the encoding spec.

@@ -4,8 +4,7 @@
 >
 > **Tranché définitivement sur vraie NGPC.** Le doute ouvert le 2026-07-02 sur
 > la taille de la famille `D8..DF` est clos par un ROM de test flashé
-> (`04_MY_PROJECTS/hw_test_off`, toolchain officielle cc900) sur le hardware
-> de Wilfried :
+> (`hw_test_off`, toolchain officielle cc900) sur une vraie console :
 >
 > | Test flashé | Octets | Résultat HW | Verdict |
 > |---|---|---|---|
@@ -38,7 +37,7 @@
 
 > ## ✅ RÉSOLU HW (2026-07-03) — `D0..D7` est une famille MÉMOIRE word, PAS registre-direct
 >
-> **Tranché sur vraie NGPC** (ROM flashé `04_MY_PROJECTS/hw_test_d0`, v2 sentinelle+canari) :
+> **Tranché sur vraie NGPC** (ROM flashé `hw_test_d0`, v2 sentinelle+canari) :
 >
 > | Test flashé | Résultat HW | Verdict |
 > |---|---|---|
@@ -90,7 +89,7 @@
 > | Document | Chemin | Couvre |
 > |---|---|---|
 > | **Manuel CPU Toshiba TLCS-900/L1** | `NgpCraft_toolchain/doc t_900/catalog_en_20010831_ALT00146.txt` | SR/IFF, règles de masque, base des vecteurs (0xFFFF00), reset |
-> | **Datasheet Toshiba TMP95C061** | (fournie par Wilfried, PDF) | **Table 3.3(1) = table complète des vecteurs d'interruption**, ADC (ADMOD/ADREG), timers, prescaler |
+> | **Datasheet Toshiba TMP95C061** | (PDF constructeur) | **Table 3.3(1) = table complète des vecteurs d'interruption**, ADC (ADMOD/ADREG), timers, prescaler |
 > | **SDK officiel SNK** | `01_SDK/docs/` | `SysPro`/`SysWork` (vecteurs RAM, batterie), `8Bit` (timers), `K2GETechRef`, `SerialCom`, `MicroDMA` |
 >
 > ⚠️ **Les TABLES du PDF datasheet sont des IMAGES** → invisibles en conversion

@@ -91,7 +91,10 @@ Currently decoded subset:
   - `SET bit, (abs16)`
 
 Current warning coverage:
-- broken `D0..D7` ALU word-register prefix family
+- `D0..D7` forms the decoder still reads as word register-direct (HW-corrected
+  2026-07-03: `D0..D7` is actually a WORD MEMORY-addressing family — see the
+  prefix note below; the remaining reg-direct-decoded forms honest-stop pending
+  the full re-decode)
 - `LINK XIY, N` when `N >= 5`
 - `ADC W, B` static risk annotation for the known silicon issue triggered when `W > 0`
 
@@ -103,13 +106,10 @@ Current quirk metadata exposure:
 - this metadata is diagnostic only and does not upgrade decode status into
   execution support
 
-Important prefix note:
-- HW-confirmed 2026-07-03: in ALU-register context, `D8..DF` are WORD (16-bit)
-  register forms (ngdis getzz(0xD8)=1=word), NOT 32-bit. The genuine 32-bit
-  (long) register prefix is `E8..EF` (getzz=2).
-- this matters for sequences such as `DB C8 <imm16>`, which decode as
-  `ADD SP, imm16` (word); the long form `EF C8 <imm32>` = `ADD XSP, imm32`
-- this is now aligned with the corrected local disassembler reference
+Important prefix note (HW-corrected 2026-07-03):
+- **register-direct** size split: `C8..CF`=byte, **`D8..DF`=word (16-bit)**, **`E8..EF`=long (32-bit)** — per ngdis `masker.h` `getzz` and confirmed on real NGPC hardware (flashed `hw_test_off`: `D8 89` -> `AAAA3344` = `ld BC, WA` word; `D9 1C` -> `0002FFFF` = `djnz BC` word). `D8..DF` were previously (wrongly) treated as 32-bit long; the genuine long prefix is `E8..EF` (e.g. `EF C8 <imm32>` = `ADD XSP, imm32`).
+- **`D0..D7` is NOT register-direct — it is a WORD MEMORY-addressing family** (parallel of the `C0..C7` byte-memory family), HW-confirmed 2026-07-03 via the flashed `hw_test_d0` ROM (`D0 89` consumes operand bytes / mis-aligns, does NOT hang) + ngdis (`getmem(0xD0)`->`decode_zz_mem`). Example: `D0 B6 3F 50 00` = `cpw (0xB6), 0x0050`, NOT the 2-byte `sbc IZ, WA`. The old "D0..D7 broken word-register" label was a mis-decode (see `cpu.d0_d7_non_immediate` v9). The abs8 word forms (`ldw R16,(abs8)`, `cpw (abs8),imm16`) now decode+execute; the full `D0..D7` word-memory re-decode is an in-progress chantier.
+- **`C7`/`E7` extended-register prefixes**: `C7 <reg> <op>` = byte extended-register, `E7 <reg> <op> [imm32]` = LONG extended-register (reg code indexes the r32 table: `0x38`->`XDE3` banked, `0xE0..0xFF`->current-bank `XWA..XSP`). Used by the real BIOS boot.
 - the current `post-increment` register-code extraction is still narrow and evidence-driven around the official StarGunner bootstrap loop, not a full ARI_PI family claim
 
 Current CLI user:

@@ -34,13 +34,35 @@ jamais le dump dans le repo.
 
 ---
 
-## 2. Statut actuel
+## 2. Statut actuel (pass 180, 2026-07-10)
 
-`core/execute.py::_try_execute_swi` existe et fait un **no-op stub
-silencieux** : PC avance, registres inchangés, side-effect non
-appliqué, note `Executed SWI {n}: BIOS call not modeled. PC advanced
-to next instruction as if the BIOS returned normally. Side effects
-of the BIOS call are omitted.`
+`core/execute.py::_try_execute_swi` **dispatche `swi 1` (BIOS
+SYSTEM_CALL)** sur l'index vecteur lu dans **RW3** (le byte W du banc
+de registres 3). Les autres `swi n` gardent le no-op stub PC-advance
+(3..6 = interruptions logicielles sur silicium réel, non modélisées).
+
+**Ground truth du dispatch** : le `SWI` du TLCS-900/H fait
+`push32(pc); pc = loadL(0xFFFE00 + (vecteur << 2))`, et le vecteur est
+lu dans le **byte de code `0x31` du banc courant**, c'est-à-dire
+**RW3**. Ça **tranche définitivement** l'ambiguïté "RW3 vs RC3 vs RB3"
+ouverte au pass 179 : c'est **RW3**. Les side-effects par vecteur
+viennent de la **table de vecteurs du BIOS SNK d'origine** (désassemblée
+depuis l'image BIOS retail). Cross-check sur ROM réelle : le `swi 1` de
+Metal Slug @0x200012 vecteurise vers `0xFF1030`, l'entrée 1 de cette
+table = CLOCKGEARSET ; notre ému lit RW3=0x01 et prend le même chemin.
+
+**Collapse note (alignement des traces)** : on exécute le handler BIOS
+en **1 pas HLE**, là où une exécution non-HLE en prend 2 (le `swi`,
+puis l'instruction marqueur placée au vecteur). L'état NET post-retour
+est identique → un diff aligné par PC re-converge ; seul un diff aligné
+par INDEX d'instruction (`oracle_tools/trace_diff.py`) dérive d'1 pas
+par `swi`. Artefact d'outillage, pas un bug de fidélité. L'alignement
+par index = le mode real-BIOS (l'autre moitié de "LES DEUX"), chantier
+séparé.
+
+`_extract_banked_core_byte(cpu, 3, r32_index, byte_pos)` lit les
+bytes du banc 3 (RA3=`(3,0,0)`, RW3=`(3,0,1)`, RC3=`(3,1,0)`,
+RB3=`(3,1,1)`). Écriture RA3 via `_build_banked_core_byte_update`.
 
 Effet observable : la plupart des ROMs cc900 du toolchain
 **continuent** sans incident car elles n'observent pas activement les
@@ -96,23 +118,62 @@ SR Phase 3 ou sont bypassés par la lib `ngpc_flash` maison.
 
 ## 4. Table SWI — statut par BIOS call
 
-Référence : `04_MY_PROJECTS/Doc de dev/Final/BIOS_REF.md` §4-5.
+Référence : `BIOS_REF.md` §4-5.
 
-| SWI / Vect | Nom | Statut | Implémentation HLE |
-|------|-----|--------|---|
-| SWI 0 | (reserved) | noop | aucune |
-| SWI 1 + RW3=0 | `BIOS_SHUTDOWN` | à faire | stop honnête status=`bios-shutdown`, écrire diag note |
-| SWI 1 + RW3=1 | `BIOS_CLOCKGEARSET` | à faire (trivial) | noop documenté : on émule à pleine vitesse, le clock gear n'affecte pas notre référence model |
-| SWI 1 + RW3=2 | `BIOS_RTCGET` | à faire (court) | lire `datetime.now()` Python, convertir en format BCD attendu par la NGPC, écrire dans buffer pointé par XHL3 |
-| SWI 1 + RW3=3 | `BIOS_RTCSET` | à faire (trivial) | noop (on ne touche pas l'horloge host) |
-| SWI 1 + RW3=4 | `BIOS_ALARMSET` | à faire (trivial) | noop (pas d'alarme background sur émulateur) |
-| SWI 1 + RW3=5 | `BIOS_SYSFONTSET` | à faire | embarquer notre font 8×8 BSD/MIT, la copier en CHAR_RAM tiles 32..127 |
-| SWI 1 + RW3=6 | `BIOS_FLASHWRITE` | **bypassable** | la lib `ngpc_flash_write_asm` du projet ne passe pas par BIOS. HLE à faire uniquement si une ROM ne utilise pas cette lib. (Lib propre au projet → réutilisable librement pour l'HLE Python sans contrainte de licence.) |
-| SWI 1 + RW3=7 | `BIOS_FLASHALLERS` | à faire (pas critique) | erase all blocks — non-trivial, mais notre design append-only n'en a pas besoin |
-| SWI 1 + RW3=8 | `BIOS_FLASHERS` | **bypassable** | lib `ngpc_flash_erase_asm` du projet. HLE à faire uniquement si nécessaire. **Note : bug HW connu blocs 32-34** — l'émulateur peut reproduire ce bug pour validation HW-faithful (retourner échec). |
-| SWI 1 + RW3=9 | `BIOS_ALARMDOWNLOAD` | à faire (trivial) | noop |
-| SWI 9 | `BIOS_USRSHUTDOWN` | à faire | stop honnête status=`user-shutdown` |
-| SWI 11..13 | divers | à déterminer | trace-only jusqu'à ce qu'une ROM en utilise activement |
+⚠️ **Correction du mapping RW3** (pass 180) : l'ancienne table
+listait des noms mal alignés (RW3=3 "RTCSET", RW3=4 "ALARMSET",
+RW3=9 "ALARMDOWNLOAD"). La table de vecteurs du BIOS SNK d'origine
+donne l'index EXACT ci-dessous. `[x]` = implémenté pass 180.
+
+| RW3 | Vecteur (0xFFxxxx) | Nom | Statut | Implémentation HLE |
+|----:|---------|-----|--------|---|
+| 0  | FF27A2 | `VECT_SHUTDOWN`     | [x] | honest-stop status=`bios-shutdown` (le BIOS ne revient jamais) |
+| 1  | FF1030 | `VECT_CLOCKGEARSET` | [x] | noop documenté : on émule à pleine vitesse, le clock gear n'affecte pas la référence |
+| 2  | FF1440 | `VECT_RTCGET`       | [x] | horloge host→7 octets BCD→buffer XHL3 (`rCodeL(0x3C)`), garde `>=0xC000`. Horloge derrière hook injectable `_bios_rtc_struct_time` (déterministe en test, non-déterministe live comme tout RTC) |
+| 3  | FF12B4 | (unknown)           | [x] | noop (le handler retail fait un RET immédiat) |
+| 4  | FF1222 | `VECT_INTLVSET`     | [x] | écrit le niveau (RB3) pour la source (RC3) dans les registres INTxx (0x70/71/73/74/79/7A, nibble bas/haut) ; lit d'abord pour préserver l'autre nibble |
+| 5  | FF8D8A | `VECT_SYSFONTSET`   | [x] | lit la VRAIE font du BIOS attaché (`0xFF8DCF`, 0x800 o 1bpp) → expand 2bpp en CHAR RAM `0xA000` (0x1000 o). RA3 = couleurs (bits 0-1 avant-plan / quartet haut arrière-plan). Sans BIOS = honest-stop `bios-font-unavailable`. **Décision FIDÉLITÉ, cf §4.1** |
+| 6  | FF6FD8 | `VECT_FLASHWRITE`   | [x] | copie `BC3*256` o de RAM (XHL3) vers la fenêtre flash cart (bank RA3 + XDE3), RA3=0 succès. Écrit dans l'overlay session (shadow ROM = NOR flash). ⚠ le chemin cart-write DIRECT (AMD unlock + /WE, lib maison, §5.4) reste un chantier session-layer séparé |
+| 7  | FF7042 | `VECT_FLASHALLERS`  | [x] | RA3=0 (SYS_SUCCESS) |
+| 8  | FF7082 | `VECT_FLASHERS`     | [x] | RA3=0 (SYS_SUCCESS). Note bug HW blocs 32-34 → reproductible plus tard |
+| 9  | FF149B | `VECT_ALARMSET`     | [x] | RA3=0 (SYS_SUCCESS) |
+| 10 | FF1033 | (unknown)           | [x] | noop |
+| 11 | FF1487 | `VECT_ALARMDOWNSET` | [x] | RA3=0 (SYS_SUCCESS) |
+| 12 | FF731F | (unknown)           | [x] | noop |
+| 13 | FF70CA | `VECT_FLASHPROTECT` | [x] | RA3=0 (SYS_SUCCESS) |
+| 14 | FF17C4 | `VECT_GEMODESET`    | [x] | noop (sans effet observable sur notre modèle GE) |
+| 15 | FF1032 | (unknown)           | [x] | noop |
+| 16 (0x10) | FF2BBD | `VECT_COMINIT` | [x] | RA3=0 (COM_BUF_OK) |
+| 0x11/0x12 | FF2C0C/44 | `COMSENDSTART`/`COMRECIVESTART` | [x] | no-peer : rien à faire |
+| 0x13 | FF2C86 | `COMCREATEDATA` | stub nommé | besoin peer + IRQ comms(11) |
+| 0x14 | FF2CB4 | `COMGETDATA` | [x] | no-peer : RA3=1 (COM_BUF_EMPTY) |
+| 0x15/0x16 | FF2D27/33 | `COMONRTS`/`COMOFFRTS` | [x] | écrit l'octet RTS 0x00B2 = 0 / 1 |
+| 0x17/0x18 | FF2D3A/4E | `COMSENDSTATUS`/`COMRECIVESTATUS` | [x] | no-peer : WA3=0 (compteur buffer 0) |
+| 0x19/0x1A | FF2D6C/85 | `COMCREATEBUFDATA`/`COMGETBUFDATA` | stub nommé | besoin peer + IRQ comms |
+| SWI 3..6 | — | interruptions logicielles | stub PC-advance | `interrupt(0..3)` sur silicium ; pas le chemin system-call |
+
+### 4.1 DÉCISION font SYSFONTSET — TRANCHÉE : FIDÉLITÉ (2026-07-10)
+
+**Choix = FIDÉLITÉ : on utilise la VRAIE font SNK, jamais un
+substitut.** La tension licence-vs-fidélité se dissout : **on
+n'embarque RIEN**. La font *vit dans le BIOS* que l'utilisateur
+fournit (`--bios`), à l'offset BIOS **`0x8DCF`** (= CPU `0xFF8DCF`),
+**`0x800` octets** (256 glyphes × 8 lignes, 1 bit/pixel).
+
+Vérifié directement sur le dump retail : le glyphe `0x41` rend un « A »
+8×8 correct, et les `0x800` octets à partir de cet offset forment bien
+256 glyphes cohérents d'affilée — c'est là que le BIOS range sa font.
+
+⇒ **Rien de propriétaire n'est distribué avec l'émulateur, ET les
+glyphes sont pixel-exacts au vrai hardware.** Sans BIOS attaché :
+**honest-stop** (`status="bios-font-unavailable"`) plutôt que
+fabriquer une font — cohérent avec la doctrine.
+
+Expansion (ce que fait le handler BIOS retail) : chaque octet 1bpp (8 pixels) devient
+un mot 16 bits 2bpp (décalage 2 bits/pixel, l'index couleur est OR'd
+→ le pixel 0 = MSB source finit dans les bits hauts). RA3 porte les
+couleurs : bits 0-1 = avant-plan, quartet haut = arrière-plan.
+Destination = CHAR RAM `0x00A000`..`0x00AFFF` (0x800 → 0x1000 o).
 
 ---
 
@@ -121,6 +182,27 @@ Référence : `04_MY_PROJECTS/Doc de dev/Final/BIOS_REF.md` §4-5.
 Voir aussi `SAVE_POLICY.md` pour la politique haut niveau et
 `Doc de dev/Final/BIOS_FLASH_SAVES_STRATEGY.md` §5 pour le protocole
 HW.
+
+### 5.0 Statut (pass 181, 2026-07-10) — chemin DIRECT modélisé
+
+**Le chemin DIRECT (§5.4, la lib flash MAISON qui ne passe pas par le
+BIOS) est modélisé** dans `core/flash.py::FlashController`, câblé dans
+la boucle `build_run_steps`/`build_run_until`. Point d'interception
+PROPRE : chaque store-executor surface déjà une écriture cart/ROM
+hardware-discardée comme MemoryWrite `[DISCARDED]` (adresse+data) →
+`_apply_flash_writes` route les écritures cart-window vers le
+contrôleur, commit dans l'overlay session (shadow ROM = NOR flash).
+Modèle = le protocole de commande de la NOR flash de cartouche
+(séquence d'unlock 0x202AAA/0x205555 qui ARME, écriture suivante qui
+COMMIT), **plus** un gate /WE (I/O 0x6E=0x14). Ce gate est plus strict
+que le modèle « unlock seul » : il colle au HW réel et à la lib maison,
+et rejette les écritures cart quand /WE n'est pas ouvert. Non-volatile :
+survit `reset()`. Le chemin BIOS-médié (VECT_FLASHWRITE, §4) était déjà
+fait pass 180. **Restent TODO** : DQ7/DQ5 status-poll (commit synchrone
+→ le poll relit direct la valeur finale), block-erase par secteur
+(jamais exercé jusqu'ici : les saves n'appendent que 256 o), persistance
+disque `.sram` (les bytes sont dans l'overlay = déjà capturés par le
+savestate).
 
 ### 5.1 Composants à modéliser
 
@@ -176,7 +258,7 @@ appliquée aux opcodes silicon-broken (D0+ALU-imm, D8 r+r).
 
 ## 6. Tests attendus quand on shippe HLE
 
-Référence ROM : `04_MY_PROJECTS/NgpCraft_toolchain/StarGunner_save_lib_test/bin/main.ngc`
+Référence ROM : `StarGunner_save_lib_test/bin/main.ngc`
 (HW-validated).
 
 ### Tests unitaires (à ajouter dans `tests/test_bios_hle.py`)
@@ -255,10 +337,10 @@ en prose).
 
 ## 9. Références
 
-- Master strategy : `04_MY_PROJECTS/Doc de dev/Final/BIOS_FLASH_SAVES_STRATEGY.md`
-- BIOS calls doc : `04_MY_PROJECTS/Doc de dev/Final/BIOS_REF.md`
-- Lib flash maison : `04_MY_PROJECTS/Doc de dev/NgpCraft_base_template/.../src/core/ngpc_flash.{h,c}` + `ngpc_flash_asm.asm`
-- Smoke ROM : `04_MY_PROJECTS/NgpCraft_toolchain/StarGunner_save_lib_test/bin/main.ngc`
+- Master strategy : `BIOS_FLASH_SAVES_STRATEGY.md`
+- BIOS calls doc : `BIOS_REF.md`
+- Lib flash maison : `src/core/ngpc_flash.{h,c}` + `ngpc_flash_asm.asm`
+- Smoke ROM : `StarGunner_save_lib_test/bin/main.ngc`
 - Politique saves : `SAVE_POLICY.md` (dans ce repo)
 - Savestate v2 spec : `specs/SAVESTATE.md`
 - HW quirks : `core/quirks_db.json` (v `2026-05-20.v4`)

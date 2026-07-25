@@ -82,7 +82,15 @@ STATUS_HALTED = 1
 STATUS_BREAKPOINT = 40
 STATUS_COUNT_REACHED = 41
 
-_DLL_NAME = "ngpc_core.dll"
+# The shared library's name follows the platform. CMake strips the `lib` prefix
+# (PROPERTIES PREFIX "", see cpp/CMakeLists.txt), so it is `ngpc_core.<ext>` on
+# every OS -- only the extension changes. Windows stays byte-for-byte what it was.
+if sys.platform == "win32":
+    _DLL_NAME = "ngpc_core.dll"
+elif sys.platform == "darwin":
+    _DLL_NAME = "ngpc_core.dylib"
+else:
+    _DLL_NAME = "ngpc_core.so"
 # Frozen (PyInstaller): the DLL is bundled at cpp/build/ under the extraction root
 # (sys._MEIPASS). From source it sits at <repo>/cpp/build/ next to this package.
 if getattr(sys, "frozen", False):
@@ -192,6 +200,29 @@ class ApuState(Structure):
     ]
 
 
+class SerialState(Structure):
+    """A read-only look at the link cable, for the debugger. Mirrors
+    `ngpc_serial_state_t`.
+
+    The bytes that DO cross the cable are already visible to whoever relays them
+    (core/link.py). What this adds is the stage a byte is stuck at when it does
+    NOT: held by the peer's CTS, queued while our own RTS is high, or presented
+    at SC0BUF and never read because nothing is draining it. That is the
+    difference between "no cable" and "cable fine, the game is not listening".
+    """
+
+    _fields_ = [(name, c_uint32) for name in (
+        "enabled", "tx_depth", "rx_depth", "tx_busy", "rx_pending",
+        "cts_high", "rts_low", "ctse",
+        "tx_count", "wire_count", "rx_queued_count", "rx_read_count",
+        "irq_tx_count", "irq_rx_count", "cts_hold_ticks", "rts_hold_ticks",
+        "sc0buf", "sc0cr", "sc0mod", "br0cr", "port_b1", "port_b2",
+    )]
+
+    def as_dict(self) -> dict[str, int]:
+        return {name: int(getattr(self, name)) for name, _ in self._fields_}
+
+
 class WriteRec(Structure):
     """One logged memory write: who wrote, where, what. Mirrors `ngpc_write_t`."""
 
@@ -200,6 +231,89 @@ class WriteRec(Structure):
         ("addr", c_uint32),
         ("value", c_uint8),
         ("_pad", c_uint8 * 3),
+    ]
+
+
+EVENT_WRITE = 0
+EVENT_IRQ = 1
+
+
+class HygieneRec(Structure):
+    """One instance of a ROM doing something hardware tolerates but that is a bug.
+    Mirrors `ngpc_hygiene_t`."""
+
+    _fields_ = [("pc", c_uint32), ("addr", c_uint32)]
+
+
+class EventRec(Structure):
+    """One logged event WITH its raster position. Mirrors `ngpc_event_t`.
+
+    `scanline` and `cycle` are what make this different from the write log: for a
+    raster effect the timing IS the behaviour.
+    """
+
+    _fields_ = [
+        ("pc", c_uint32),
+        ("addr", c_uint32),      # address written, or the vector index for an IRQ
+        ("scanline", c_uint16),
+        ("cycle", c_uint16),     # cycles into that scanline (0..514)
+        ("value", c_uint8),
+        ("type", c_uint8),       # EVENT_WRITE / EVENT_IRQ
+        ("_pad", c_uint8 * 2),
+    ]
+
+
+class Frame(Structure):
+    """One call-stack frame. Mirrors `ngpc_frame_t`.
+
+    Index 0 is the OUTERMOST caller; the routine currently executing is the last.
+    """
+
+    _fields_ = [
+        ("caller_pc", c_uint32),   # the CALL instruction's own address
+        ("entry_pc", c_uint32),    # where it went
+        ("return_pc", c_uint32),   # where it will come back to
+        ("entry_sp", c_uint32),    # SP before the call pushed anything
+    ]
+
+
+class ReadRec(Structure):
+    """One logged memory READ: who read, where, what came back. Mirrors `ngpc_read_t`.
+
+    Instruction fetches are not logged -- see `set_read_log`.
+    """
+
+    _fields_ = [
+        ("pc", c_uint32),
+        ("addr", c_uint32),
+        ("value", c_uint8),
+        ("_pad", c_uint8 * 3),
+    ]
+
+
+class RtcState(Structure):
+    """The calendar IC at I/O 0x90-0x97. Mirrors `ngpc_rtc_t`.
+
+    Packed BCD, exactly as the registers read: `year=0x24` IS 2024. `counter` is the
+    sub-second cycle accumulator -- invisible to software, carried so that saving and
+    restoring the clock loses nothing.
+    """
+
+    _fields_ = [
+        ("enable", c_uint8),
+        ("year", c_uint8),
+        ("month", c_uint8),
+        ("day", c_uint8),
+        ("hour", c_uint8),
+        ("minute", c_uint8),
+        ("second", c_uint8),
+        ("weekday", c_uint8),
+        # The alarm rides the same coin cell, so it belongs to the same save.
+        ("alarm_enable", c_uint8),
+        ("alarm_day", c_uint8),
+        ("alarm_hour", c_uint8),
+        ("alarm_minute", c_uint8),
+        ("counter", c_uint32),
     ]
 
 
@@ -241,10 +355,27 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_timer_base.restype = None
     lib.ngpc_raise_irq.argtypes = [c_void_p, c_uint32]
     lib.ngpc_raise_irq.restype = None
+    # --- link cable (serial channel 0) ---
+    lib.ngpc_serial_set_enabled.argtypes = [c_void_p, c_int]
+    lib.ngpc_serial_set_enabled.restype = None
+    lib.ngpc_serial_read_tx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
+    lib.ngpc_serial_read_tx.restype = c_uint32
+    lib.ngpc_serial_write_rx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
+    lib.ngpc_serial_write_rx.restype = None
+    lib.ngpc_serial_rts.argtypes = [c_void_p]
+    lib.ngpc_serial_rts.restype = c_int
+    lib.ngpc_serial_set_cts.argtypes = [c_void_p, c_int]
+    lib.ngpc_serial_set_cts.restype = None
+    lib.ngpc_serial_state.argtypes = [c_void_p, POINTER(SerialState)]
+    lib.ngpc_serial_state.restype = None
     lib.ngpc_get_apu_state.argtypes = [c_void_p, POINTER(ApuState)]
     lib.ngpc_get_apu_state.restype = None
     lib.ngpc_set_apu_channel_mask.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_apu_channel_mask.restype = None
+    lib.ngpc_set_layer_mask.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_layer_mask.restype = None
+    lib.ngpc_get_layer_mask.argtypes = [c_void_p]
+    lib.ngpc_get_layer_mask.restype = c_uint32
     lib.ngpc_get_audio.argtypes = [c_void_p, POINTER(c_int16), c_uint32]
     lib.ngpc_get_audio.restype = c_uint32
     lib.ngpc_audio_dropped.argtypes = [c_void_p]
@@ -255,14 +386,26 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_write_log.restype = None
     lib.ngpc_write_log_count.argtypes = [c_void_p]
     lib.ngpc_write_log_count.restype = c_uint64
+    lib.ngpc_set_read_log.argtypes = [c_void_p, c_uint32, c_uint32]
+    lib.ngpc_set_read_log.restype = None
+    lib.ngpc_read_log_count.argtypes = [c_void_p]
+    lib.ngpc_read_log_count.restype = c_uint64
     lib.ngpc_get_framebuffer.argtypes = [c_void_p, POINTER(c_uint16), c_uint32]
     lib.ngpc_get_framebuffer.restype = c_uint32
     lib.ngpc_set_battery_ram.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
     lib.ngpc_set_battery_ram.restype = None
+    lib.ngpc_get_rtc.argtypes = [c_void_p, POINTER(RtcState)]
+    lib.ngpc_get_rtc.restype = None
+    lib.ngpc_set_rtc.argtypes = [c_void_p, POINTER(RtcState)]
+    lib.ngpc_set_rtc.restype = None
+    lib.ngpc_rtc_advance.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_rtc_advance.restype = None
     lib.ngpc_set_cart_wait.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_cart_wait.restype = None
     lib.ngpc_set_cart_data_wait.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_cart_data_wait.restype = None
+    lib.ngpc_set_k1ge_console.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_k1ge_console.restype = None
     lib.ngpc_set_vram_wait.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_vram_wait.restype = None
     lib.ngpc_set_ldir_cost.argtypes = [c_void_p, c_uint32]
@@ -279,6 +422,38 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_flash_restore.restype = c_int
     lib.ngpc_get_write_log.argtypes = [c_void_p, POINTER(WriteRec), c_uint32]
     lib.ngpc_get_write_log.restype = c_uint32
+    lib.ngpc_get_read_log.argtypes = [c_void_p, POINTER(ReadRec), c_uint32]
+    lib.ngpc_get_read_log.restype = c_uint32
+    lib.ngpc_set_coverage.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_coverage.restype = None
+    lib.ngpc_coverage_hits.argtypes = [c_void_p]
+    lib.ngpc_coverage_hits.restype = c_uint32
+    lib.ngpc_get_coverage.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
+    lib.ngpc_get_coverage.restype = c_uint32
+    lib.ngpc_set_hygiene.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_hygiene.restype = None
+    lib.ngpc_uninit_reads.argtypes = [c_void_p]
+    lib.ngpc_uninit_reads.restype = c_uint64
+    lib.ngpc_lost_writes.argtypes = [c_void_p]
+    lib.ngpc_lost_writes.restype = c_uint64
+    lib.ngpc_get_uninit_reads.argtypes = [c_void_p, POINTER(HygieneRec), c_uint32]
+    lib.ngpc_get_uninit_reads.restype = c_uint32
+    lib.ngpc_get_lost_writes.argtypes = [c_void_p, POINTER(HygieneRec), c_uint32]
+    lib.ngpc_get_lost_writes.restype = c_uint32
+    lib.ngpc_set_event_log.argtypes = [c_void_p, c_uint32, c_uint32]
+    lib.ngpc_set_event_log.restype = None
+    lib.ngpc_event_log_count.argtypes = [c_void_p]
+    lib.ngpc_event_log_count.restype = c_uint64
+    lib.ngpc_get_event_log.argtypes = [c_void_p, POINTER(EventRec), c_uint32]
+    lib.ngpc_get_event_log.restype = c_uint32
+    lib.ngpc_set_callstack.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_callstack.restype = None
+    lib.ngpc_callstack_depth.argtypes = [c_void_p]
+    lib.ngpc_callstack_depth.restype = c_uint32
+    lib.ngpc_callstack_overflow.argtypes = [c_void_p]
+    lib.ngpc_callstack_overflow.restype = c_uint64
+    lib.ngpc_get_callstack.argtypes = [c_void_p, POINTER(Frame), c_uint32]
+    lib.ngpc_get_callstack.restype = c_uint32
     lib.ngpc_abi_version.restype = c_uint32
     lib.ngpc_create.restype = c_void_p
     lib.ngpc_destroy.argtypes = [c_void_p]
@@ -374,6 +549,16 @@ class NativeMachine:
         """
         self._lib.ngpc_set_cart_data_wait(self._h, int(cycles_per_byte))
 
+    def set_k1ge_console(self, on: bool) -> None:
+        """Emulate the ORIGINAL mono NGP instead of the NGPC, for a mono cartridge.
+
+        The NGPC reports itself at 0x6F91 and a colour-aware mono game (Samurai
+        Shodown) then runs its colourisation code and paints the 12-bit compat
+        palette. An original NGP has neither, so the game stays monochrome and the
+        BIOS grey ramp stands. Must be set BEFORE reset. See Machine::k1ge_console.
+        """
+        self._lib.ngpc_set_k1ge_console(self._h, 1 if on else 0)
+
     def set_vram_wait(self, cycles_per_byte: int) -> None:
         """EXPERIMENTAL wait-states per byte written to display RAM (0x8000-0xBFFF).
 
@@ -415,6 +600,26 @@ class NativeMachine:
         """Debug mute: bit0..2 squares, bit3 noise, bit4 DAC (0x1F = all on)."""
         self._lib.ngpc_set_apu_channel_mask(self._h, int(mask) & 0x1F)
 
+    # Debug layer mask -- the video twin of the channel mute above. Keep these names
+    # in step with `core.renderer.LAYER_*`: one concept, and the two cores must not
+    # drift apart on what bit means what.
+    LAYER_SCR1, LAYER_SCR2 = 0x01, 0x02
+    LAYER_SPR_BACK, LAYER_SPR_MID, LAYER_SPR_FRONT = 0x04, 0x08, 0x10
+    LAYER_SPRITES = LAYER_SPR_BACK | LAYER_SPR_MID | LAYER_SPR_FRONT
+    LAYER_ALL = 0x1F
+
+    def set_layer_mask(self, mask: int) -> None:
+        """Debug show/hide: bit0 SCR1, bit1 SCR2, bit2..4 sprites by PR.C.
+
+        Composition only -- no machine state changes, so a mask can be flipped mid-game
+        and flipped back with the picture identical. 0x1F (default) = everything on;
+        any fidelity or corpus measurement must run there.
+        """
+        self._lib.ngpc_set_layer_mask(self._h, int(mask) & self.LAYER_ALL)
+
+    def layer_mask(self) -> int:
+        return int(self._lib.ngpc_get_layer_mask(self._h))
+
     AUDIO_RATE_HZ = 44100
 
     def audio(self, frames: int = 8192) -> bytes:
@@ -452,6 +657,129 @@ class NativeMachine:
         """The most recent logged writes, oldest first."""
         buf = (WriteRec * limit)()
         got = self._lib.ngpc_get_write_log(self._h, buf, limit)
+        return list(buf[:got])
+
+    READ_LOG_SIZE = 8192
+
+    def set_read_log(self, lo: int, hi: int) -> None:
+        """Log every DATA read landing in `[lo, hi]`, with the PC that made it.
+
+        The write log's missing half: "which routine writes this?" was answerable,
+        "which routine READS this?" was not -- and that is the question you ask about
+        a flag nobody seems to act on.
+
+        ⚠️ Instruction FETCHES are deliberately excluded. They go through the same
+        read path, so logging them would bury the one data read you are after under
+        every instruction of the code doing the reading. Pass `lo > hi` to disarm;
+        arming also resets the count.
+        """
+        self._lib.ngpc_set_read_log(self._h, lo, hi)
+
+    def read_log_count(self) -> int:
+        """Every logged read the window saw -- INCLUDING any the ring had to drop."""
+        return int(self._lib.ngpc_read_log_count(self._h))
+
+    def read_log(self, limit: int = READ_LOG_SIZE) -> list[ReadRec]:
+        """The most recent logged reads, oldest first."""
+        buf = (ReadRec * limit)()
+        got = self._lib.ngpc_get_read_log(self._h, buf, limit)
+        return list(buf[:got])
+
+    COVERAGE_LO, COVERAGE_HI = 0x200000, 0x3FFFFF
+
+    def set_coverage(self, enabled: bool) -> None:
+        """Record the address of every instruction executed in the cart window.
+
+        Without this, "the analyzer looked at this ROM" cannot be checked. With it,
+        "driving the buttons reached more code" is a number rather than a hope.
+        Enabling allocates 256 KiB and resets the count.
+        """
+        self._lib.ngpc_set_coverage(self._h, 1 if enabled else 0)
+
+    def coverage_hits(self) -> int:
+        """Distinct instruction addresses executed since coverage was enabled."""
+        return int(self._lib.ngpc_coverage_hits(self._h))
+
+    def coverage_bitmap(self) -> bytes:
+        size = int(self._lib.ngpc_get_coverage(self._h, None, 0))
+        if not size:
+            return b""
+        buf = (c_uint8 * size)()
+        got = self._lib.ngpc_get_coverage(self._h, buf, size)
+        return bytes(buf[:got])
+
+    HYGIENE_SAMPLES = 256
+
+    def set_hygiene(self, enabled: bool) -> None:
+        """Watch for work-RAM reads that precede any write, and stores into unmapped
+        space. Both are things hardware tolerates silently and that are almost always
+        bugs. Enabling resets the counters. Off by default."""
+        self._lib.ngpc_set_hygiene(self._h, 1 if enabled else 0)
+
+    def uninit_reads(self) -> int:
+        return int(self._lib.ngpc_uninit_reads(self._h))
+
+    def lost_writes(self) -> int:
+        return int(self._lib.ngpc_lost_writes(self._h))
+
+    def uninit_read_samples(self, limit: int = HYGIENE_SAMPLES) -> list[HygieneRec]:
+        buf = (HygieneRec * limit)()
+        got = self._lib.ngpc_get_uninit_reads(self._h, buf, limit)
+        return list(buf[:got])
+
+    def lost_write_samples(self, limit: int = HYGIENE_SAMPLES) -> list[HygieneRec]:
+        buf = (HygieneRec * limit)()
+        got = self._lib.ngpc_get_lost_writes(self._h, buf, limit)
+        return list(buf[:got])
+
+    EVENT_LOG_SIZE = 4096
+    # The K2GE video registers: scroll, palette, window, raster control. The default
+    # window for the event viewer, because this is where every raster trick lands.
+    VIDEO_REGS = (0x008000, 0x0083FF)
+
+    def set_event_log(self, lo: int, hi: int) -> None:
+        """Log writes in `[lo, hi]` WITH the scanline and cycle they happened on, plus
+        every interrupt delivery.
+
+        The write log answers "who wrote this"; this answers "when in the frame", which
+        is the only question that matters for a scroll split or an HBlank HUD. Pass
+        `lo > hi` to disarm; arming resets the count.
+        """
+        self._lib.ngpc_set_event_log(self._h, lo, hi)
+
+    def event_log_count(self) -> int:
+        return int(self._lib.ngpc_event_log_count(self._h))
+
+    def event_log(self, limit: int = EVENT_LOG_SIZE) -> list[EventRec]:
+        """The most recent events, oldest first."""
+        buf = (EventRec * limit)()
+        got = self._lib.ngpc_get_event_log(self._h, buf, limit)
+        return list(buf[:got])
+
+    CALLSTACK_DEPTH = 64
+
+    def set_callstack(self, enabled: bool) -> None:
+        """Track the call stack as a shadow stack, per instruction.
+
+        Answers the one question a breakpoint always raises and that no register
+        dump can: how did execution get here. Off by default -- it costs a couple
+        of compares per instruction plus a 4-byte read per call, which a player has
+        no reason to pay. Disabling also clears the stack.
+        """
+        self._lib.ngpc_set_callstack(self._h, 1 if enabled else 0)
+
+    def callstack_depth(self) -> int:
+        return int(self._lib.ngpc_callstack_depth(self._h))
+
+    def callstack_overflow(self) -> int:
+        """Frames dropped because the shadow stack was full. Non-zero means the view
+        is TRUNCATED (deep recursion), not that it is wrong."""
+        return int(self._lib.ngpc_callstack_overflow(self._h))
+
+    def callstack(self, limit: int = CALLSTACK_DEPTH) -> list[Frame]:
+        """Frames outermost-first; the routine executing now is the last one."""
+        buf = (Frame * limit)()
+        got = self._lib.ngpc_get_callstack(self._h, buf, limit)
         return list(buf[:got])
 
     RASTER_LINES = 152
@@ -555,6 +883,34 @@ class NativeMachine:
         """The console's 12 KiB of work RAM, as it stands now."""
         return self.read(RAM_START, RAM_SIZE)
 
+    def rtc(self) -> RtcState:
+        """The calendar IC (I/O 0x90-0x97), in packed BCD.
+
+        It runs off the SAME coin cell as `battery_ram`, so it belongs to the same save.
+        It is machine state rather than memory, though, so `read` cannot reach it -- which
+        is precisely how it went unsaved and got re-seeded to a fixed date every launch.
+        """
+        st = RtcState()
+        self._lib.ngpc_get_rtc(self._h, ctypes.byref(st))
+        return st
+
+    def rtc_advance(self, seconds: int) -> None:
+        """Wind the clock forward, for time the console spent switched off.
+
+        Goes through the CORE's own BCD carry chain -- the same one the running clock
+        ticks through -- so month ends and leap years are handled by the code that
+        already gets them right, instead of by a second implementation up here.
+        """
+        if seconds > 0:
+            self._lib.ngpc_rtc_advance(self._h, int(seconds))
+
+    def set_rtc(self, st: RtcState) -> None:
+        """Put the clock back the way it was left. Hand it over BEFORE `reset` in
+        real-BIOS mode: the BIOS reads the chip during its own boot, and (measured) it
+        REWRITES it to 1998-01-01 only when the coin cell is blank -- on a configured
+        console it never writes it at all, so this is what the console will believe."""
+        self._lib.ngpc_set_rtc(self._h, ctypes.byref(st))
+
     def reset(self, *, bios_handoff: bool = True, real_bios: bool = False) -> None:
         """Power the machine up. See NGPC_RESET_* in ngpc_core.h.
 
@@ -587,6 +943,45 @@ class NativeMachine:
     def set_breakpoints(self, pcs: list[int]) -> None:
         arr = (c_uint32 * len(pcs))(*pcs)
         self._lib.ngpc_set_breakpoints(self._h, arr, len(pcs))
+
+    # --- link cable (serial channel 0) -------------------------------------
+    # The cable is a byte pipe. A host bridges two machines by draining each
+    # one's transmitted bytes (serial_read_tx) and feeding them to the other
+    # (serial_write_rx). See core/link.py for the in-process / TCP bridges.
+    def serial_set_enabled(self, on: bool) -> None:
+        self._lib.ngpc_serial_set_enabled(self._h, 1 if on else 0)
+
+    def serial_read_tx(self, max_bytes: int = 64) -> bytes:
+        """Drain the bytes this machine has transmitted since the last call."""
+        out = (c_uint8 * max_bytes)()
+        n = self._lib.ngpc_serial_read_tx(self._h, out, max_bytes)
+        return bytes(out[:n])
+
+    def serial_write_rx(self, data: bytes) -> None:
+        """Queue bytes for this machine to receive from the peer."""
+        if data:
+            self._lib.ngpc_serial_write_rx(self._h, _buf(data), len(data))
+
+    def serial_rts(self) -> bool:
+        """True when this machine is ready to receive (RTS low)."""
+        return self._lib.ngpc_serial_rts(self._h) != 0
+
+    def serial_set_cts(self, high: bool) -> None:
+        """Drive this machine's CTS0 handshake input (wired to the PEER's RTS).
+
+        `high` True -> CTS0 high: if the game enabled CTSE (SC0MOD bit6), its
+        transmitter halts a queued byte until the peer drops RTS. A bridge passes
+        the peer's RTS state here each pump so the hardware handshake is modelled.
+        """
+        self._lib.ngpc_serial_set_cts(self._h, 1 if high else 0)
+
+    def serial_state(self) -> SerialState:
+        """Snapshot the serial channel: FIFO depths, handshake lines, the SC0
+        registers and the per-stage byte/interrupt counters. Read-only -- see
+        SerialState. Feeds the debugger's Link tab."""
+        st = SerialState()
+        self._lib.ngpc_serial_state(self._h, ctypes.byref(st))
+        return st
 
     def run_frames(self, frames: int = 1, *, max_instrs: int | None = None) -> Summary:
         """Advance whole FRAMES. The core owns the raster, so it owns the boundary.

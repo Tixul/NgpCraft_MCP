@@ -101,9 +101,10 @@ void ngpc_raster_init(void)
      * - T01MOD: Timer 0 clock source = internal (bits 1-0)
      * - TRUN bit 0 = 1 (start Timer 0)
      *
-     * Note: exact timer configuration may need tuning on real hardware.
-     * A scanline is ~515 CPU cycles (~84 us) at 6.144 MHz (silicon-measured).
-     * TREG0 counts HBlanks/scanlines here (TI0 clock), NOT CPU cycles.
+     * Timing: one scanline is ~515 CPU cycles (~84 us) at 6.144 MHz
+     * (silicon-measured: 515 cyc/line x 199 lines/frame ~= 102485 cyc/frame,
+     * 59.95 Hz). TREG0 counts HBlanks/scanlines here, NOT CPU cycles, because
+     * the clock source is TI0 (the K2GE H-int), one tick per visible line.
      */
     HW_T01MOD &= (u8)~0xC3; /* Timer0 clock = TI0, 8-bit mode */
     HW_TREG0 = 0x01;

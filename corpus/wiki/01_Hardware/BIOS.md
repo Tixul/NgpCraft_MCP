@@ -67,6 +67,12 @@ __asm("ldb rw3, " NGPC_STR(BIOS_SHUTDOWN));
 __asm("swi 1");
 ```
 
+> **`swi 1` and the table are the same dispatcher.** The BIOS's `swi 1` handler
+> reads `RW3` and jumps through the very same `0xFFFE00 + RW3*4` table, so *any*
+> vector can be reached either way — the two conventions above are a style choice,
+> not two different mechanisms. (Confirmed by disassembly and by a clean-room HLE
+> re-implementation that services both paths through one table.)
+
 ---
 
 ## 3. Register Bank 3
@@ -219,6 +225,37 @@ __asm(" ld xix, (xix+w)");
 __asm(" call xix");
 ```
 
+### 5.7 BIOS_INTLVSET (4) — Interrupt priority levels
+
+Sets the priority level of one interrupt source in the CPU's `INTxx` control
+registers. Reachable via the table (`0xFFFE00`) or `swi 1`; `system.lib` wraps it
+as `INT_LV_set`.
+
+**Parameters:** `RC3` = interrupt source (0-9), `RB3` = priority level (0-5, capped at 5).
+
+| RC3 source | Meaning | `INTxx` register | Nibble |
+|-----------|---------|------------------|--------|
+| 0 | RTC alarm | `0x70` | low |
+| 1 | Z80 / system | `0x71` | high |
+| 2 | Timer 0 | `0x73` | low |
+| 3 | Timer 1 | `0x73` | high |
+| 4 | Timer 2 | `0x74` | low |
+| 5 | Timer 3 | `0x74` | high |
+| 6 | DMA 0 | `0x79` | low |
+| 7 | DMA 1 | `0x79` | high |
+| 8 | DMA 2 | `0x7A` | low |
+| 9 | DMA 3 | `0x7A` | high |
+
+> **Register-encoding gotcha (measured).** The value written into the source's
+> nibble is **`0x08 | min(level, 5)`**, *not* the bare level — the `0x08` bit is
+> the interrupt **enable** bit. Even sources write the low nibble, odd sources the
+> high nibble of the shared register (the other nibble is preserved). Examples:
+> `INTLVSET(source=2, level=3)` -> `0x73 = 0x0B`; a following
+> `INTLVSET(source=3, level=2)` -> `0x73 = 0xAB`. Measured on the retail BIOS
+> across five commercial ROMs. A model that writes the bare level (without `0x08`)
+> leaves the source **disabled** and its interrupt never fires — the one detail
+> the reference emulator's HLE model had wrong until it was traced against silicon.
+
 ---
 
 ## 6. BCD Values (RTC)
@@ -348,6 +385,15 @@ buffers and the TX/RX interrupts; you only call the vectors.
 2. Wrap long ops (V-blank) with `COMOFFRTS` ... `COMONRTS`.
 3. Use the table (`SYSTEM_CALL`), **never `swi 1`**, for the COM vectors.
 4. Serial TX/RX interrupts (`0x6FE4` / `0x6FE8`) are owned by the BIOS — do not hook them.
+5. **Cable/peer detection = port `0xB1` bit2** (input): `1` = nothing plugged, `0` = a
+   peer console is connected. Gate a session's *first* transmission on bit2 == 0 (this
+   is how *Card Fighters' Clash* decides it may become the link initiator). `0xB1` bit1
+   = the CR2032 sub-battery (must read 1). See **[Link Cable](../05_Systems/Link-Cable.md)** §5.
+
+> 📖 **Full link-cable reference: [Link Cable](../05_Systems/Link-Cable.md)** — registers,
+> all 11 vectors with verified addresses, the CTS/RTS handshake, cable-detect, the
+> symmetric programming loop, a reverse-engineered session handshake (initiator/
+> responder, `0x55 0x77` → `0xAA 0x22`), gotchas, and emulator-modelling notes.
 
 ### 10.4 Minimal use
 ```c

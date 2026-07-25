@@ -139,7 +139,7 @@ des centaines de milliers d'instructions, une frame commerciale des millions.
 | **Memoisation de `probe()`** | `NgpcAddressSpace.probe()` parcourait la liste des regions et allouait un `AddressProbe` neuf **pour chaque octet lu** : **370 000 appels `contains` pour 4 000 instructions** (~93 comparaisons/instruction). L'espace d'adressage est `frozen` ⇒ `probe()` est **pure** ⇒ memoisable sans changer le comportement. |
 
 **Gain : 1 123 → 1 706 instr/s (x1,5).** Fidelite re-verifiee apres coup contre
-l'oracle (`cosim_diff`) : **0 divergence**.
+le cœur de référence (`oracle_tools/native_diff.py`) : **0 divergence**.
 
 ### 10.2 Cahier des charges du coeur natif (C++)
 
@@ -158,5 +158,5 @@ precisement — c'est exactement ce qu'un coeur natif supprime :
    → etat CPU **mutable** dans le coeur chaud.
 
 **Regle qui ne change pas :** le coeur rapide doit rester *reference-exact*. Toute
-optimisation se valide contre `oracle_tools/cosim_diff.py` sur le corpus (voir
+optimisation se valide contre `oracle_tools/native_diff.py` sur le corpus (voir
 `README.md`), et une divergence est un **bug d'optimisation**, pas une licence.

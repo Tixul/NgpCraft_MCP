@@ -98,7 +98,7 @@ formats consistent.
   "target_pc": <int or null>,
   "target_pc_hex": "0x<8 hex>" or null,
   "max_steps": <int or null>,
-  "seed_registers": {"XWA": <int>, ...} or null,
+  "seed_registers": {"XWA": <int>, "DMAC0": <int>, ...} or null,
   "seed_xsp": <int or null>,
   "seed_from_savestate": null | {
     "format_version": "2026-04-22.v1",
@@ -115,7 +115,15 @@ formats consistent.
   run; records the savestate's format_version, ROM hash, and CPU PC
   at load time. This is the reproducibility anchor.
 - `seed_registers` / `seed_xsp`: recorded verbatim when the run was
-  parameterized via `--seed-reg` / `--seed-xsp`.
+  parameterized via `--seed-reg` / `--seed-xsp` (including modeled
+  TLCS-900/H control-register seeds such as `DMAC0` / `INTNEST`).
+- Bridge note:
+  - engine-bridge `runtime.seed_presets` are flattened into the same
+    effective `seed_registers` / `seed_xsp` fields instead of adding a
+    separate event-log schema key
+  - example: `bios-handoff-minimal` contributes `INTNEST=0` under
+    `seed_registers`, while an explicit bridge `seed_xsp` override still
+    appears in `seed_xsp`
 
 ## 5. Events
 
@@ -129,7 +137,7 @@ formats consistent.
     "raw_bytes_hex": "XX XX XX",
     "assembly": "<mnemonic operands>" or null,
     "length": <int or null>,
-    "status": "executed" | "silicon-broken" | "requires-known-flags"
+    "status": "executed" | "cpu-halted" | "silicon-broken" | "requires-known-flags"
               | "runtime-memory-unavailable" | ... ,
     "next_pc": <int or null>,
     "next_pc_hex": "0x<8 hex>" or null,
@@ -170,6 +178,13 @@ formats consistent.
   }
 ]
 ```
+
+- `cpu-halted` means the `HALT` instruction itself completed and produced
+  a post-step CPU state, but the bounded run stopped immediately because
+  resume requires a future interrupt.
+- For statuses with a real post-step state such as `cpu-halted`,
+  `next_pc` can be non-null even though the run summary stop reason is
+  `stopped-on-...`.
 
 Rules:
 - Every attempted instruction produces exactly one event. There are

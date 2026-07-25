@@ -55,6 +55,8 @@ the machine and the techniques, not any single game or project.
 - **[Game Loop](05_Systems/Game-Loop.md)** — Main loop, VBlank sync, watchdog, frame
   budget, state-machine patterns.
 - **[Input](05_Systems/Input.md)** — Joypad polling, edge detection, menu/game input.
+- **[Link Cable](05_Systems/Link-Cable.md)** — Serial channel 0, the 11 BIOS COM
+  vectors, CTS/RTS handshake, cable-detect (`0xB1` bit2), and session handshakes.
 - **[Storage and Saves](05_Systems/Storage-and-Saves.md)** — Flash save and RTC, save
   struct design, and flash hardware pitfalls.
 - **[Collision](05_Systems/Collision.md)** — AABB and tile collision, shmup patterns,
@@ -87,4 +89,5 @@ the machine and the techniques, not any single game or project.
 | Move data fast to VRAM | [DMA](03_Graphics/DMA.md) · [VRAM Queue](03_Graphics/VRAM-Queue.md) |
 | Build a stable main loop | [Game Loop](05_Systems/Game-Loop.md) |
 | Add save support | [Storage and Saves](05_Systems/Storage-and-Saves.md) |
+| Link two consoles (multiplayer) | [Link Cable](05_Systems/Link-Cable.md) |
 | Do a raster / HUD split | [Effects and Raster](03_Graphics/Effects-and-Raster.md) |

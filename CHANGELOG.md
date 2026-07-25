@@ -1,6 +1,59 @@
 # Changelog — @ngpcraft/mcp
 
 
+## 2026-07-25 — emulator re-vendored, broken homemade-link fixed, PRNG fix picked up
+
+### `vendor/emulator/` re-synced to upstream `6380728`
+Both cores, the specs and the two CLI entry points now match the emulator repo byte for
+byte. The C++ core was **rebuilt from the vendored sources** (MinGW, Release) rather than
+copied, so `cpp/build/ngpc_core.dll` provably matches `cpp/src/`.
+
+What the snapshot gains — every item silicon-measured upstream, not guessed:
+- the second ROM chip at `0x800000` (4 MiB carts: SvC MotM, Metal Slug 2nd Mission,
+  Densha de Go! 2 read their data as zero without it);
+- K1GE compatibility mode + the BIOS grey ramp (mono cartridges draw instead of black);
+- the OOWC window palette at `0x83F0`, the unconditional backdrop;
+- the H-int raster anchor (split-line jitter), `199` scanlines/frame, timer tap `128`;
+- silicon-calibrated instruction costs (cart fetch wait-states, MUL/DIV, LDIR);
+- the secondary-byte rcode decode, `ldir` register masking, RTC, micro-DMA INTTC.
+
+New vendored modules the entry points now need: `core/rom_loader.py` (zip/7z ROMs),
+`expr.py`, `link*.py`, `pointers.py`, `romcheck.py`, `romdiff.py`, `texttable.py`.
+`core/lobby.py` is deliberately **not** vendored — it is the one core module that imports
+PyQt6, and nothing in the CLI import closure touches it.
+
+### Fixed
+- **`ngpc_compile_homemade` could not link.** The bundled default linker script
+  `vendor/toolchain/tools/ngpc.lcf` was still in the old Toshiba/tulink syntax while the
+  vendored `t900ld.py` had moved on, so every build died with
+  `section 'f_code' not placed (no matching LCF rule)`. Re-synced from the toolchain; it
+  also brings the `SYSPATCH` / `VRAMQ_ASM` / `dma_prog` / `FLASH` rules whose absence used
+  to leave `.asm` symbols silently resolved to 0.
+- **`vendor/templates/base` shipped the broken PRNG.** `ngpc_random()` used a u32 LCG whose
+  modulo never reduced (cc900's u32 runtime helpers are buggy on hardware — confirmed on
+  silicon: 98 % crit instead of 2/7), so every project scaffolded by `ngpc_new_project`
+  inherited it. Synced `core/ngpc_math.{c,h}` (u16 LCG, full period) and
+  `fx/ngpc_raster.{c,h}` (the HBlank write budget is ~30 cycles, **not** the 515-cycle
+  scanline period). `ngpc_api_lookup` now reports `u16 ngpc_random(u16 max)`.
+
+### Added
+- `scripts/sync_vendor_emulator.sh` — reproducible re-vendoring of the emulator snapshot.
+- `scripts/smoke_emu_tools.mjs` — calls every emulator-backed tool against a real ROM.
+  A re-vendor changes the CLI the bridges spawn, and a renamed flag still *looks* fine
+  until an agent calls the tool. 17/17 green after this sync.
+
+### Deliberately NOT synced
+- **`vendor/disasm/` is AHEAD of `NgpCraft_Disasm`, not behind.** The vendored copy carries
+  `_rcode_r32_name()` (the secondary addressing byte is `rrrrrrmm` — a 6-bit *extended
+  register code*, not a bare 3-bit index; reading it as `(b >> 2) & 7` is right only by
+  accident for current-bank codes). Upstream **never** received that fix and still does the
+  accidental read. Re-vendoring from it would reintroduce the Densha de Go! 2 mis-decode.
+  The fix needs to travel upstream, not the other way round.
+- `vendor/templates/base/src/core/ngpc_flash.*` — vendor and upstream disagree in
+  **comments only** (standalone AMD stub vs `CLR_FLASH_RAM`/system.lib) over identical code.
+  Direction unclear, so left alone.
+
+
 ## 2026-07-18 — emulator re-vendored (both cores), player save states, agent guide
 
 ### Added

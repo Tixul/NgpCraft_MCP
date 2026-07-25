@@ -15,8 +15,10 @@
  *   - Wave/distortion (variable scroll per line)
  *   - Gradient background
  *
- * WARNING: the ISR must be extremely fast (~5 us per scanline at 6 MHz).
- * Only write 1-2 registers per HBlank. Heavy operations will cause glitches.
+ * WARNING: the ISR must fit inside the HBlank window (~5 us / ~30 cycles at
+ * 6.144 MHz) -- this is the write budget, NOT the scanline period (a full
+ * scanline is ~515 cycles / ~84 us). Only write 1-2 registers per HBlank;
+ * heavy operations spill into the next line and cause glitches.
  *
  * Usage:
  *   1. Call ngpc_raster_init() once

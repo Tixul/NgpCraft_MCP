@@ -6,8 +6,8 @@
  * Here the whole 24-bit space is one flat array and a read is an array index.
  *
  * Every power-on value below is transcribed from core/memory.py, which cites
- * its own sources (TMP95C061 datasheet, NGPC_HW_QUICKREF.md §5, and the
- * NeoPop reset table). Do not "tidy" these values: a wrong one boots a
+ * its own sources (TMP95C061 datasheet, NGPC_HW_QUICKREF.md §5). Do not
+ * "tidy" these values: a wrong one boots a
  * plausible-but-wrong machine, which is worse than not booting.
  */
 #include <cstring>
@@ -45,6 +45,15 @@ Region region_of(uint32_t addr) {
     if (addr >= 0x008000 && addr <= 0x008FFF) return Region::K2ge;     /* video regs + palette   */
     if (addr >= 0x009000 && addr <= 0x00BFFF) return Region::Vram;     /* SCR1/SCR2/CHAR RAM     */
     if (addr >= 0x200000 && addr <= 0x3FFFFF) return Region::CartRom;  /* read-only -> flash     */
+    /* THE SECOND DIE. A 4 MiB cartridge is two chips and the hardware maps the second
+     * at 0x800000 -- the copy loop below fills it, read8() answers flash IDs from it,
+     * and flash_command() accepts its unlock sequence. This function never learned
+     * about it and kept calling the window "unmapped", which was harmless while nobody
+     * asked (CartRom and Unmapped are equally non-writable) and became wrong the moment
+     * something did: the ROM analyzer reported the BIOS's perfectly normal cartridge
+     * probe -- 0xAA to 0x805555, 0x55 to 0x802AAA, the AMD unlock sequence -- as
+     * "writes into unmapped space", on every 4 MiB cart. */
+    if (addr >= 0x800000 && addr <= 0x9FFFFF) return Region::CartRom;
     if (addr >= 0xFF0000)                     return Region::Bios;     /* read-only              */
     return Region::Unmapped;
 }
@@ -100,8 +109,8 @@ void Machine::reset_memory() {
 
     for (uint32_t a = 0; a < 0x100; ++a) mem[a] = kIoPageReset[a];
 
-    /* A/D data register = the BATTERY gauge. NeoPop resets these to 0 because it
-     * HLEs the BIOS and never runs the real power-on battery check; we DO run it,
+    /* A/D data register = the BATTERY gauge. Resetting these to 0 is only safe if you
+     * HLE the BIOS and never run the real power-on battery check; we DO run it,
      * and 0 means "flat battery" -> the BIOS powers the console off (DEVLOG 183).
      * TMP95C061 Fig. 3.12(3-1): ADREG = (result << 6) | 0x3F, unused bits read 1.
      * Full scale 0x03FF = healthy. */
@@ -168,14 +177,35 @@ void Machine::reset_memory() {
     }
 
     /* BIOS hand-off system RAM the cart sees at entry. Cross-checked 2026-07-09
-     * against cosim --dump-mem 0x6F80 and found UNIVERSAL across carts. Without
+     * against a reference dump at 0x6F80 and found UNIVERSAL across carts. Without
      * these, carts diverge at instruction ~1 (Neo Turf reads 0x6F84). */
     mem[0x006F80] = 0xFF;  /* ADC/contrast reading, 0x03FF full-scale (low)  */
     mem[0x006F81] = 0x03;  /*                                        (high)  */
-    mem[0x006F84] = 0x40;  /* BIOS system status byte                        */
-    mem[0x006F87] = 0x01;  /* BIOS system status byte                        */
+    mem[0x006F83] = 0x10;
+    mem[0x006F86] = 0x40;
+    /* ⚡ 0x6F91 IS HOW A CARTRIDGE KNOWS IT IS ON A COLOUR CONSOLE.
+     *
+     * Read off a REAL BIOS boot (real_bios=true, 700 frames) and diffed against what
+     * this hand-off used to leave. We were seeding 0x40/0x01 at 0x6F84/0x6F87; the
+     * BIOS actually puts them at 0x6F83/0x6F86 and -- the part that matters -- fills
+     * 0x6F91 = 0x10 and 0x6F92 = 0x03, which we left at ZERO.
+     *
+     * A colour-aware mono cartridge tests that byte (Cool Boarders does it literally:
+     * `cp (0x6F91), 0x10`). With zero there, Samurai Shodown decides it is running on
+     * a plain mono NGP and never runs its colourisation code: measured, it wrote SIXTEEN
+     * bytes of palette in 1200 frames and nothing at all to the K2GE blocks, so its
+     * fighter stayed a two-tone silhouette. On the user's real NGPC the same cartridge
+     * comes up partly COLOURED -- green bamboo, characters near their canonical
+     * colours -- which is the game's own data, not a BIOS theme.
+     *
+     * So this is not decoration: it is the flag that selects the cartridge's colour
+     * path, and leaving it zero silently downgraded every colour-aware mono game. */
+    if (!k1ge_console) {
+        mem[0x006F91] = 0x10;
+        mem[0x006F92] = 0x03;
+    }
 
-    /* K2GE power-on values (NGPC_HW_QUICKREF.md §5 + NeoPop reset_memory()).
+    /* K2GE power-on values (NGPC_HW_QUICKREF.md §5).
      * 0x8000 = 0xC0 is load-bearing: VBlank+HBlank interrupts are ENABLED at
      * reset. An all-zero default booted a console with interrupts OFF. */
     mem[0x008000] = 0xC0;  /* control: VBlank (b7) + HBlank (b6) IRQ enabled */
@@ -284,6 +314,62 @@ void Machine::adc_tick(uint32_t cycles) {
     irq_pending |= 1u << kIrqVectorIndexIntAd;
 }
 
+/* --- serial channel 0 (the link cable) ------------------------------------
+ * A byte pipe between two machines. Disabled -> no-op (cable unplugged), which
+ * is the pre-link behaviour every existing ROM and test still gets. See
+ * machine.hpp for the model. */
+void Machine::serial_tick(uint32_t cycles) {
+    if (!serial_link_enabled) return;
+
+    /* TX: the BIOS wrote a byte to SC0BUF (captured in io_action_write). After one
+     * baud-time it is on the wire: hand it to the host to relay, and raise the
+     * TRANSMIT-buffer-empty interrupt so the BIOS transmit handler pulls the next
+     * byte from its ring. (That handler lives on the 0x19 vector on this BIOS.)
+     *
+     * CTS0 handshake (SC0MOD<CTSE>=bit6, datasheet 3.11 fig.16): when enabled, a
+     * queued byte is HELD while CTS0 is HIGH and only shifts out once CTS0 goes LOW
+     * -- so INTTX0 fires only when the PEER (whose RTS drives our CTS0) is ready to
+     * receive. Games that just blast bytes leave CTSE off / the peer's RTS low, so
+     * nothing changes for them; Card Fighters' Clash relies on this gate to keep the
+     * two consoles' handshake in step. Without it we completed every send instantly,
+     * one-sided, and CFC's mutual rendezvous never converged. */
+    if (serial_tx_busy) {
+        const bool ctse       = (mem[0x000052] & 0x40) != 0;  /* SC0MOD<CTSE> */
+        const bool cts_blocks = ctse && serial_cts_high;      /* peer not ready */
+        if (!cts_blocks) {
+            serial_tx_cycles -= int32_t(cycles);
+            if (serial_tx_cycles <= 0) {
+                serial_tx.push_back(serial_tx_byte);
+                serial_tx_busy = false;
+                irq_pending |= 1u << kIrqVectorSerialTransmit;
+                ++serial_wire_count;
+                ++serial_irq_tx_count;
+            }
+        } else {
+            ++serial_cts_hold_ticks;       /* debugger: "held by the peer", not idle */
+        }
+    }
+
+    /* RX: present the next queued byte at SC0BUF and raise INTRX0 -- but only when
+     * the previous one has been read (serial_rx_pending clears in read8, the
+     * overrun guard) AND our RTS says we are ready to receive (0xB2 bit0 == 0, set
+     * low by COMONRTS). serial_rx_cycles starts at 0 so the first byte arrives
+     * promptly, then paces at one byte-time. */
+    if (!serial_rx_pending && !serial_rx.empty() && (mem[0x0000B2] & 0x01) == 0) {
+        serial_rx_cycles -= int32_t(cycles);
+        if (serial_rx_cycles <= 0) {
+            serial_rx_byte = serial_rx.front();
+            serial_rx.pop_front();
+            serial_rx_pending = true;
+            serial_rx_cycles = kSerialByteCycles;
+            irq_pending |= 1u << kIrqVectorSerialReceive;
+            ++serial_irq_rx_count;
+        }
+    } else if (!serial_rx.empty() && (mem[0x0000B2] & 0x01) != 0) {
+        ++serial_rts_hold_ticks;    /* debugger: bytes waiting, WE are not ready */
+    }
+}
+
 /* --- the 8-bit timers ------------------------------------------------------
  * Same shape as core/timers.py so the two can be diffed by eye. */
 void Machine::timer_tick(uint32_t cycles) {
@@ -387,14 +473,20 @@ void Machine::timer_tick(uint32_t cycles) {
 }
 
 /* --- the calendar IC (RTC), I/O 0x90..0x97 --------------------------------
- * Transcribed from ares ngp/cpu/rtc.cpp + io.cpp: BCD fields that tick once a
- * second. Modelling this is what stops the BIOS deciding the coin cell is dead.
+ * BCD fields that tick once a second, per the SDK's register map. Modelling
+ * this is what stops the BIOS deciding the coin cell is dead.
  * The CPU runs at ~6.144 MHz, so one RTC second is that many cycles. */
 static constexpr uint32_t kRtcCyclesPerSecond = 6144000u;
 
+/* The alarm's own vector. See irq_priority_register in machine.hpp for how index 10 was
+ * pinned down, and why it is not the power button's index 8. */
+constexpr uint32_t kRtcAlarmVector = 10;
+
 uint8_t Machine::rtc_read(uint32_t addr) const {
     switch (addr) {
-        case 0x90: return uint8_t(rtc.enable & 1u);
+        /* bit0 = the clock runs, bit1 = the alarm is armed. Returning only bit0 meant the
+         * BIOS wrote 0x03 and read back 0x01 -- it could never see its own alarm. */
+        case 0x90: return uint8_t((rtc.enable & 1u) | ((rtc.alarm_enable & 1u) << 1));
         case 0x91: return rtc.year;
         case 0x92: return rtc.month;
         case 0x93: return rtc.day;
@@ -402,13 +494,19 @@ uint8_t Machine::rtc_read(uint32_t addr) const {
         case 0x95: return rtc.minute;
         case 0x96: return rtc.second;
         case 0x97: return uint8_t((rtc.weekday & 0x0Fu) | ((rtc.year & 3u) << 4));
+        case 0x98: return rtc.alarm_day;
+        case 0x99: return rtc.alarm_hour;
+        case 0x9A: return rtc.alarm_minute;
         default:   return 0;
     }
 }
 
 void Machine::rtc_write(uint32_t addr, uint8_t v) {
     switch (addr) {
-        case 0x90: rtc.enable  = uint8_t(v & 1u); break;
+        case 0x90:
+            rtc.enable       = uint8_t(v & 1u);
+            rtc.alarm_enable = uint8_t((v >> 1) & 1u);
+            break;
         case 0x91: rtc.year    = v; break;
         case 0x92: rtc.month   = v; break;
         case 0x93: rtc.day     = v; break;
@@ -416,6 +514,9 @@ void Machine::rtc_write(uint32_t addr, uint8_t v) {
         case 0x95: rtc.minute  = v; break;
         case 0x96: rtc.second  = v; break;
         case 0x97: rtc.weekday = uint8_t(v & 0x0Fu); break;
+        case 0x98: rtc.alarm_day    = v; break;
+        case 0x99: rtc.alarm_hour   = v; break;
+        case 0x9A: rtc.alarm_minute = v; break;
         default:   break;
     }
 }
@@ -428,40 +529,84 @@ static uint8_t rtc_days_in_month(uint8_t bcd_month, uint8_t bcd_year) {
     }
 }
 
+/* ONE SECOND on the calendar chip: the BCD carry chain.
+ *
+ * Standard BCD adjust, and there is only one shape it can take: increment, and if the
+ * low nibble has passed 9 add 6 to carry it into the high nibble; if the field has
+ * passed its limit, zero it and carry into the next. The limits are the calendar's, not
+ * a choice -- 0x59 seconds, 0x59 minutes, 0x23 hours, 0x12 months, 0x99 years. Each
+ * `return` means "the carry stopped here".
+ *
+ * ⚠️ TWO PLACES WHERE THE OBVIOUS TRANSLATION IS WRONG. Both are easy slips that
+ * survive casual testing, and both have been found in the wild:
+ *   - the month length must be indexed by the MONTH, not the day. Indexing by the day
+ *     agrees with the right answer for much of the month, so it hides.
+ *   - the year rollover must compare the FULL BYTE against 0x99. Comparing a 4-bit
+ *     field against 0x99 is always true, and the year then never rolls over at all. */
+void Machine::rtc_tick_one_second() {
+    rtc.second++;
+    if ((rtc.second & 0x0Fu) <= 0x09) return;
+    rtc.second += 6;
+    if (rtc.second <= 0x59) return;
+    rtc.second = 0;
+    rtc.minute++;
+    if ((rtc.minute & 0x0Fu) <= 0x09) return;
+    rtc.minute += 6;
+    if (rtc.minute <= 0x59) return;
+    rtc.minute = 0;
+    rtc.hour++;
+    if ((rtc.hour & 0x0Fu) >= 0x0a) rtc.hour += 6;
+    if (rtc.hour <= 0x23) return;
+    rtc.hour = 0;
+    rtc.weekday++;
+    if (rtc.weekday >= 7) rtc.weekday = 0;
+    rtc.day++;
+    if ((rtc.day & 0x0Fu) >= 0x0a) rtc.day += 6;
+    if (rtc.day <= rtc_days_in_month(rtc.month, rtc.year)) return;
+    rtc.day = 1;
+    rtc.month++;
+    if ((rtc.month & 0x0Fu) >= 0x0a) rtc.month += 6;
+    if (rtc.month <= 0x12) return;
+    rtc.month = 1;
+    rtc.year++;
+    if ((rtc.year & 0x0Fu) >= 0x0a) rtc.year += 6;
+    if (rtc.year <= 0x99) return;
+    rtc.year = 0;
+}
+
+/* Has the clock just reached the armed alarm?
+ *
+ * Day/hour/minute only -- the chip has no alarm second (SDK: ALARM{Day,Hour,Min,Code}) --
+ * so the match is taken on the second the minute turns over, ONCE, rather than staying
+ * true for all sixty seconds of that minute. Day 0 is the "every day" case: the BIOS
+ * normalises the SDK's 0xFF wildcard before it ever reaches the chip, so anything it
+ * writes is a real day; a game poking the register directly may not, and an impossible
+ * day should not silently mean "never". */
+bool Machine::rtc_alarm_due() const {
+    if (!rtc.alarm_enable) return false;
+    if (rtc.second != 0x00) return false;
+    if (rtc.minute != rtc.alarm_minute) return false;
+    if (rtc.hour != rtc.alarm_hour) return false;
+    return rtc.alarm_day == 0x00 || rtc.alarm_day == rtc.day;
+}
+
+/* Split out of `rtc_step` so that catching up on time that passed while the emulator was
+ * CLOSED goes through this exact chain rather than a second implementation -- a real
+ * console's clock runs off the coin cell whether or not you are playing. One carry chain,
+ * both callers, and an alarm crossed while the machine was dark still fires. */
+void Machine::rtc_advance_seconds(uint32_t seconds) {
+    for (uint32_t i = 0; i < seconds; ++i) {
+        if (!rtc.enable) return;        /* a stopped clock does not run, wound or ticked */
+        rtc_tick_one_second();
+        if (rtc_alarm_due()) irq_pending |= (1ull << kRtcAlarmVector);
+    }
+}
+
 void Machine::rtc_step(uint32_t cycles) {
     rtc.counter += cycles;
     while (rtc.counter >= kRtcCyclesPerSecond) {
         rtc.counter -= kRtcCyclesPerSecond;
-        if (!rtc.enable) continue;
-        /* BCD carry chain, byte for byte per ares. */
-        rtc.second++;
-        if ((rtc.second & 0x0Fu) <= 0x09) continue;
-        rtc.second += 6;
-        if (rtc.second <= 0x59) continue;
-        rtc.second = 0;
-        rtc.minute++;
-        if ((rtc.minute & 0x0Fu) <= 0x09) continue;
-        rtc.minute += 6;
-        if (rtc.minute <= 0x59) continue;
-        rtc.minute = 0;
-        rtc.hour++;
-        if ((rtc.hour & 0x0Fu) >= 0x0a) rtc.hour += 6;
-        if (rtc.hour <= 0x23) continue;
-        rtc.hour = 0;
-        rtc.weekday++;
-        if (rtc.weekday >= 7) rtc.weekday = 0;
-        rtc.day++;
-        if ((rtc.day & 0x0Fu) >= 0x0a) rtc.day += 6;
-        if (rtc.day <= rtc_days_in_month(rtc.month, rtc.year)) continue;
-        rtc.day = 1;
-        rtc.month++;
-        if ((rtc.month & 0x0Fu) >= 0x0a) rtc.month += 6;
-        if (rtc.month <= 0x12) continue;
-        rtc.month = 1;
-        rtc.year++;
-        if ((rtc.year & 0x0Fu) >= 0x0a) rtc.year += 6;
-        if (rtc.year <= 0x99) continue;
-        rtc.year = 0;
+        rtc_advance_seconds(1);
     }
 }
 

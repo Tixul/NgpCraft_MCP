@@ -1,17 +1,30 @@
-memory
-{
-	io(RW)	: org=0x000000, len=0x000100
-	ram(RW)	: org=0x004000, len=0x002C00
-	rom(RX)	: org=0x200000, len=0x200000
+# NGPCraft Toolchain — Linker script NGPC Color
+# Syntaxe : t900ld.py
+
+memory {
+    ram : org=0x004000, len=0x2C00
+    ; La ROM commence à 0x200000 : l'EN-TÊTE CARTOUCHE (64 o lus par le BIOS) N'EST PAS
+    ; fabriqué par l'outillage — c'est le `f_const` de main.c (`carthdr.h` : Licensed,
+    ; EntryPoint, CartID, CartSystem, CartTitle, CartReserved). main.c étant le premier
+    ; objet, son f_const atterrit pile à 0x200000. NE RIEN PRÉFIXER (sinon tout est
+    ; décalé de 64 o et le BIOS lit un faux en-tête).
+    rom : org=0x200000, len=0x200000
 }
 
-sections
-{
-	far_area	org=0x004000								: {*(f_area)}
-	far_startup	org=0x200000								: {*(f_header)}
-	far_const	org=org(far_startup)+sizeof(far_startup)		: {*(f_const)}
-	far_code	org=org(far_const)+sizeof(far_const)	: {*(f_code)}
-	far_data	org=org(far_code)+sizeof(far_code)
-				addr=org(far_area)+sizeof(far_area)			: {*(f_data)}
-	__DataRAM = addr(far_data);
+sections {
+    far_area    > ram  { *(f_area) }
+    far_startup > rom  { *(f_header) }
+    far_const   > rom  { *(f_const) }
+    far_code    > rom  { *(f_code) }
+    dma_prog    > rom  { *(dma_prog) }
+    far_alias   > rom  { *(ALIAS) }
+    far_flash   > rom  { *(FLASH) }
+    ; Sections custom des .asm écrits main de kuroi (tulink les place
+    ; AUTOMATIQUEMENT ; notre t900ld laissait leurs symboles à 0 EN SILENCE
+    ; → `cal _ngpc_sys_patch` = cal 0x000000, crash à l'instruction 2).
+    syspatch    > rom  { *(SYSPATCH) }
+    vramq_asm   > rom  { *(VRAMQ_ASM) }
+    far_data    > rom  addr=far_area_end  { *(f_data) }
 }
+
+stack_top = 0x006000
