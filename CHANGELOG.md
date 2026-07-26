@@ -1,6 +1,19 @@
 # Changelog — @ngpcraft/mcp
 
 
+## Unreleased
+
+- `ngpc_bug_check`: four measured traps added to the corpus -- `RGB()` built from `u8`
+  components loses the blue nibble on cc900; palette RAM is 16-bit only and entry 0 must
+  be left alone; sprite priority 0 means hidden; `COMINIT` installs the BIOS serial
+  handlers and they must not be reinstalled afterwards.
+- Docs: the link-cable page gains a session-layer section -- the reusable `ngpc_link`
+  module, the input-lockstep recipe (the wire round trip is two frames, so two steps of
+  input delay are what keeps 60 Hz), and host election by search time rather than by
+  asking both players to press the same button.
+- Docs: the palette quick-reference addresses were wrong (`0x8100/0x8200/0x8300`);
+  corrected to sprites `0x8200`, SCR1 `0x8280`, SCR2 `0x8300`.
+
 ## 2026-07-25 — emulator re-vendored, broken homemade-link fixed, PRNG fix picked up
 
 ### `vendor/emulator/` re-synced to upstream `6380728`

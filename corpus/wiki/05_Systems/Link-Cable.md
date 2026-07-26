@@ -229,7 +229,99 @@ Takeaways for your own protocol:
 
 ---
 
-## 8. Gotchas & field notes
+## 8. A reusable session layer (`ngpc_link`)
+
+Everything above is the transport. A game needs one layer more: find the peer, decide
+who is who, frame the bytes, notice a disconnection. That layer exists as a drop-in
+module in the base template, `optional/ngpc_link/`, and is used by a complete two-player
+game (`04_MY_PROJECTS/Fini/NeoGeo_Windcup`, doc `LINK_2P.md`).
+
+### 8.1 What it adds over the BIOS calls
+
+```
+0xA5 | type | seq | body | checksum       (checksum = (type + seq + body) XOR 0x5A)
+
+  HELLO  version, payload size, token hi/lo, "I already have a session"
+  DATA   the game's payload, NGPC_LINK_PAYLOAD bytes
+  BYE    the peer is leaving
+```
+
+- The `0xA5` magic lets the parser latch back on after noise or a mid-session restart:
+  one lost byte costs one packet, not the session.
+- A payload-size mismatch is reported (`NGPC_LINK_MISMATCH`) instead of quietly
+  shuffling bytes: two builds with different `NGPC_LINK_PAYLOAD` refuse to play.
+- Silence for ~2 s reports `NGPC_LINK_LOST` while still announcing, so a peer that
+  comes back rebuilds the session on its own.
+- Nothing ever blocks: one call per frame, bounded work.
+
+### 8.2 Who is host — the search-time rule ⭐
+
+Both consoles run the same binary, and the NGPC link is an **asynchronous UART with no
+master** (unlike the Game Boy, where the console driving the clock *is* the master). So
+the roles cannot come from the hardware — and they must not come from a coin toss the
+player cannot predict.
+
+The rule that works, and the one cable games have always used in spirit:
+
+> **Whoever opened the link screen first plays player one.**
+
+Each console announces how long it has been searching; the longest search wins. In the
+module the announced token is `(frames_searching << 4) | 4 random bits`.
+
+- **Resolution is one frame, deliberately.** Counting in seconds looks tidier but leaves
+  half a second of ambiguity in which the winner is random again — a measured gate at 30
+  frames of head start failed with seconds and passes with frames.
+- The four random bits only separate consoles that entered within a few frames
+  (~80 ms — two people never press start that close together); identical draws are
+  simply re-drawn.
+- Two perfectly identical machines (emulators, same frame, nobody touching anything)
+  stay in "searching" and settle the instant **any** button is touched, because the pad
+  state feeds the draw.
+- `ngpc_link_set_role()` remains for games whose menu already asked ("create" / "join").
+
+**Do not ask both players to press the same button.** It is the intuitive design and it
+is wrong: both press at once and nothing is decided. And never put "go back to the menu"
+on a button the link screen also uses — a stray press sends a `BYE`, which drops *both*
+consoles out of the session.
+
+### 8.3 Input lockstep — the recipe that keeps 60 Hz ⭐
+
+For a game where both consoles must simulate the same match (a versus game), the cheap
+and exact scheme is **input lockstep**: each console sends its own controller for step N
+and neither advances until it has the other one; both simulate both players. No game
+state on the wire, so there cannot be two versions of the truth.
+
+Two things decide whether this runs at 60 Hz or at 20:
+
+- **The round trip is TWO frames, not one.** A packet sent during frame `f` is only
+  presented to the peer's CPU during `f+1`, and the peer's game code reads it at the
+  start of `f+2`. Measured on two consoles: sending then waiting drops the game to
+  20 fps; one step of input delay still leaves 44 % of frames waiting; **two steps of
+  delay leaves 13 waiting frames out of 600** — a full 60 Hz, for ~33 ms between press
+  and effect. That is the classic fixed-delay netplay trade-off.
+- **Queue the received packets.** A session layer that keeps only the last packet
+  (`ngpc_link_in[]`) is right for exchanging state, but wrong here: two packets landing
+  in the same frame overwrite each other and the lost step desynchronises the match
+  *silently*. Set `NGPC_LINK_RX_QUEUE` to 4 or 8 and pop with `ngpc_link_recv()`.
+
+Carry a **step number** in each packet. It is what turns a desync into a message instead
+of two consoles quietly playing different games.
+
+Determinism is a property of the game, not of the link: check that no random number is
+drawn on a path both consoles run. In the reference game every `QRandom()` sits in an
+AI-only branch, which is exactly why lockstep on inputs is enough.
+
+### 8.4 Settings must cross the wire too
+
+Anything that changes the simulation has to be identical on both sides. In the reference
+game the host sends arena, points, match duration **and difficulty** before the first
+step — difficulty because the engine derives the *human* P2's speed from the opponent
+definition. Two consoles configured differently would simulate two different matches
+while each believing it was right.
+
+---
+
+## 9. Gotchas & field notes
 
 - **`COMSENDSTATUS` can return garbage under compiler optimisation.** Building a link
   stub with `-O` produced a "No return value" path where `com_send_status()` was
@@ -241,12 +333,17 @@ Takeaways for your own protocol:
   a single status guess.
 - **No inter-console frame sync.** Tolerate the peer being any number of frames
   ahead/behind.
+- **`COMINIT` installs the BIOS serial handlers itself** (`0x6FE4` / `0x6FE8`). An SDK
+  init routine that fills every user vector with a dummy handler is harmless as long as
+  it runs *before* the link is opened. Saving those two pointers at boot to "restore"
+  them afterwards overwrites the working handlers: exactly one byte leaves and the TX
+  ring stays full, which reads as "cable unplugged".
 - **Two different game versions can link** (CFC SNK ↔ Capcom): complementary roles,
   identical transport — the bridge is at the BIOS-COM byte level.
 
 ---
 
-## 9. How a faithful emulator models the cable
+## 10. How a faithful emulator models the cable
 
 - **Transport = a byte pipe.** Drain each machine's TX FIFO into the other; in-process
   for two players on one host, or over TCP for online (TCP because the cable never
@@ -260,7 +357,7 @@ Takeaways for your own protocol:
 
 ---
 
-## 10. Known gaps & what is *not* yet verified
+## 11. Known gaps & what is *not* yet verified
 
 None of these block a working link, but a programmer or emulator author should know
 they are open:
@@ -289,8 +386,9 @@ they are open:
   *should* work, but the cross-host role rendezvous is untested.
 - **`SC0CR` error flags** (framing / parity / overrun) are documented from the manual;
   emulation fidelity under real line conditions is unvalidated.
-- **Role-collision behaviour** (both players press A at once → ~6 bytes then abort) is
-  observed but not fully characterised — arbitrate roles rather than rely on it.
+- **Role collision is no longer an open question**: see §8.2. Do not arbitrate roles by
+  asking both players for the same button; elect the console that has been searching
+  longest, at one frame of resolution.
 - **Vector `0x0F`** (between `GEMODESET` and `COMINIT`) is a presumed reserved stub, not
   disassembled.
 

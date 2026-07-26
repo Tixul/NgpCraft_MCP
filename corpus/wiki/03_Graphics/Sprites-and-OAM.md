@@ -60,6 +60,20 @@ SPR_VCHAIN = 0x02       /* extend 8px down   (use 2 consecutive tile slots) */
 
 ---
 
+### 1.x Priority 0 means hidden
+
+The control byte's priority field is not a decoration: **0 = the sprite is not drawn**.
+A sprite set up with correct tile, position and palette but a zero priority is simply
+absent, while every piece of game logic attached to it keeps running — the object still
+moves, still collides, still scores. A game can be perfectly playable with an invisible
+object, so look at the OAM control byte before suspecting the tile data.
+
+The NGPC C Framework's `SetSprite()` always wrote control register 24 (`SPR_FRONT`) and
+added 6 for chaining. Any wrapper that forwards a flags value of `0` instead loses
+exactly the sprites that had no explicit `SpriteControl()` call after them.
+
+---
+
 ## 2. Chaining & Metasprites
 
 ### 2.1 H-chain and V-chain

@@ -277,6 +277,8 @@ See [Effects-and-Raster.md](Effects-and-Raster.md) for the full ngpc_palfx API.
 | Using wrong plane constant | Colors on SCR1 displayed by SCR2 | Match `GFX_SCR1/SCR2/SPR` to the plane actually used |
 | Direct HW write without restoring | Palette permanently changed | Always restore from shadow the next frame |
 | Mixed palette for sprite + tilemap | Confusing palette IDs | SCR palettes (0-15) and sprite palettes (0-15) are separate |
+| `RGB()` built from `u8` components | **Blue nibble lost**: an orange background renders green, while the data and the writes are both correct | Widen each component before shifting: `((u16)(r) & 15) \| (((u16)(g) & 15) << 4) \| (((u16)(b) & 15) << 8)`. cc900 evaluates `(u8 & 0xF) << 8` in 8-bit width |
+| Palette write helper written as a macro | Colours keep their low byte, high nibble lost: palette RAM takes **16-bit accesses only** | Keep the write in a *function* taking `u16` parameters — that is what makes cc900 emit word stores |
 
 ---
 
@@ -286,9 +288,10 @@ See [Effects-and-Raster.md](Effects-and-Raster.md) for the full ngpc_palfx API.
 |------|-------|-------|
 | Color format | `0x0BGR` (12-bit RGB444) | B/G/R each 0-15 |
 | RGB macro | `RGB(r, g, b)` | `((b<<8)\|(g<<4)\|r)` |
-| SCR1 palette RAM | `0x8100` | 16 palettes × 4 colors × 2 bytes |
-| SCR2 palette RAM | `0x8200` | same layout |
-| Sprite palette RAM | `0x8300` | same layout |
+| Sprite palette RAM | `0x8200` | 16 palettes x 4 colors x 2 bytes |
+| SCR1 palette RAM | `0x8280` | same layout |
+| SCR2 palette RAM | `0x8300` | same layout |
+| Background / window | `0x83E0` / `0x83F0` | 4 colors each |
 | GFX constants | `GFX_SCR1`, `GFX_SCR2`, `GFX_SPR` | use in API calls |
 | Colors per tile | 3 visible + 1 transparent | index 0 = always transparent on scroll |
 | Max palettes | 16 per plane | indices 0-15 |
