@@ -164,6 +164,21 @@ void Machine::reset_memory() {
          *
          * 🔑 "I could not find it in the ROM" is not "it does not exist". The machine
          * had it all along; I was looking for the wrong SHAPE. */
+        /* ...and the mode bit that SELECTS that table. 0x87E2 bit 7 is the K2GE's
+         * "K1GE upper-palette compatible" switch; on real K1GE silicon there is no
+         * switch, the machine simply IS that. The mono BIOS therefore never writes the
+         * register (disassembled: it does not address 0x87E2 once), so our renderer sat
+         * in K2GE colour mode and resolved every pixel through colour palettes nobody
+         * had filled -- the two-tone screen.
+         *
+         * So the RENDERER no longer asks this byte on a mono console (render.cpp: the
+         * machine decides, not the register). We still stamp it, for the debugger and
+         * for anything that reads the register file expecting it to describe the
+         * machine -- but nothing depends on it surviving: a cartridge clearing the
+         * video page puts it back to zero, and on this console that must change
+         * nothing at all. */
+        mem[0x0087E2] = 0x80;
+
         static const uint16_t kGreyRamp[8] = {
             0x0FFF, 0x0DDD, 0x0BBB, 0x0999, 0x0777, 0x0444, 0x0333, 0x0000,
         };
@@ -203,6 +218,48 @@ void Machine::reset_memory() {
     if (!k1ge_console) {
         mem[0x006F91] = 0x10;
         mem[0x006F92] = 0x03;
+    } else {
+        /* THE MONO NGP ANSWERS FOR ITSELF -- and it answers 0x00.
+         *
+         * This used to leave whatever ROM load had seeded here, which is the
+         * CARTRIDGE HEADER byte (rom[0x23], see above). For a mono cartridge that
+         * reads 0x00 and looked right by accident; for a COLOUR cartridge the header
+         * says 0x10, so a colour game put in our "mono NGP" was told it was on an
+         * NGPC and behaved exactly as it does on one -- which is the bug a user
+         * reported against SNK vs. Capcom, a colour game that shows a DIFFERENT
+         * screen on mono hardware.
+         *
+         * The console, not the cartridge, owns this byte: disassembled, the mono
+         * NGP's own BIOS does `ld (0x6F91), 0x00` (encoded F1 91 6F 00 00) exactly
+         * where the NGPC's does `ld (0x6F91), 0x10`, and it never writes 0x6F92 at
+         * all. So we stamp what that silicon stamps, whatever cartridge is in the
+         * slot -- and when the user supplies the real mono BIOS image, its own code
+         * writes the same value over the top. */
+        mem[0x006F91] = 0x00;
+        mem[0x006F92] = 0x00;
+
+        /* THE MONO NGP'S GREY RAMP, WHICH ON THAT SILICON IS NOT A PALETTE AT ALL.
+         *
+         * On a K1GE the 3-bit LEVEL tables at 0x8100 ARE the picture: level -> grey is
+         * fixed in the panel, there is no 12-bit colour block. We render through the
+         * K2GE's compat palette at 0x8380..0x83DF, and mono mode BLOCKS writes there
+         * (execute.cpp) because a cartridge cannot reach that silicon -- but the block
+         * caught the BIOS's own writes too, so the table stayed all ZERO and every
+         * level resolved to the same colour: the screen came out in two tones, and the
+         * NGP boot logo appeared over the SNK wallpaper that should have been invisible.
+         *
+         * So the ramp is part of the machine, stamped at power-on: the eight greys the
+         * retail BIOS programs (FFF DDD BBB 999 666 444 222 000, read off a real boot),
+         * for both sub-palettes of all three planes. Neutral on purpose -- the greys are
+         * the panel's, and the BIOS colour THEME is an NGPC feature that mono hardware
+         * has no way to apply. */
+        static const uint16_t kGreyRamp[8] = {
+            0x0FFF, 0x0DDD, 0x0BBB, 0x0999, 0x0666, 0x0444, 0x0222, 0x0000};
+        for (uint32_t base = 0x008380; base < 0x0083E0; base += 2) {
+            const uint16_t grey = kGreyRamp[((base - 0x008380) >> 1) & 0x07];
+            mem[base] = uint8_t(grey & 0xFF);
+            mem[base + 1] = uint8_t(grey >> 8);
+        }
     }
 
     /* K2GE power-on values (NGPC_HW_QUICKREF.md §5).
@@ -318,6 +375,41 @@ void Machine::adc_tick(uint32_t cycles) {
  * A byte pipe between two machines. Disabled -> no-op (cable unplugged), which
  * is the pre-link behaviour every existing ROM and test still gets. See
  * machine.hpp for the model. */
+/* TMP95C061 datasheet section 3.11, figures 3.11(6) SC0MOD, 3.11(8) BR0CR and
+ * 3.11(12) the channel-0 block diagram. Cycles per BIT are the product of the baud
+ * generator's input-clock divider, its own divider, and UART's 16x oversampling; a
+ * byte is that times the frame length in bits. */
+int32_t Machine::serial_byte_cycles() const {
+    const uint8_t sc0mod = mem[0x000052];
+    const uint8_t br0cr  = mem[0x000053];
+
+    /* SC0MOD<SM1,SM0>: 00 = I/O interface mode (not a UART frame at all), 01/10/11 =
+     * UART with 7 / 8 / 9 data bits. A frame is start + data + stop. */
+    const unsigned sm = (sc0mod >> 2) & 0x3;
+    if (sm == 0) return kSerialByteCycles;      /* I/O interface mode: not modelled */
+    const int32_t bits = int32_t(sm + 8);       /* 01->9, 10->10, 11->11 */
+
+    /* SC0MOD<SC1,SC0> picks what clocks the shift register. */
+    const unsigned sc = sc0mod & 0x3;
+    int32_t cycles_per_bit;
+    if (sc == 1) {
+        /* Baud rate generator. BR0CR<BR0CK1,0> selects phi-T0 (fc/4), phi-T2 (fc/16),
+         * phi-T8 (fc/64) or phi-T32 (fc/256); BR0CR<BR0S3:0> divides by 2..15, with
+         * 0000 meaning 16 (and 0001 documented as "don't set"). */
+        const int32_t tap = int32_t(4u << (2u * ((br0cr >> 4) & 0x3)));
+        const unsigned s = br0cr & 0x0F;
+        const int32_t div = (s == 0) ? 16 : int32_t(s);
+        cycles_per_bit = tap * div * 16;
+    } else if (sc == 2) {
+        cycles_per_bit = 2 * 16;                /* internal clock phi1 = fc/2, then /16 */
+    } else {
+        /* 00 = timer 2 match output, 11 = don't care. Nothing programs these on this
+         * console; keep the previous behaviour rather than invent a rate. */
+        return kSerialByteCycles;
+    }
+    return bits * cycles_per_bit;
+}
+
 void Machine::serial_tick(uint32_t cycles) {
     if (!serial_link_enabled) return;
 
@@ -332,15 +424,37 @@ void Machine::serial_tick(uint32_t cycles) {
      * receive. Games that just blast bytes leave CTSE off / the peer's RTS low, so
      * nothing changes for them; Card Fighters' Clash relies on this gate to keep the
      * two consoles' handshake in step. Without it we completed every send instantly,
-     * one-sided, and CFC's mutual rendezvous never converged. */
+     * one-sided, and CFC's mutual rendezvous never converged.
+     *
+     * ⚡ CTS GATES THE START OF A BYTE, NEVER A BYTE ALREADY GOING OUT. The datasheet
+     * says it twice -- "when the CTS0 pin goes high, AFTER COMPLETION OF THE CURRENT
+     * DATA SEND, data send is halted", and Note 1 of fig 3.11(16): "if the CTS signal
+     * rises during transmission, the NEXT data is not sent after the completion of the
+     * current transmission". A shift register that has begun cannot be paused.
+     *
+     * ⛔ THE BUG THIS ENDS: this used to re-test CTS every tick and freeze the
+     * in-flight byte's countdown, so a peer that pulsed its RTS high for a fraction of
+     * a frame stalled a byte that hardware would have finished. MEASURED, Card
+     * Fighters' Clash at the HP exchange that starts a VS match: the peer raises RTS
+     * just as we start a packet, the sender is held 6001 ticks, a 26-byte packet drags
+     * over three frames instead of two, and the game gives up -- "LINK ERROR. CHECK
+     * CONNECTIONS AND SETTINGS." on one console while the other waits at "CHOOSING HP."
+     * for ever. That is the reported "both press A and nothing happens".
+     *
+     * It only became visible when the cable started being relayed every LINK_SLICE
+     * instructions (for The Last Blade): at one relay per frame the peer's RTS pulse
+     * fell between two samples and was never seen. So the finer relay did not break
+     * CFC -- it exposed a transmitter that was always wrong. */
     if (serial_tx_busy) {
         const bool ctse       = (mem[0x000052] & 0x40) != 0;  /* SC0MOD<CTSE> */
         const bool cts_blocks = ctse && serial_cts_high;      /* peer not ready */
-        if (!cts_blocks) {
+        if (serial_tx_shifting || !cts_blocks) {
+            serial_tx_shifting = true;     /* committed: this byte now always finishes */
             serial_tx_cycles -= int32_t(cycles);
             if (serial_tx_cycles <= 0) {
                 serial_tx.push_back(serial_tx_byte);
                 serial_tx_busy = false;
+                serial_tx_shifting = false;
                 irq_pending |= 1u << kIrqVectorSerialTransmit;
                 ++serial_wire_count;
                 ++serial_irq_tx_count;
@@ -361,7 +475,7 @@ void Machine::serial_tick(uint32_t cycles) {
             serial_rx_byte = serial_rx.front();
             serial_rx.pop_front();
             serial_rx_pending = true;
-            serial_rx_cycles = kSerialByteCycles;
+            serial_rx_cycles = serial_byte_cycles();
             irq_pending |= 1u << kIrqVectorSerialReceive;
             ++serial_irq_rx_count;
         }
@@ -449,7 +563,36 @@ void Machine::timer_tick(uint32_t cycles) {
         timer_count[i] = total % limit;
         if (matches) {
             if (even) cascade[i] = matches;
-            irq_pending |= 1u << (kIrqVectorIndexIntT0 + i);
+            /* ⚡ ONE MATCH, ONE MICRO-DMA TRANSFER -- AND `irq_pending` IS A BITMASK.
+             *
+             * A per-HBlank scroll table is a channel armed on INTT0 walking one entry
+             * per scanline: the Nth entry MUST land on the Nth line, or every line
+             * below the loss is drawn with its neighbour's offset. The request used to
+             * be recorded by OR-ing one bit and answered later, in deliver_irq, which
+             * runs BETWEEN INSTRUCTIONS -- so two matches falling inside a single long
+             * instruction collapsed into one transfer and the table ran a line behind
+             * for the whole rest of the frame.
+             *
+             * MEASURED, SNK Gals' Fighters (the player's own save state, 120 frames):
+             * a healthy frame delivers 152 entries, and the entry that hands the bottom
+             * HUD its S2SO.V = 8 arrives on line 135, in time for line 136's snapshot.
+             * On the frames that lost one -- always at line 0 or 1, where the VBlank
+             * handler's block copy straddles the first HBlanks of the picture -- only
+             * 151 arrived, the split reached line 136 too late to be latched, and line
+             * 136 came out as a row of playfield above the special bar. That is the
+             * reported flickering line, and it is the SAME seam Samurai Shodown! 2 was
+             * fixed at, by a different mechanism (see render.cpp: the window is live).
+             *
+             * The DMA controller is not the CPU and does not wait for an instruction
+             * boundary: it steals a bus cycle when the request happens. So answer each
+             * match here, as it happens. A channel that runs its count out clears its
+             * own start vector, so the loop stops on its own; whatever is left over --
+             * no channel armed, or the channel just disarmed -- falls through to the
+             * CPU exactly as before. */
+            uint32_t unserviced = matches;
+            while (unserviced && micro_dma_service(kIrqVectorIndexIntT0 + i))
+                --unserviced;
+            if (unserviced) irq_pending |= uint64_t(1) << (kIrqVectorIndexIntT0 + i);
             /* "T03 is used as an interrupt to the Z80 CPU" -- SNK, 8Bit.txt. Timer 3
              * is the sound driver's heartbeat. It is not an option: without it the
              * driver boots, idles forever, and the game waits on a handshake that
@@ -653,26 +796,163 @@ int Machine::flash_block_of(int chip, uint32_t offset) const {
  * first, "the next size up" breaks the second. Two carts, two answers, same ROM size --
  * there is no static rule, which is exactly why this used to be guesswork.
  *
- * 🔑 BUT THE SDK'S OWN TABLE HAS A CONSTANT IN IT. On all three cards the save block is the
- * SECOND 8 KiB BLOCK FROM THE TOP, so `capacity - save address == 0x6000`, exactly:
+ * 🔑 BUT THE CART ASKS FOR ITS SAVE IN ITS OWN CARD'S UNITS, and that request is readable.
+ * On all three cards the save is the top of the chip -- the two 8 KiB blocks numbered n-3
+ * and n-2:
  *
- *      4 Mbit  block  9 @ 0x07A000     8 Mbit  block 17 @ 0x0FA000     16 Mbit  block 33 @ 0x1FA000
+ *      4 Mbit  blocks  8,  9 @ 0x078000     8 Mbit  16, 17 @ 0x0F8000     16 Mbit  32, 33 @ 0x1F8000
  *
- * So the cart answers the question itself, the first time it programs: capacity =
- * offset + 0x6000. And the trigger is precise rather than fuzzy -- offset + 0x6000 is a
- * standard capacity for THREE offsets only, and they are precisely the three save blocks.
- * A cart already presenting at the derived size (every full-size cart, saving at 0x1FA000)
- * changes nothing. The game's own retry then finds the geometry right. */
-void Machine::flash_adopt_capacity_from_save(int chip, uint32_t offset) {
-    const uint32_t derived = offset + 0x6000;
-    if (derived != 0x080000 && derived != 0x100000 && derived != 0x200000) return;
-    if (flash_blocks[chip].empty()) return;
+ * So the cartridge answers the question itself, two ways, and we take both:
+ *   - `flash_adopt_capacity_from_block` -- the BLOCK NUMBER a game hands the BIOS, read at
+ *     the `swi 1`, BEFORE the BIOS turns it into an address. This is the one that gets the
+ *     FIRST save right, and it is the one that was missing.
+ *   - `flash_adopt_capacity_from_save`  -- the ADDRESS, for homebrew that drives the chip
+ *     directly and never calls the BIOS.
+ *
+ * A cart already presenting at the derived size (every full-size cart) changes nothing. */
+/* The three cards the SDK's block tables describe. There is no fourth. */
+static constexpr uint32_t kCardCapacities[3] = {0x080000, 0x100000, 0x200000};
+
+/* How many blocks a card of `capacity` has: 64 KiB blocks all the way up, the last
+ * 64 KiB split in four. So the two 8 KiB SAVE blocks are numbers n-3 and n-2:
+ *      4 Mbit  n=11 -> 8, 9        8 Mbit  n=19 -> 16, 17       16 Mbit  n=35 -> 32, 33 */
+static uint32_t card_block_count(uint32_t capacity) { return capacity / 0x10000 + 3; }
+
+uint32_t Machine::flash_presented_capacity(int chip) const {
+    if (flash_blocks[chip].empty()) return 0;
     const auto& top = flash_blocks[chip].back();
-    if (top.offset + top.length == derived) return;      /* already this card */
-    flash_build_blocks(chip, derived);
+    return top.offset + top.length;
+}
+
+/* The image burned on this die -- meaning the DATA on it, not the file's length.
+ *
+ * A chip is never smaller than what is written on it, and that is the floor under any
+ * size the cartridge claims. But trailing 0xFF is not written: it is what an ERASED
+ * cell reads as, indistinguishable from a chip nobody filled to the top. Counting it
+ * as image is how a file that grew once stays grown: an under-filled cart persisted at
+ * a guessed 16 Mbit comes back looking like a 2 MiB image, its own correction is then
+ * refused as "smaller than the ROM", and every save after that is programmed into a
+ * slot nobody erased. Ignoring the erased tail heals those files on the next load, and
+ * costs nothing on a full cart -- a 2 MiB ROM's data still reaches far above any
+ * smaller card, so the floor still holds.
+ *
+ * Computed ONCE, when the cartridge goes in. It was briefly computed per call, which
+ * is a scan of the erased tail on EVERY flash command -- and a 256-byte save is 256
+ * programs, so an under-filled cart would have walked its 1.5 MiB of padding a
+ * quarter of a million times for one save. */
+void Machine::flash_measure_image() {
+    const uint32_t total = uint32_t(rom.size());
+    for (int chip = 0; chip < 2; ++chip) {
+        const uint32_t begin = chip == 0 ? 0u : kCartChipSize;
+        if (total <= begin) { flash_image_bytes[chip] = 0; continue; }
+        uint32_t end = chip == 0 ? (total < kCartChipSize ? total : kCartChipSize)
+                                 : total - begin;
+        while (end > 0 && rom[begin + end - 1] == 0xFF) --end;
+        flash_image_bytes[chip] = end;
+    }
+}
+
+uint32_t Machine::flash_image_size(int chip) const { return flash_image_bytes[chip]; }
+
+/* ⚠️ THE CARD-TYPE BYTE AND THE BLOCK MAP MUST NEVER DISAGREE.
+ *
+ * They are two halves of one answer: the BIOS turns a block NUMBER into an ADDRESS
+ * using the byte, and the chip decides how much to erase from the map. Let them drift
+ * and a game asking for its 8 KiB save block gets 64 KiB of its own ROM erased --
+ * measured, exactly that, when the byte said 8 Mbit over a 16 Mbit map. With
+ * `save_to_rom` on (the default) that lands in the .ngc.
+ *
+ * So every exit from this function leaves the byte describing the map, including the
+ * exit that REFUSES a resize -- the one path that used to leave a stale byte standing.
+ * (A cartridge on silicon cannot get into that state at all: the BIOS reads the chip's
+ * own ID at power-on. If a game clobbers the byte afterwards, a real console erases
+ * the wrong block too, and so do we -- that part is faithful, not a bug.) */
+void Machine::flash_present_as(int chip, uint32_t capacity) {
+    if (flash_blocks[chip].empty()) return;             /* no cartridge in this slot */
+    const uint32_t card_type_addr = chip == 0 ? kBiosFlashCardType0 : kBiosFlashCardType1;
+    if (capacity < flash_image_size(chip) ||            /* smaller than its own image */
+        capacity == flash_presented_capacity(chip)) {   /* already this card          */
+        mem[card_type_addr] = flash_size_code(chip);    /* ...but say so, either way   */
+        return;
+    }
+    flash_build_blocks(chip, capacity);
     /* The BIOS reads the card type before it touches the chip, so restate it: the block
      * map and this byte are two halves of one answer. */
     mem[chip == 0 ? kBiosFlashCardType0 : kBiosFlashCardType1] = flash_size_code(chip);
+}
+
+/* ⚡ THE CARTRIDGE TELLS US WHICH CHIP IT IS -- BY THE BLOCK NUMBER IT ASKS FOR.
+ *
+ * This is the earliest and the sharpest of the two signals, and it is the one that was
+ * missing. A game does not hand the BIOS an address; it hands it a BLOCK NUMBER
+ * (`ld rb3, BLOCK_NB` ; VECT_FLASHERS), a number it took from the SDK table FOR ITS OWN
+ * CARD. The BIOS then turns that number into an address using the card type at 0x6C58 --
+ * so by the time the chip sees anything, the identity is gone. Read at the `swi 1`, the
+ * number IS the answer:
+ *
+ *      block 16/17 -> an 8 Mbit card      block 8/9 -> 4 Mbit      block 32/33 -> 16 Mbit
+ *
+ * ⛔ WHY THE ADDRESS RULE BELOW IS NOT ENOUGH. It only recognises a save that lands in
+ * the top 64 KiB, and it only fires on the PROGRAM -- after the erase has already gone to
+ * the wrong block. Measured: a cart presented one size too big saves once (a virgin chip
+ * is all 0xFF, so the first program needs no erase at all -- the same false green as
+ * 2026-07-18) and then fails FOREVER, because the slot is never cleared again. That is
+ * the "sometimes I have to pick the size by hand" the user reported.
+ *
+ * The guards, in order of how much damage they prevent:
+ *   - a block inside the presented card's OWN top four is the card saving normally: no
+ *     signal, nothing to learn.
+ *   - the derived capacity must hold the image (`flash_present_as`). Shrinking a card is
+ *     the dangerous direction -- it moves the save DOWN, into the game's own code -- so a
+ *     capacity that would cut into the image is refused outright.
+ *   - the number must name a save block on EXACTLY ONE of the three cards. */
+void Machine::flash_adopt_capacity_from_block(int chip, uint32_t block) {
+    const uint32_t present = flash_presented_capacity(chip);
+    if (present == 0) return;
+    /* Its own top four: the card saving normally, nothing to learn. Written as a RANGE and
+     * not as ">= n-4", because a number ABOVE the presented map is the opposite case --
+     * a card bigger than the one we are showing, which is exactly what must get through. */
+    const uint32_t n = card_block_count(present);
+    if (block >= n - 4 && block < n) return;
+
+    uint32_t derived = 0;
+    for (uint32_t cap : kCardCapacities) {
+        const uint32_t candidate_blocks = card_block_count(cap);
+        if (block != candidate_blocks - 3 && block != candidate_blocks - 2) continue;
+        if (derived) return;                              /* two readings: no answer */
+        derived = cap;
+    }
+    if (derived) flash_present_as(chip, derived);
+}
+
+/* The same question asked of an ADDRESS, for the homebrew that drives the chip itself and
+ * never goes near the BIOS. A save lives in the LAST 64 KiB of the chip -- that is what
+ * the split into 32/8/8/16 is for -- so an offset that falls in the top 64 KiB of a
+ * standard card, while the card we present puts it mid-chip, names the card.
+ *
+ * (This used to test `offset + 0x6000` exactly, which recognises only the second 8 KiB
+ * block. Real games use the whole top: 0xF8000, 0xF9F00, 0xFBF00 are all in the corpus.) */
+void Machine::flash_adopt_capacity_from_save(int chip, uint32_t offset) {
+    for (uint32_t cap : kCardCapacities)
+        if (offset >= cap - 0x10000 && offset < cap) { flash_present_as(chip, cap); return; }
+}
+
+/* Listen to the request a game makes of the BIOS, at the `swi 1` -- the last moment it is
+ * still expressed in the CARTRIDGE's own units rather than in addresses.
+ *
+ *      ld rw3, VECT_FLASHERS (8) ; ld ra3, card ; ld rb3, BLOCK_NB ; swi 1
+ *      ld rw3, VECT_FLASHWRITE (6) ; ld ra3, card ; ld xde3, offset ; swi 1
+ *
+ * (SNK SysCall.txt / SYSTEM.INC; the register layout is the one tests/test_bios_flash_
+ * syscall.py drives.) This only READS registers -- `swi 1` still runs the real BIOS
+ * routine through the hardware vector table, exactly as before. */
+void Machine::bios_flash_syscall_hint() {
+    const uint32_t* b3 = (cpu.rfp == 3) ? cpu.regs : cpu.banks[3];
+    const uint8_t vector = uint8_t(b3[0] >> 8);      /* RW3 -- which system call */
+    const uint8_t card   = uint8_t(b3[0]);           /* RA3 -- 0 = 0x200000, 1 = 0x800000 */
+    if (card > 1) return;
+    if (vector == 8)      flash_adopt_capacity_from_block(card, uint8_t(b3[1] >> 8));  /* RB3 */
+    else if (vector == 6) flash_adopt_capacity_from_save(card, b3[2] & 0x00FFFFFFu);   /* XDE3 */
 }
 
 /* ⚠️ A NOR CELL ONLY GOES DOWN. Programming ANDs; only an erase restores the ones. */
@@ -686,6 +966,7 @@ void Machine::flash_program(int chip, uint32_t base, uint32_t addr, uint8_t data
 }
 
 void Machine::flash_erase_block(int chip, uint32_t base, uint32_t addr) {
+    flash_adopt_capacity_from_save(chip, addr - base);
     const int blk = flash_block_of(chip, addr - base);
     if (blk < 0 || !flash_blocks[chip][blk].writable) return;
     const auto& b = flash_blocks[chip][blk];
@@ -843,7 +1124,18 @@ bool Machine::micro_dma_service(unsigned vector_index) {
                 value |= uint32_t(read8(src + i)) << (8 * i);
             for (uint8_t i = 0; i < size; ++i) {
                 const uint32_t a = (dst + i) & kAddrMask;
-                if (region_writable(region_of(a))) mem[a] = uint8_t(value >> (8 * i));
+                if (!region_writable(region_of(a))) continue;
+                mem[a] = uint8_t(value >> (8 * i));
+                /* ⚡ A DMA WRITE IS STILL A WRITE, AND IT IS THE ONE RASTER WORK IS MADE OF.
+                 * The event log exists to answer "when in the frame did this register
+                 * change", and the answer for a scroll split is almost never a CPU store:
+                 * the split is driven by micro-DMA precisely so no instruction has to run.
+                 * Logging only `write8` left the log showing a game's vblank set-up and
+                 * NOTHING on the lines where the split actually happens -- a silence that
+                 * reads as "this game does no raster effect". It does; the CPU just is not
+                 * the one doing it. Same window, same fields, `pc` = the DMA'd source. */
+                if (a >= elog_lo && a <= elog_hi)
+                    note_event(kEventWrite, a, mem[a], src + i);
             }
             switch (kind) {
                 case 0: dst += size; break;         /* (DMAD+) <- (DMAS)  */

@@ -38,22 +38,53 @@ const CASES = [
   ["ngpc_emu_screenshot", { rom_path: rom }],
   ["ngpc_emu_tick_frame", { rom_path: rom }],
   ["ngpc_emu_opcode_coverage", { rom_path: rom }],
-  // ngpc_emu_map_lookup needs a linker .map, which a commercial ROM has no counterpart
-  // for -- it is exercised by the toolchain smoke, not here.
+  // Both registries: `list` needs no prior state and still crosses the whole bridge, so a
+  // flag renamed upstream shows up here instead of the first time an agent adds one.
+  ["ngpc_emu_breakpoint", { action: "list", rom_path: rom }],
+  ["ngpc_emu_watchpoint", { action: "list", rom_path: rom }],
+  // ngpc_emu_map_lookup and ngpc_emu_eventlog_profile both want a linker .map, which a
+  // commercial ROM has no counterpart for -- they are exercised by the toolchain smoke.
   ["ngpc_emu_native_run", { rom_path: rom, bios_path: bios, frames: 30 }],
+  // Timing is a FLAG now, so run it both ways: a rename upstream must not be able to
+  // leave the default silently falling back to free fetch.
+  ["ngpc_emu_native_run(free)", { rom_path: rom, bios_path: bios, frames: 5, timing: "free" }],
+  ["ngpc_emu_native_run(guard)", { rom_path: rom, bios_path: bios, frames: 5, hw_guard: true }],
 ];
+
+// A case may name a variant as `tool(label)`; the handler is the part before the paren.
+const handlerName = (name) => name.replace(/\(.*\)$/, "");
+
+// What a green run must CONTAIN. A tool that answers with the interesting field missing
+// is a pass by byte count and a failure in fact -- which is the whole point of this file.
+const CONTRACTS = {
+  "ngpc_emu_native_run": (o) => o.timing === "silicon" && o.hw_safety != null,
+  "ngpc_emu_native_run(free)": (o) => o.timing === "free",
+  "ngpc_emu_native_run(guard)": (o) => o.hw_safety != null,
+};
 
 let pass = 0, fail = 0, skip = 0;
 for (const [name, args] of CASES) {
-  const fn = toolHandlers[name];
+  const fn = toolHandlers[handlerName(name)];
   if (!fn) { console.log(`MISSING ${name}`); fail++; continue; }
-  if (name === "ngpc_emu_native_run" && !bios) {
+  if (handlerName(name) === "ngpc_emu_native_run" && !bios) {
     console.log(`SKIP    ${name}  (no bios given)`); skip++; continue;
   }
   try {
     const out = await fn(args);
     const size = JSON.stringify(out).length;
-    console.log(`ok      ${name}  (${size} B)`);
+    const contract = CONTRACTS[name];
+    // The bridges answer {content:[{type:"text",text:"<json>"}]}; look inside for the
+    // fields the contract names, rather than asserting on the envelope.
+    const payload = (() => {
+      try { return JSON.parse(out?.content?.[0]?.text ?? "null") ?? out; }
+      catch { return out; }
+    })();
+    if (contract && !contract(payload)) {
+      console.log(`FAIL    ${name}\n        answered, but the contract does not hold`);
+      fail++;
+      continue;
+    }
+    console.log(`ok      ${name}  (${size} B)${contract ? " +contract" : ""}`);
     pass++;
   } catch (e) {
     console.log(`FAIL    ${name}\n        ${String(e.message).split("\n")[0]}`);

@@ -49,6 +49,57 @@ class _SerialMachine(Protocol):
 # never left stranded in the FIFO for a frame.
 _DRAIN_CHUNK = 256
 
+# ⚡ HOW OFTEN TWO CONSOLES IN ONE PROCESS MUST BE INTERLEAVED, in instructions.
+#
+# Running one console's whole frame while the other stands still puts a frame of
+# latency on the answer, in one direction, always -- and that is enough to lose Card
+# Fighters' Clash's VS handshake (its packet reader gives up when the next byte is not
+# already in the BIOS ring). Both places that own two consoles use this: the shell's
+# local 2-player cable (PlayPage.LINK_SLICE) and mirror netplay
+# (core.netplay.run_two_consoles_interleaved).
+#
+# ⚠️ THIS NUMBER IS A CORRECTNESS FIGURE, NOT A TUNING KNOB -- The Last Blade needs it
+# no coarser than 400 (2000 already fails it). See PlayPage.LINK_SLICE for that table.
+CABLE_SLICE = 400
+
+# A frame is a few thousand instructions, so this is a runaway backstop with a wide
+# margin, not a target: whatever happens, the caller finishes the frame the plain way.
+_MAX_SLICES = 256
+
+
+def run_two_consoles_interleaved(first, second, link) -> None:
+    """Advance both consoles by one frame, a slice at a time, relaying between slices.
+
+    `first` runs first within each slice round -- callers that must agree bit for bit
+    across two PCs (mirror netplay) have to pass the SAME console first on both.
+
+    Machines without the sliced `run` interface (test doubles) fall back to a whole
+    frame each, which is what this code did everywhere before.
+    """
+    if not hasattr(first, "run") or not hasattr(second, "run"):
+        first.run_frames(1)
+        link.pump()
+        second.run_frames(1)
+        link.pump()
+        return
+    pair = (first, second)
+    starts = [m.run(0, record=False)[0].frame_count for m in pair]
+    done = [False, False]
+    for _ in range(_MAX_SLICES):
+        for i, m in enumerate(pair):
+            if done[i]:
+                continue
+            summ, _ = m.run(CABLE_SLICE, record=False)
+            if summ.executed == 0 or summ.frame_count != starts[i]:
+                done[i] = True          # this console's frame is finished
+        link.pump()
+        if all(done):
+            return
+    for i, m in enumerate(pair):        # never leave a frame half-run
+        if not done[i]:
+            m.run_frames(1)
+    link.pump()
+
 
 class InProcessLink:
     """Cable between two machines living in the same process.
@@ -136,8 +187,28 @@ class TcpLink:
         self.monitor = monitor
         self.machine.serial_set_enabled(True)
         self._rx = bytearray()
+        self._out = bytearray()     # written but not yet accepted by the kernel
         self.bytes_out = 0
         self.bytes_in = 0
+        # ⚡ WHY THE PEER WENT AWAY, once it has -- and None while the cable is good.
+        #
+        # ⛔ THE CRASH THIS ENDS. "Sometimes, some games lost the connection between
+        # users playing in online mode and then, the emulator crashes." pump() caught
+        # only BlockingIOError/InterruptedError, which are the "try again" cases. A peer
+        # that GOES is a different family -- ConnectionResetError, BrokenPipeError,
+        # ConnectionAbortedError -- and those escaped. MEASURED, both ways a peer can
+        # vanish (a clean FIN and an RST from a kill/NAT drop): ConnectionResetError out
+        # of the FIRST pump after the peer left, every time.
+        #
+        # That pump runs inside PlayPage._tick, which is a QTimer slot, and PyQt answers
+        # an unhandled Python exception in a slot with qFatal(). MEASURED: the process
+        # dies with 0xC0000409 and prints no traceback -- which is exactly why this reads
+        # as "the emulator crashes" rather than as an error. (Same mechanism the root
+        # conftest documents for the test runner.)
+        #
+        # So the link records the loss instead of raising it, and stops touching a dead
+        # socket. The owner polls this and can say so; the emulation is never disturbed.
+        self.lost: str | None = None
 
     # --- connection helpers -------------------------------------------------
     @classmethod
@@ -157,8 +228,19 @@ class TcpLink:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return cls(machine, conn)
 
+    def _lose(self, why: str) -> None:
+        """The peer is gone. Record it once and let go of the socket."""
+        if self.lost is None:
+            self.lost = why or "peer closed"
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
     # --- per-frame pump -----------------------------------------------------
     def pump(self) -> None:
+        if self.lost is not None:
+            return                      # a dead cable carries nothing; do not touch it
         # 1) local TX -> socket. Drained into one buffer so the monitor sees one
         # handover per pump (and can release bytes it is holding back for latency
         # even on a pump where the game sent nothing).
@@ -169,25 +251,44 @@ class TcpLink:
                 break
             buf += data
         outgoing = self.monitor.on_tx(bytes(buf)) if self.monitor is not None else bytes(buf)
-        if outgoing:
+        self._out += outgoing
+        if self._out:
+            # ⛔ NOT `sendall` ON A NON-BLOCKING SOCKET. It raises BlockingIOError the
+            # moment the kernel buffer fills and does NOT say how much of the buffer it
+            # already handed over -- so the old code dropped the whole write, mid-stream,
+            # and a link cable that loses bytes is a game that desyncs or hangs waiting
+            # for a packet that was never sent. (core/lobby.py fixed exactly this on the
+            # lobby socket; the direct host/join socket still had it.)
+            #
+            # `send` reports what it took. Keep the rest and offer it again next pump --
+            # the frame is relayed several times now (PlayPage._run_one_frame), so a full
+            # buffer costs a fraction of a frame, not a byte.
             try:
-                self.sock.sendall(outgoing)
-                self.bytes_out += len(outgoing)
+                sent = self.sock.send(self._out)
+                self.bytes_out += sent
+                del self._out[:sent]
             except (BlockingIOError, InterruptedError):
-                # kernel buffer full; the bytes are lost for this simple relay.
-                # A production link would queue them -- fine for frame-rate,
-                # low-volume link traffic.
-                pass
+                pass                # buffer full: nothing taken, nothing lost, try again
+            except OSError as e:
+                # ...whereas this family IS the peer going away. Note it and stop.
+                self._lose(str(e))
+                return
 
         # 2) socket -> local buffer
         try:
             while True:
                 chunk = self.sock.recv(4096)
                 if not chunk:
-                    break               # peer closed
+                    # A clean FIN. This used to just leave the loop, so a peer that
+                    # quit tidily was indistinguishable from one with nothing to say
+                    # and the game sat there waiting for a console that had gone.
+                    self._lose("peer closed the connection")
+                    break
                 self._rx.extend(chunk)
         except (BlockingIOError, InterruptedError):
             pass
+        except OSError as e:
+            self._lose(str(e))
 
         # 3) buffer -> local RX FIFO. Push unconditionally: the core's serial_tick
         # is the flow-control gate (it only PRESENTS a byte to the CPU once our RTS

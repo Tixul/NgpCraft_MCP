@@ -71,7 +71,14 @@ Return: `RA3` = 0 (`SYS_SUCCESS`) or an error. `VECT_FLASHWRITE` destroys RBC3/X
 ⚠️ **The SDK's own `ngpc.h` in this RAG has `#define VECT_FLASHWRITE` with NO VALUE**
 (the numbers were lost from that copy). Trusting it would have called vector 0 —
 `VECT_SHUTDOWN`. The authority is `SYSTEM.INC`: SHUTDOWN 0 … SYSFONTSET 5,
-**FLASHWRITE 6, FLASHALLERS 7, FLASHERS 8**, FLASHPROTECT 9.
+**FLASHWRITE 6, FLASHALLERS 7, FLASHERS 8**, FLASHPROTECT **0x0D**.
+
+⛔ **This line used to say FLASHPROTECT 9. Nine is ALARMSET** (`SYSTEM.INC`, and its
+own ABI section documents FLASHPROTECT at `0dh` with a different signature entirely:
+`RB3` = first block, `RC3` = card type, `RD3` = how many). The clean-room BIOS image
+was wired from the wrong number for one pass: a game setting an RTC alarm would have
+irreversibly write-protected a block of its own cartridge instead. Pinned now by
+`tests/test_hle_bios_image.py::SyscallVectorNumbers`.
 
 **Our `swi 1` is not high-level-emulated in the C++ core.** It pushes PC/SR and jumps
 through the hardware vector table exactly as the chip does, so with the retail BIOS
@@ -151,6 +158,80 @@ save lives. The SDK reserves the **final** block for the system program.
 by everything else (`flash_size_code` → the `0x6C58` hand-off). Two independent size
 ladders is how a 4 Mbit cartridge gets told it is 8 Mbit by one path and 4 by another.
 
+---
+
+## 4b. 🔑 Which cartridge is it? **The cart tells us — in its own units**
+
+A console never has to guess: it probes the chip, the chip answers a device ID that names
+its size, done. **A ROM file has thrown that away.** The image is what the publisher
+burned; the part is as big as the publisher bought. Delta Warp is 512 KiB of ROM on an
+8 Mbit chip, StarGunner is a small homebrew on a 16 Mbit one — **same image size, two
+different cartridges**, so no rule over the file can be right for both. That is not a gap
+in our model of the hardware; it is information the dump does not contain.
+
+What survives is the cart's own **save request**, and it is expressed in the units of the
+card the game was burned on (SDK `FlashMem.txt` / `BLOCK_NO.INC`). The save is the top of
+the chip — the two 8 KiB blocks numbered `n-3` and `n-2`:
+
+| card | blocks | addresses |
+|---|---|---|
+| 4 Mbit | 8, 9 | `0x078000`, `0x07A000` |
+| 8 Mbit | 16, 17 | `0x0F8000`, `0x0FA000` |
+| 16 Mbit | 32, 33 | `0x1F8000`, `0x1FA000` |
+
+So we listen in two places, and both matter:
+
+* **`flash_adopt_capacity_from_block`** — the **BLOCK NUMBER** a game hands the BIOS
+  (`ld rb3, BLOCK_NB` ; `VECT_FLASHERS`), read at the **`swi 1`**. This is the only moment
+  the number still exists: the BIOS's next move is to turn it into an address using
+  `0x6C58`, and after that the identity is gone. Block 17 means *an 8 Mbit card*,
+  whatever we were presenting.
+* **`flash_adopt_capacity_from_save`** — the **ADDRESS**, for homebrew that drives the
+  chip itself and never calls the BIOS. An offset in the **top 64 KiB** of a standard card
+  names that card.
+
+⛔ **Why the address alone was not enough**, measured: with only the address rule, a cart
+presented one size too big saves **once** and then fails forever. The first program lands
+on a virgin chip — all `0xFF`, nothing to erase, any geometry "works" — and by the time we
+learn anything, the erase has already gone to the wrong block, so the slot is never
+cleared again. And the rule only recognised `capacity − 0x6000`, i.e. the *second* 8 KiB
+block; real games use the whole top (`0xF8000`, `0xF9F00`, `0xFBF00` are all in the corpus
+of §6), and those learnt nothing at all. **That is what made the manual size setting
+necessary.** `tests/test_bios_flash_syscall.py::CartridgeIdentityTests` pins both cases,
+and both fail against the previous core.
+
+⚠️ **AND THE CARD-TYPE BYTE MUST NEVER OUTLIVE THE MAP.** They are two halves of one
+answer: the BIOS turns a block NUMBER into an ADDRESS using `0x6C58`, the chip decides
+how MUCH to erase from its block map. An adversarial pass found the one path that left
+them out of step — the exit that *refuses* a resize returned without restating the byte
+— and measured the consequence: a game asking for its 8 KiB save block had **64 KiB of
+its own ROM erased**, which with `save_to_rom` on (the default) reaches the `.ngc`.
+Every exit from `flash_present_as` now leaves the byte describing the map.
+(On silicon this state cannot arise: the BIOS reads the chip's own ID at power-on. If a
+game clobbers the byte afterwards, a real console erases the wrong block too — that part
+is faithful. What was ours to fix was the core creating the disagreement itself.)
+
+**The guards** — the dangerous direction is *shrinking*, because it moves the save DOWN
+into the game's own code and the next erase takes 8 KiB of it:
+
+* a capacity smaller than the **data** on the die is **refused outright** — and *data*
+  is the point: a trailing run of `0xFF` is not image, it is what an erased cell reads
+  as, indistinguishable from a chip nobody filled to the top. Counting it as image is
+  how a file that grew once stayed grown (see §5), so the floor ignores the erased tail
+  and an already-padded `.ngc` heals on its next load. Measured once, when the cartridge
+  goes in — computing it per call would rescan the padding on every programmed byte;
+* a block inside the presented card's **own top four** is that card saving normally — no
+  signal, nothing to learn;
+* a number **above** the presented map is a *bigger* card (StarGunner asking for block 33)
+  and is allowed through: growing is free, the space above the image is erased `0xFF`;
+* the number must name a save block on **exactly one** of the three cards.
+
+⚠️ **Still guesswork: the card byte at POWER-ON.** Until the game asks for its first save
+we have nothing to go on, and `auto` presents every sub-2 MiB cart as 16 Mbit
+(`ngpc_settings.flash_capacity_bytes`). A game that reads `0x6C58` for itself before ever
+saving would read the wrong card. Saying so rather than pretending the question is closed.
+The manual **Flash size** setting stays as an override; it should no longer be needed.
+
 ### Cross-checks
 * **An independent implementation of the same chip, derived from the datasheet rather
   than from ours, reaches the same model**: same block map, same `input & data`
@@ -186,6 +267,18 @@ FlashFileBlockHeader u32 start_address        (a CPU address: 0x200000 + offset)
 * We save the granules of the cart image that **differ from the ROM file** — which
   correctly includes an **erase**, since 0xFF-where-there-was-data is a change that must
   survive a reload.
+* ⚡ **The image is persisted at the CHIP's size, not at the size we guessed.** `auto`
+  presents an under-filled cart as 16 Mbit because it has to guess; the cartridge then
+  corrects us (§4b). Writing the `.ngc` back at the guess pads it out to a size the cart
+  never had — and on the next load that padding reads as *image*, so the correction is
+  refused ("a chip is never smaller than its image") and every later save is programmed
+  into a slot nobody erased. Measured on a 512 KiB cart: session 1 saved, the file grew
+  to 2 MiB, sessions 2-4 wrote the bitwise AND of two payloads. `_cart_windows()` now
+  asks the core what it presents *now* (`ngpc_flash_capacity`), so the file is exactly
+  one chip. A cart that really does use the bigger part (StarGunner, saving at
+  `0x1FA000`) still grows — that is where its save lives.
+  Pinned by `tests/test_save_persistence.py`, which saves DIFFERENT bytes each session:
+  the same payload twice cannot fail, because programming a byte over itself is a no-op.
 * `data_length` is a u16, so runs are split at 32 KiB.
 * Saves live in `saves/`, **not** next to the ROM: the ROM directory is the player's
   collection, not ours to scatter files through. Copy the file next to a ROM and any

@@ -182,6 +182,32 @@ The cold-start memory image (`core/memory.py::_build_builtin_readable_bytes`)
 pre-populates `WSI.H = WSI.V = 0xFF` and `REF = 0xC6` to match the HW
 reset values (the rest of the K2GE register range remains 0).
 
+#### 6.1.1 The window is NOT latched per line
+
+The native line-by-line renderer takes the latched display registers from the
+start-of-line raster snapshot, but reads **the window registers live** — the value
+standing as the line finished, like the palettes, the VRAM and the OAM.
+
+Sourced by omission, and the omission is systematic: the K2GE Tech Ref attaches an
+explicit *"reflected/displayed in the next line being drawn"* caution to `0x8012`
+(§ 4-11), `0x8020/21` (§ 4-3-4), `0x8030` (§ 4-4-7), `0x8032..35` (§ 4-4-8) and
+`0x8118` (§ 4-6). The window block (§ 4-5, `0x8002..0x8005`) has a caution of its
+own — about `WBA + WSI` overflowing 256 — and it says nothing about latching. The one
+block whose caution does not mention the next line is the one that gates the display
+area against the raster as it draws.
+
+A game settles it. Samurai Shodown! 2 hides the junk row between its playfield and its
+bottom HUD by writing `WSI.H = 0` from the H-blank handler (window empty ⇒ the whole
+line becomes the out-of-window colour) and putting `0xA0` back one line later: a
+deliberate one-line blank. Read from the snapshot, that blank lands one line too late —
+harmlessly inside the black HUD — and leaves the junk row on screen. MEASURED over
+12 000 frames of a match: 4 053 of 8 802 blank requests left content on the line the
+game blanked; live, 0 of 9 046.
+
+Gate: `tests/test_window_is_live.py` — which also pins the OTHER half (a mid-frame
+`S1SO.V` write must still land on the NEXT line), because "make everything live" would
+satisfy the window test and break every scroll split in every game.
+
 ### 6.2 NEG invert
 
 When bit 7 of `0x8012` is set, every 4-bit RGB component of every

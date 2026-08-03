@@ -38,6 +38,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from core import flash_file, native, rom_loader
@@ -107,10 +108,16 @@ _RTC_BLOB_SIZE = ctypes.sizeof(native.RtcState)
 # PAUSED    time stops with the emulator and resumes exactly where it left off. Not what
 #           hardware does, but it is REPRODUCIBLE -- the one to pick for debugging, or to
 #           keep a game's in-world clock where you left it.
+# MANUAL    the clock is set to a date and time YOU chose, at every launch. On a real
+#           console that is what the BIOS setup screen is for -- and the clean-room HLE
+#           image has no setup screen, so without this there was no way to set the clock
+#           at all short of changing the PC's. Deterministic on purpose: a game whose
+#           events depend on the date can be put on the date you want, repeatably.
 CLOCK_HARDWARE = "hardware"
 CLOCK_HOST = "host"
 CLOCK_PAUSED = "paused"
-CLOCK_MODES = (CLOCK_HARDWARE, CLOCK_HOST, CLOCK_PAUSED)
+CLOCK_MANUAL = "manual"
+CLOCK_MODES = (CLOCK_HARDWARE, CLOCK_HOST, CLOCK_PAUSED, CLOCK_MANUAL)
 
 # A guard on the catch-up, not a policy: if the saved stamp is nonsense (a PC clock that
 # jumped, a file copied from another machine) we would otherwise wind the chip forward one
@@ -134,6 +141,31 @@ def host_clock_state() -> "native.RtcState":
     st.minute = _to_bcd(t.tm_min)
     st.second = _to_bcd(min(t.tm_sec, 59))   # a leap second would not be valid BCD
     st.weekday = (t.tm_wday + 1) % 7      # Python Mon=0..Sun=6 -> the chip's Sun=0..Sat=6
+    st.counter = 0
+    return st
+
+
+def manual_clock_state(when: "str | None") -> "native.RtcState | None":
+    """The chosen date/time, in the packed BCD the chip's registers use.
+
+    `when` is an ISO-8601 string ("1999-01-01T12:00:00") -- what the settings store.
+    Returns None when it cannot be read, and the caller then leaves the clock alone
+    rather than inventing a date nobody chose."""
+    if not when:
+        return None
+    try:
+        t = datetime.fromisoformat(str(when))
+    except (TypeError, ValueError):
+        return None
+    st = native.RtcState()
+    st.enable = 1
+    st.year = _to_bcd((t.year - 2000) % 100)
+    st.month = _to_bcd(t.month)
+    st.day = _to_bcd(t.day)
+    st.hour = _to_bcd(t.hour)
+    st.minute = _to_bcd(t.minute)
+    st.second = _to_bcd(min(t.second, 59))
+    st.weekday = (t.weekday() + 1) % 7        # Python Mon=0..Sun=6 -> the chip's Sun=0
     st.counter = 0
     return st
 
@@ -171,11 +203,16 @@ def write_rtc_file(path: Path, state: "native.RtcState") -> None:
     tmp.replace(path)
 
 
-def apply_saved_clock(machine, path: Path, mode: str) -> None:
+def apply_saved_clock(machine, path: Path, mode: str, manual: "str | None" = None) -> None:
     """Put the console's clock back, per the chosen mode. One place, so the game path,
     the BIOS-only path and any reboot all behave identically."""
     if mode == CLOCK_HOST:
         machine.set_rtc(host_clock_state())
+        return
+    if mode == CLOCK_MANUAL:
+        state = manual_clock_state(manual)
+        if state is not None:
+            machine.set_rtc(state)
         return
 
     saved = read_rtc_file(path)
@@ -234,7 +271,10 @@ class NativeSession:
         flash_size: int = 0,
         real_bios: bool = False,
         clock_mode: str = CLOCK_HARDWARE,
+        clock_manual: str | None = None,
         k1ge_console: bool = False,
+        language: int = 1,          # 0 = Japanese, 1 = English (SDK SysWork 0x6F87)
+        hle_bios: bool = False,     # our clean-room image: no setup screen, see below
     ):
         if not native.available():
             raise RuntimeError(
@@ -271,7 +311,23 @@ class NativeSession:
         # reset, which consults the marker inside it to tell a first boot from a resume.
         # Which machine a monochrome cartridge thinks it is in. Set BEFORE either reset
         # path below, because the reset is what stamps 0x6F91.
+        self.k1ge_console = k1ge_console
+        # ⚡ WHO OWNS THE CONSOLE'S SETTINGS: the BIOS, or the emulator's UI.
+        #
+        # A REAL BIOS has a setup screen. That screen is the console's own control panel,
+        # what the player sets on it goes into battery RAM, and `commit_system_ram` now
+        # keeps it -- so it must WIN, in both boot modes. Overriding it from the UI made
+        # the BIOS screen a decoration: you set the language on it and the emulator undid
+        # the choice at the next launch.
+        #
+        # Our clean-room HLE image has no such screen (yet), so a console running it has
+        # no control panel other than the UI. There, and on a console that has never been
+        # configured at all, the setting is the only thing that can answer.
+        self.hle_bios = hle_bios
         self.machine.set_k1ge_console(k1ge_console)
+        # ...and which language the console is set to (0x6F87). Same deal: the reset is
+        # what stamps it, and a bilingual cartridge reads that byte and nothing else.
+        self.machine.set_language(language)
         self.real_bios = real_bios and bios is not None
         self.ram_path = SYSTEM_RAM_PATH
         self._power_pressed = False
@@ -288,6 +344,7 @@ class NativeSession:
         # launches the way the hardware's does.
         self.rtc_path = SYSTEM_RTC_PATH
         self.clock_mode = clock_mode if clock_mode in CLOCK_MODES else CLOCK_HARDWARE
+        self.clock_manual = clock_manual
         # The console's own settings -- language, date, colour theme -- live in the coin
         # cell, and the player configured them once through Boot BIOS. Load that cell here
         # for BOTH boot modes: the fast hand-off is meant to skip the BIOS INTRO, not the
@@ -295,14 +352,23 @@ class NativeSession:
         # work RAM must never be persisted back as console settings.)
         if self.ram_path.exists():
             self.system_ram_baseline = self.ram_path.read_bytes()
+        # Was this console configured BEFORE this launch? The answer decides who owns its
+        # settings, and it must be taken now: the console-boot path fills the cell in as it
+        # goes (the shell auto-completes the BIOS's first-boot wizard so a player who only
+        # wanted to start a game is not left on a setup screen), so by hand-off time an
+        # unconfigured console looks configured. The UI setting is the answer we give that
+        # wizard on the player's behalf -- once. From the next launch the console remembers,
+        # and its own setup screen is the only thing that changes it.
+        self.started_unconfigured = self.system_ram_baseline is None
 
         if self.real_bios:
             if self.system_ram_baseline is not None:
-                self.machine.set_battery_ram(self.system_ram_baseline)
+                self.machine.set_battery_ram(
+                    self._cell_with_machine_type(self.system_ram_baseline))
             # BEFORE the reset, like the RAM: the BIOS reads the chip during its own boot.
             # With a configured cell it leaves what it finds; with a blank one it resets
             # the date to 1998-01-01 itself, which is the real dead-battery behaviour.
-            apply_saved_clock(self.machine, self.rtc_path, self.clock_mode)
+            apply_saved_clock(self.machine, self.rtc_path, self.clock_mode, self.clock_manual)
             self.machine.reset(real_bios=True)
         else:
             self.machine.reset(bios_handoff=True)
@@ -311,7 +377,7 @@ class NativeSession:
             # and it does so on a blank coin cell -- so the BIOS takes that boot's
             # dead-battery path and stamps 1998-01-01 over the chip. Restoring before the
             # reset would hand the player's clock straight to that warm-up to be wiped.
-            apply_saved_clock(self.machine, self.rtc_path, self.clock_mode)
+            apply_saved_clock(self.machine, self.rtc_path, self.clock_mode, self.clock_manual)
             # The player's language/date, laid back over the hand-off for the same reason as
             # the clock above: the fast boot skips the intro, not the settings. The warm-up
             # ran on a blank cell (its captured char RAM stays deterministic); here we put
@@ -338,15 +404,30 @@ class NativeSession:
         # which for a cart already padded to its chip size is the padded length -- so the
         # identity is read off the FILE, and a file grown by an earlier save keeps claiming
         # the bigger card forever. That is why an explicit setting must be able to shrink it.
+        #
+        # ⚡ AND THE CAPACITY IS ONE DIE'S, NOT THE WHOLE CARTRIDGE'S. The caller sizes the
+        # chip from the ROM FILE, and a 4 MiB file is TWO 2 MiB dies -- so handing that
+        # number to chip 0 tells the core a single die is 4 MiB long. Every consumer of
+        # `flash_capacity(0)` then believes it: `_cart_windows` returns a 4 MiB window at
+        # 0x200000, which runs 2 MiB past the end of the cart window. MEASURED on SvC The
+        # Match of the Millennium (and it is the same for Metal Slug 2nd Mission and Densha
+        # de Go! 2): `reboot()` raised `flash_restore: 0x200000+4194304 is not in the cart
+        # window` -- and a reboot is what ATTACHING PLAYER 2 does, so two-player play on a
+        # 4 MiB cart died on the spot; in the GUI that exception lands in a Qt slot, which
+        # PyQt answers with qFatal, i.e. the whole emulator vanishes with no message.
+        # `_read_cart_image` was reading 6 MiB for a 4 MiB cart too (chip 0's 2 MiB of
+        # nothing included), so it never matched the file and an in-game save would have
+        # written that 6 MiB back over the .ngc.
+        die = min(flash_size, CART_CHIP_SIZE) if flash_size else 0
         self._flash_presented = min(len(self._rom), CART_CHIP_SIZE)
-        if flash_size and flash_size != self._flash_presented:
-            self.machine.set_flash_size(flash_size)
+        if die and die != self._flash_presented:
+            self.machine.set_flash_size(die)
             # The BIOS reads the card type BEFORE it touches the chip, and `reset` wrote it
             # from the pre-resize map -- so it has to be restated, or the byte and the block
             # map disagree about which card this is.
-            self.machine.write(BIOS_FLASH_CARD_TYPE, bytes([flash_size_code(flash_size)]))
-        if flash_size and flash_size > len(self._rom):
-            self._rom = self._orig_rom = bytes(self.machine.read(flash_file.CART_BASE, flash_size))
+            self.machine.write(BIOS_FLASH_CARD_TYPE, bytes([flash_size_code(die)]))
+        if die and die > len(self._rom):
+            self._rom = self._orig_rom = bytes(self.machine.read(flash_file.CART_BASE, die))
 
         # THE SAVE. The cartridge is the save -- a game erases a block of its own ROM
         # and programs its slot back in -- so restoring one means putting those bytes
@@ -383,23 +464,41 @@ class NativeSession:
         return bool(blocks)
 
     def commit_system_ram(self) -> bool:
-        """The coin cell. Whatever the BIOS learnt -- your language, the date -- lives here.
+        """The coin cell. Whatever the BIOS learnt -- your language, your colour theme --
+        lives here, and on a console boot the BIOS SETUP SCREEN is what wrote it.
 
-        Only in real-BIOS mode: in the hand-off the BIOS never ran, so its work RAM holds
-        nothing it wrote and saving it would be inventing settings the console never had.
+        Only in real-BIOS mode: in the hand-off the BIOS never ran, so nothing here is
+        its work and saving it would invent settings the console never had.
 
-        ⚡ We persist the coin cell AS IT WAS CONFIGURED, not the machine's live work RAM.
-        Once a game boots, work RAM is the GAME's -- its variables, not console settings --
-        and the game-boot hand-off deliberately hands the cart a clean slate anyway. Writing
-        that back would wipe the language/date the player set. A game never reconfigures the
-        console, so the right thing to persist is the baseline we loaded. (The console is
-        (re)configured through Boot BIOS, which saves system.ram on its own path.)
-        """
-        if not self.real_bios or self.system_ram_baseline is None:
+        ⚡ WHAT IS PERSISTED, AND WHY IT IS NOT THE WHOLE OF RAM.
+        Two regions, two owners:
+
+          * 0x6C00-0x6FFF is the BIOS's own settings page. It is written by the setup
+            screen, and it is saved LIVE -- what you set on that screen is what the
+            console remembers, exactly as a coin cell behaves. This used to write the
+            baseline back instead, so every choice made in the BIOS screen was thrown
+            away on exit: the language asked again at every launch, the colour theme
+            never sticking. (And with a blank cell it saved nothing at all, so a first
+            boot re-ran the setup wizard for ever.)
+          * everything below it is the GAME's work RAM. That one keeps the baseline: a
+            game fills it with its own variables, and writing those back as console
+            settings would wipe the config with a save file's leftovers.
+
+        The clock is the other half of the same coin cell and rides its own file, live
+        from the chip -- see `commit_rtc`. """
+        if not self.real_bios:
             return False
+        base = bytearray(self.system_ram_baseline
+                         if self.system_ram_baseline is not None
+                         else bytes(native.RAM_SIZE))
+        page_start, page_end = self._SETTINGS_PAGE
+        live = self.machine.read(page_start, page_end - page_start)
+        lo = page_start - native.RAM_START
+        if lo + len(live) <= len(base):
+            base[lo:lo + len(live)] = live
         self.ram_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.ram_path.with_suffix(".tmp")
-        tmp.write_bytes(self.system_ram_baseline)
+        tmp.write_bytes(bytes(base))
         tmp.replace(self.ram_path)
         return True
 
@@ -448,8 +547,13 @@ class NativeSession:
             blocks: list[tuple[int, bytes]] = []
             offset = 0
             for base, size in self._cart_windows():
-                blocks += flash_file.diff_blocks(
-                    self._orig_rom[offset:offset + size], current[offset:offset + size], base)
+                # The pristine image can be SHORTER than the chip (an under-filled cart
+                # whose save lives above its ROM) -- pad it with the erased 0xFF a blank
+                # chip reads as, or `diff_blocks` walks off the end and reports nothing
+                # for exactly the region the save is in.
+                pristine = self._orig_rom[offset:offset + size]
+                pristine += b"\xFF" * (size - len(pristine))
+                blocks += flash_file.diff_blocks(pristine, current[offset:offset + size], base)
                 offset += size
             flash_file.write(self.save_path, blocks)
             wrote = True
@@ -459,12 +563,25 @@ class NativeSession:
         return wrote
 
     def _cart_windows(self) -> list[tuple[int, int]]:
-        """(base, length) of each flash die, exactly as the core maps them."""
+        """(base, length) of each flash die, exactly as the core maps them.
+
+        ⚡ THE LENGTH IS THE CHIP'S, NOT THE FILE'S. `auto` presents an under-filled cart
+        as 16 Mbit because it has to guess -- but the cartridge then CORRECTS us, by the
+        block number it asks the BIOS for. Persisting at the guess writes the .ngc back
+        padded out to a size the cart never had, and on the next load that padding reads
+        as image: the correction is then refused (a chip is never smaller than its image)
+        and every later save is ANDed into a slot nobody erased.
+
+        Measured, three sessions on a 512 KiB cart: session 1 saved, the file grew to
+        2 MiB, sessions 2 and 3 wrote garbage. Asking the core what it presents NOW --
+        after the cart has spoken -- makes the file exactly one chip, and it stays right.
+        """
         size = len(self._rom)
-        chip0 = min(size, CART_CHIP_SIZE)
+        chip0 = self.machine.flash_capacity(0) or min(size, CART_CHIP_SIZE)
         windows = [(flash_file.CART_BASE, chip0)]
         if size > CART_CHIP_SIZE:
-            windows.append((CART_CHIP1_BASE, min(size - CART_CHIP_SIZE, CART_CHIP_SIZE)))
+            chip1 = self.machine.flash_capacity(1) or min(size - CART_CHIP_SIZE, CART_CHIP_SIZE)
+            windows.append((CART_CHIP1_BASE, chip1))
         return windows
 
     def _read_cart_image(self) -> bytes:
@@ -517,6 +634,20 @@ class NativeSession:
         else:
             self.machine.reset(bios_handoff=True)
             self.machine.set_rtc(clock)               # after: the warm-up would wipe it
+            # ⛔ AND THE CONSOLE'S OWN SETTINGS PAGE, exactly as __init__ does after the
+            # same reset. Without it a power cycle quietly forgets the language, and a
+            # dual-language SNK cartridge comes back up in JAPANESE.
+            #
+            # It stayed unnoticed while the only way here was the reset button. Then the
+            # link button started power-cycling player 1 (so a game that probes the cable
+            # at boot can find its peer) -- and two-player play began showing one window
+            # in the chosen language and the other in Japanese, because player 2 was a
+            # FRESH session, which does restore the page, and player 1 was a rebooted one,
+            # which did not. Reported by a player, diffed byte by byte: 25 bytes of the
+            # BIOS page differed between the two consoles, 0x6DC8.. still at 0xFF on the
+            # rebooted side.
+            self._restore_bios_settings_page()
+            self._apply_bios_colour_theme()
 
         for base, data in cartridge:
             self.machine.flash_restore(base, data)
@@ -595,6 +726,15 @@ class NativeSession:
     _THEME_ADDR, _THEME_LEN = 0x006DD8, 0x80
 
     def _apply_bios_colour_theme(self) -> None:
+        # ⚡ NOT ON THE MONO NGP. The theme is a K2GE feature -- that silicon has no
+        # 12-bit palette to theme -- and 0x8380 is where `reset_memory` stamps the
+        # panel's grey ramp for a mono console instead. Writing an NGPC theme over it
+        # put the mono picture back into two tones, and only ONCE THE COIN CELL HAD
+        # BEEN CONFIGURED: a fresh install looked right, and every launch after the
+        # player had been through Boot BIOS once did not. Same rule as the machine-type
+        # bytes above: the console answers for itself.
+        if self.k1ge_console:
+            return
         try:
             cell = self.ram_path.read_bytes()
         except OSError:
@@ -614,12 +754,57 @@ class NativeSession:
     # power-on default left, and a dual-language SNK cart boots Japanese. Laid back on top of
     # the hand-off EXCEPT the bytes the hand-off itself owns for the inserted cartridge:
     #   0x6C58/0x6C59  the flash card-type the BIOS learnt (0 = "no cart" -> the save fails)
+    #   0x6F87         the LANGUAGE, which is now a SETTING and not the cell's to keep
     #   0x6F91/0x6F92  the colour machine-type reset stamps per the console's own mode
     #   0x6FB8-0x6FFF  the user interrupt vector table the hand-off seeds
     # Game work RAM (0x4000-0x6BFF) is untouched, so the boot stays as deterministic as it
     # was: only the OS settings page is restored.
     _SETTINGS_PAGE = (0x006C00, 0x007000)
-    _SETTINGS_SKIP = ((0x006C58, 0x006C5A), (0x006F91, 0x006F93), (0x006FB8, 0x007000))
+    # ⚠️ 0x6F87 is in this list because a user reported the language setting doing
+    # nothing: the page restore below put the SAVED cell's language back over the value
+    # the reset had just stamped from the setting, so whichever language the console was
+    # first configured in stayed forever. The cell is still the authority for everything
+    # else on this page -- the date, the theme, the BIOS's own scratch.
+    _SETTINGS_SKIP = ((0x006C58, 0x006C5A), (0x006F87, 0x006F88),
+                      (0x006F91, 0x006F93), (0x006FB8, 0x007000))
+
+    def _cell_with_machine_type(self, cell: bytes) -> bytes:
+        """The coin cell as handed to a console BOOT, with the machine-type bytes set
+        to THIS console's answer rather than to the one that happened to be saved.
+
+        0x6F91/0x6F92 say which machine the cartridge is in. They are not battery-backed
+        settings -- but our console boot reaches the cartridge without the BIOS having
+        re-stamped them, so whatever the cell carries is what the game reads. Handed over
+        untouched that is the LAST session's console: boot the mono NGP after any NGPC
+        session and a colour cartridge (SNK vs. Capcom) still read 0x10 and went on
+        believing it was in an NGPC. Blanking them instead was worse -- measured, the
+        COLOUR console then answered 0x00 and its games came up monochrome.
+
+        So we stamp the pair `reset_memory` stamps, from the same setting. The hand-off
+        path solves this by SKIPPING these bytes when it restores the page
+        (`_SETTINGS_SKIP`); this is the console-boot half of the same rule."""
+        lo, hi = 0x006F91 - native.RAM_START, 0x006F93 - native.RAM_START
+        if len(cell) < hi:
+            return cell
+        stamp = b"\x00\x00" if self.k1ge_console else b"\x10\x03"
+        return cell[:lo] + stamp + cell[hi:]
+
+    def _ui_owns_language(self) -> bool:
+        """True when the emulator's language setting is the only control panel there is:
+        the HLE image (no setup screen) or a console that was never configured."""
+        return self.hle_bios or self.started_unconfigured
+
+    def _settings_skip(self) -> tuple:
+        """Which bytes of the settings page the coin cell does NOT get to restore.
+
+        The language is in that list only when the UI owns it. With a real BIOS on a
+        configured console the cell is the authority -- that is where its setup screen
+        wrote the player's choice, and taking it back would be the emulator overruling
+        the console's own control panel."""
+        skip = list(self._SETTINGS_SKIP)
+        if not self._ui_owns_language():
+            skip = [r for r in skip if r != (0x006F87, 0x006F88)]
+        return tuple(skip)
 
     def _restore_bios_settings_page(self) -> None:
         base = self.system_ram_baseline
@@ -627,7 +812,7 @@ class NativeSession:
             return
         page_start, page_end = self._SETTINGS_PAGE
         addr = page_start
-        for skip_start, skip_end in self._SETTINGS_SKIP:
+        for skip_start, skip_end in self._settings_skip():
             if addr < skip_start:
                 self._write_from_baseline(base, addr, skip_start)
             addr = max(addr, skip_end)

@@ -22,11 +22,12 @@
  * renderer that quietly disagrees with the slow one is not an optimisation, it is a
  * second implementation of the machine -- and this project has exactly one.
  *
- * WHICH REGISTERS A LINE IS DRAWN WITH. The display block (0x8000..0x803F: scroll,
- * window, sprite offset, plane priority, 2D control) is taken from the RASTER SNAPSHOT
- * of this line -- the values standing as the line opened -- because the Tech Ref says a
- * write lands on the NEXT line. Everything else (palettes, the backdrop register, VRAM,
- * the OAM) is read LIVE, because that is what the beam sees.
+ * WHICH REGISTERS A LINE IS DRAWN WITH. The LATCHED part of the display block
+ * (0x8000..0x803F: scroll, sprite offset, plane priority, 2D control) is taken from the
+ * RASTER SNAPSHOT of this line -- the values standing as the line opened -- because the
+ * Tech Ref says in as many words that a write lands on the NEXT line. Everything else
+ * (palettes, the backdrop register, VRAM, the OAM -- and the WINDOW, see regs_of_line)
+ * is read LIVE, because that is what the beam sees.
  */
 #include "machine.hpp"
 
@@ -85,11 +86,36 @@ struct Regs {
     uint8_t s1so_h, s1so_v, s2so_h, s2so_v;
 };
 
+/* ⚡ THE WINDOW IS NOT LATCHED PER LINE, AND THE MANUFACTURER SAYS SO BY OMISSION.
+ *
+ * Every display register this renderer reads carries an explicit caution in the K2GE
+ * Tech Ref -- 0x8012 (§ 4-11 "Setting in this register is reflected in the next line
+ * being drawn"), 0x8020/21 (§ 4-3-4), 0x8030 (§ 4-4-7), 0x8032..35 (§ 4-4-8), 0x8118
+ * (§ 4-6). The WINDOW registers (§ 4-5, 0x8002..0x8005) carry a caution too -- and it
+ * is about WBA + WSI overflowing 256, not about latching. The one register block whose
+ * caution does NOT mention the next line is the one that gates the display area
+ * against the raster as it draws.
+ *
+ * ⚖️ AND A GAME SETTLES IT. Samurai Shodown! 2 hides the seam between its playfield and
+ * its bottom HUD by writing WSI.H = 0 (window empty -> the whole line becomes the
+ * out-of-window colour) from the H-blank handler, then putting 0xA0 back one line
+ * later: a deliberate one-line blank. MEASURED (event log): the 0 lands on line 136 at
+ * cycle 73, the 0xA0 on line 137 at cycle 74. Reading the window from the start-of-line
+ * snapshot blanks line 137 -- which is already inside the black HUD, so the blank does
+ * nothing -- and leaves the junk row that SCR1 draws on line 136 in plain sight. That is
+ * the "badly rendered line above the bottom bar" of the bug report, and the layer mask
+ * names the culprit: with SCR1 alone, line 136 is 8-colour garbage and line 138 is the
+ * HUD. The game is blanking the junk; we were blanking the line after it.
+ *
+ * Live here means "as the line ENDED": render_scanline runs when the line's cycles have
+ * elapsed, exactly like the palettes, the VRAM and the OAM this renderer already reads
+ * live. Everything else stays on the snapshot, because for everything else the
+ * manufacturer wrote the caution down. */
 inline Regs regs_of_line(const Machine& m, uint32_t line) {
     const uint8_t* r = m.raster_log[line];   /* the 0x8000..0x803F block, as the line opened */
     Regs g;
-    g.wba_h = r[0x02]; g.wba_v = r[0x03];
-    g.wsi_h = r[0x04]; g.wsi_v = r[0x05];
+    g.wba_h = m.mem[0x008002]; g.wba_v = m.mem[0x008003];
+    g.wsi_h = m.mem[0x008004]; g.wsi_v = m.mem[0x008005];
     g.ctl2d = r[0x12];
     g.po_h  = r[0x20]; g.po_v  = r[0x21];
     g.scr2_in_front = (r[0x30] & 0x80) != 0;
@@ -105,12 +131,24 @@ struct PaletteView {
     uint32_t lut, cpal;     /* K1GE compat: the level LUT and the 12-bit palette. */
 };
 
+/* THE MONO NGP'S EIGHT GREYS. On a K1GE the LUT value IS the picture: the Tech Ref's
+ * palette LUT (0x8100..) holds a 3-bit COLOUR CODE, "the smallest contrast change being
+ * the LSB and the largest the MSB", and the panel turns it into a shade. There is no
+ * colour RAM on that machine to hold a ramp -- so we do not read any, and no cartridge
+ * write can flatten it. Values are the ones the retail BIOS programs for mono output. */
+constexpr uint16_t kK1geGrey[8] = {0x0FFF, 0x0DDD, 0x0BBB, 0x0999,
+                                   0x0666, 0x0444, 0x0222, 0x0000};
+
 inline uint16_t resolve(const Machine& m, const PaletteView& pv,
                         unsigned code, unsigned value) {
     if (pv.compat) {
         /* Only the SINGLE P.C bit exists on the old machine: two palettes per plane. */
         const unsigned p_c = code & 1u;
         const unsigned level = m.mem[pv.lut + p_c * 4u + value] & 0x07u;
+        /* A REAL K1GE stops here -- level -> grey, straight out of the panel. The
+         * K2GE's compat mode instead sends that level through a 12-bit palette, which
+         * is what lets an NGPC colourise a mono cartridge. Same LUT, two machines. */
+        if (m.k1ge_console) return kK1geGrey[level];
         return color_at(m, pv.cpal + (p_c * 8u + level) * 2u);
     }
     return color_at(m, pv.base + code * 8u + value * 2u);
@@ -127,7 +165,16 @@ inline uint16_t resolve(const Machine& m, const PaletteView& pv,
 void Machine::render_scanline(uint32_t line) {
     if (line >= kVisibleScanlines) return;
     const Regs g = regs_of_line(*this, line);
-    const bool compat = (mem[kK1geMode] & 0x80) != 0;
+    /* ⚡ ON A K1GE THERE IS NO MODE BIT: the machine IS this mode.
+     *
+     * 0x87E2 is a K2GE register -- the mono NGP's own BIOS never writes it (it is not
+     * in that console's address map at all, K1GE Tech Ref §3), and anything clearing
+     * the video page puts it back to zero. Deriving the mode from that byte therefore
+     * ran the MONO console through the COLOUR path, resolving every pixel with palettes
+     * nobody had filled: the boot logo came up over the SNK wallpaper and the whole
+     * screen was two tones. The console setting decides; the register only speaks for
+     * a K2GE that was asked to imitate one. */
+    const bool compat = k1ge_console || (mem[kK1geMode] & 0x80) != 0;
 
     uint16_t* row = &framebuffer[line * kScreenWidth];
 

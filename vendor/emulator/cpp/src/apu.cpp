@@ -167,15 +167,24 @@ void Apu::tick(uint32_t main_cycles) {
     /* How many output samples does `chip` chip-clocks buy? Exactly
      * `chip * 44100 / 3072000`, with the remainder carried -- NOT `chip / 69`, which
      * is what this did and which produced 44 522 Hz worth of samples per second while
-     * claiming 44 100. */
-    chip_residue += chip * kAudioSampleHz;
-    uint32_t samples = chip_residue / kApuClockHz;
+     * claiming 44 100.
+     *
+     * ⚠️ WIDEN BEFORE MULTIPLYING. `chip` and `kAudioSampleHz` are both uint32, so
+     * `chip * kAudioSampleHz` was evaluated in 32 bits and only widened afterwards on
+     * its way into the uint64 accumulator. It overflows once `chip` passes
+     * 4294967295 / 44100 = 97 392 chip-clocks -- under TWO frames' worth, which a HALT
+     * that idles a frame or a long `ldir` reaches. Same arithmetic, same rate, same
+     * latency: only the intermediate width changes.
+     * (The libretro tree already had this; the desktop tree did not. Reconciled
+     * 2026-08-03, see specs/LINK_CABLE.md 2.4.) */
+    chip_residue += uint64_t(chip) * kAudioSampleHz;
+    const uint64_t sample_count = chip_residue / kApuClockHz;
     chip_residue %= kApuClockHz;
 
     /* A single `ldir` can bill twenty thousand cycles; a HALT idles a whole frame.
      * Cap the burst so one pathological instruction cannot ask for a million
      * samples in one call -- the ring only holds 16 384 anyway. */
-    samples = std::min(samples, Apu::kRingFrames);
+    const uint32_t samples = uint32_t(std::min<uint64_t>(sample_count, Apu::kRingFrames));
     for (uint32_t i = 0; i < samples; ++i) emit_sample();
 }
 

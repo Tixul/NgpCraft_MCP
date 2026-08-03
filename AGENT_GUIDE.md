@@ -112,6 +112,66 @@ Two failure modes to hold in mind:
 For anything that must actually run on hardware or in the emulator, use
 `ngpc_compile_official` (Toshiba cc900 / asm900 / tulink, user-installed).
 
+## ⏱️ Timing: `ngpc_emu_native_run` bills the cartridge bus. Do not turn that off by accident
+
+The cartridge flash is slow, and on this console it is the dominant cost: **every
+instruction is fetched across it**. The raw C++ core defaults to *free* fetch for
+backward compatibility, which makes a machine measured that way ~2.9× too fast — so this
+tool applies the silicon-calibrated set on every run and **tells you which model ran**, in
+the `timing` field of the answer.
+
+| Knob | Silicon | Meaning |
+|---|---|---|
+| `cart_wait` | **3** | cycles per byte of **instruction fetch** from cart |
+| `cart_data_wait` | **0** | a cart data read costs the same as RAM (measured; an earlier 5 was refuted) |
+| `ldir_cost` | **14** | cycles per byte of `LDIR`/`LDDR` (the datasheet's 7 is a floor) |
+
+`timing: "free"` exists to reproduce a measurement taken before wait-states existed. **It is
+not a hardware claim** — never pass it to answer a "how fast is this?" question, and if a
+number came out of a free run, say so when you quote it.
+
+**The trap it protects you from.** With fetch unbilled, any optimisation whose gain is
+*fewer instruction bytes* measures as **exactly zero**, because the one thing it saves is
+the one thing not being charged. On silicon every extra byte of encoding costs 3 ticks, so
+**code size is speed** — which is also why padding a struct to a power of two can backfire
+(offsets fall out of the 8-bit displacement form and every access grows).
+
+Still true: a cycle figure from one run is a measurement of *this* run. For a breakdown of
+where a frame goes, the emulator app's **Profiler** (F1) is the right instrument.
+
+---
+
+## 🩺 Every run reports two hardware faults most emulators never mention
+
+`ngpc_emu_native_run` returns an `hw_safety` block, always:
+
+```jsonc
+"hw_safety": {
+  "counts": { "watchdog-starved": 1, "system-stack": 0 },
+  "clean": false,
+  "first": [ { "kind": "watchdog-starved", "pc": 2097216, "detail": 6144000, "cycle": 6144006 } ]
+}
+```
+
+- **`watchdog-starved`** — the BIOS hands the console over with the watchdog **armed**, so
+  from instruction one the cart owes I/O `0x006F` the clear code `0x4E` (roughly every
+  100 ms). Starve it and a real console **resets itself**. `detail` is the period it was
+  armed for.
+- **`system-stack`** — the cartridge's `XSP` wandered into `0x6C01..0x6FFF`, the BIOS's own
+  page. Nothing complains at the time; the console dies later, somewhere else entirely.
+  `detail` is the offending `XSP`.
+
+Both are **counted, not fatal** — neither halts a real console at the instruction that
+commits it, so neither halts this one. That is the point: a homebrew build that resets on
+hardware and plays fine in every emulator is exactly the bug this catches. `hw_guard: true`
+turns the first one into a stop when you want a verdict or the exact PC.
+
+⚠️ **`"clean": true` means the counters were read and were zero** — it is a measurement, not
+a default. Say "no watchdog or stack fault in those N frames", not "the ROM is fine": these
+are two specific faults, not an audit.
+
+---
+
 ## Honesty boundaries — what these tools will not tell you
 
 - **`ngpc_emu_screenshot` (inspector) composes from memory**, not from the beam. For a
@@ -124,6 +184,11 @@ For anything that must actually run on hardware or in the emulator, use
 - **`ngpc_quickrun` is a JS interpreter, not the console.** It is for checking your own C
   quickly; it is not evidence about hardware behaviour.
 - **`ngpc_font_bake` is a stub** and returns `not_implemented`.
+- **Timing is only as good as the model you asked for.** `ngpc_emu_native_run` is
+  silicon-timed by default, but a run made with `timing: "free"` is ~3× optimistic — check
+  the `timing` field of the answer before quoting any cycle figure.
+- **`hw_safety: clean` covers two faults, not the whole machine.** It is not a verdict on
+  the build.
 - **A decoder that refuses is telling the truth.** `ngpc_emu_decode` and
   `ngpc_emu_opcode_coverage` report what they cannot decode rather than inventing it —
   an "unimplemented" answer is data, not a failure.

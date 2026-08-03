@@ -213,9 +213,16 @@ savestate).
    par writes à cette adresse :
    - `0x14` → `flash_we_enabled = True`
    - `0xF0` → `flash_we_enabled = False`
-3. **I/O `0x6F` (FLASH_WD)** : watchdog. `0xB1` = extended, `0x4E` =
-   normal. L'émulateur peut le tracker pour validation HW-faithful
-   sans appliquer de comportement watchdog (pas de reset auto).
+3. **I/O `0x6E`/`0x6F` (WDMOD/WDCR)** : watchdog. Le code de
+   rafraîchissement documenté est `0x4E`, à écrire au moins toutes les ~100 ms —
+   c'est la règle demandée au programme, pas la période du compteur, que le cœur
+   modélise (faute de mesure) à une seconde CPU comme ares.
+   Le bit 7 de WDMOD arme le compteur ; `0xB1` dans WDCR le désactive (séquence
+   utilisée par le vrai BIOS, et par le startup Toshiba). Le cœur natif fait
+   vraiment passer le temps pour lui — l'ancienne version se contentait de
+   mémoriser le dernier octet écrit — et **compte** les famines sans arrêter la
+   ROM : voir [HARDWARE_SAFETY.md](HARDWARE_SAFETY.md). Un appelant qui veut un
+   verdict plutôt qu'un rapport arme `ngpc_set_hw_guard`.
 4. **Cart write interception** : pendant `flash_we_enabled`, les
    writes au cart window `0x200000..0x3FFFFF` sont **interceptées** :
    - Pattern AMD unlock detection (séquences à `0x200000` /

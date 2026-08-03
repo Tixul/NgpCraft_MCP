@@ -136,10 +136,34 @@ constexpr uint8_t  kIrqLevelIntAd       = 4;
  * the RX ring -- a self-loopback (measured: the console received its own pad). */
 constexpr unsigned kIrqVectorSerialReceive  = 0x18;  /* handler FILLS the RX ring   */
 constexpr unsigned kIrqVectorSerialTransmit = 0x19;  /* handler DRAINS the TX ring   */
-/* One byte at 19200 bps, 8N1 (10 bit-times) with the CPU at 6.144 MHz
- * (515 * 199 * 60): 6_144_000 / 1920 ~= 3200 cycles. APPROXIMATE -- flow control
- * (RTS) and the 64-byte BIOS rings absorb any drift, so exact baud is not load-
- * bearing for correctness; see PERF_TIMING_POLICY.md. */
+/* One byte on the link cable, in CPU cycles. DERIVED, not assumed -- see below.
+ *
+ * ⚡ THE DERIVATION, forward, from manufacturer documents and our own measurements
+ * only. (An earlier comment reasoned BACKWARDS -- "the cable's *documented* 19200 bps
+ * implies phi-T0 = fc/4, therefore fc = 6.144 MHz" -- which cannot then be used to
+ * justify the baud. This does it in the honest direction.)
+ *
+ *  1. fc ~= 6.144 MHz, from the VIDEO timing, independently of anything serial:
+ *     515 cycles/line * 199 lines * 60 Hz = 6 149 100 (K2GETechRef).
+ *  2. What the machine actually programs, measured across TEN cartridges
+ *     (scratchpad/baud.py): every one converges on SC0MOD = 0x69, BR0CR = 0x05 --
+ *     and the writes come from the BIOS (PC 0xFF2BC9/0xFF2BCF), never from the
+ *     cartridge. There is no per-game serial configuration to look up.
+ *  3. What those bits mean, TMP95C061 datasheet section 3.11:
+ *       SC0MOD = 0x69 -> SM = 10   : UART, 8-bit length
+ *                        SC = 01   : clocked by the baud rate generator
+ *                        RXE = 1, CTSE = 1 (bit 6; channel 0 only, fig 3.11(12))
+ *       BR0CR  = 0x05 -> BR0CK = 00: input clock phi-T0 = fc/4
+ *                        BR0S  = 5 : divide by 5
+ *       UART mode divides by a further 16 -- the transmission and receive counters
+ *       are labelled "UART only /16" in the channel-0 block diagram, fig 3.11(12).
+ *  4. Therefore baud = fc / 4 / 5 / 16 = fc / 320 = 19 200 bps,
+ *     and 8N1 is 10 bit-times, so one byte = 10 / 19 200 s = 520.83 us
+ *     = 0.00052083 * 6 144 000 = 3200 CPU cycles, exactly the value below.
+ *
+ * Flow control (RTS) and the 64-byte BIOS rings still absorb drift, so this is not
+ * knife-edge for correctness -- but it is no longer a guess either.
+ * See PERF_TIMING_POLICY.md and specs/LINK_CABLE.md §2.2. */
 constexpr int32_t kSerialByteCycles = 3200;
 /* 10-bit full scale. An emulator has no cell, so we model a healthy one; a flat
  * reading would make the BIOS power the console off (see above). */
@@ -168,6 +192,15 @@ constexpr uint8_t kFlashDeviceId3      = 0x80;
  * could only have learnt the size by asking OUR chip. */
 constexpr uint32_t kBiosFlashCardType0 = 0x006C58;   /* CS0 -- the game cartridge */
 constexpr uint32_t kBiosFlashCardType1 = 0x006C59;   /* CS1 -- the development slot */
+
+/* `Language` (SDK SysWork.txt): 0 = Japanese, 1 = English, read-only to the cart.
+ * A bilingual cartridge picks its script from this byte and nothing else -- 24 games
+ * of the corpus read it. The console's setup wizard writes it and the coin cell keeps
+ * it; we skip that wizard, so it sat at 0 and every one of those games ran in Japanese
+ * by default rather than by choice. */
+constexpr uint32_t kSysLanguage        = 0x006F87;
+constexpr uint8_t  kLanguageJapanese   = 0;
+constexpr uint8_t  kLanguageEnglish    = 1;
 
 /* --- THE SUB-BATTERY: the console's RAM is NOT volatile ---------------------
  *
@@ -426,6 +459,46 @@ constexpr uint32_t kInt0PowerButton      = 8;
  * (pass 247) -- so it is a second CHIP, with its own block map and its own identity. */
 constexpr uint32_t kCartChipSize         = 0x200000;
 
+/* --- HARDWARE SAFETY: WHAT THE CONSOLE MINDS AND THE CODE CANNOT SEE --------
+ *
+ * SysPro.txt gives user software 0x4000..0x6BFF. The 0x6C00..0x6FFF page is
+ * system-managed. XSP may EQUAL 0x6C00 because the stack descends before it
+ * writes; a cart that leaves it above that boundary puts a later push or call
+ * into system RAM, and that is what makes the BIOS restart or power off.
+ *
+ * The same manual requires the watchdog control at I/O 0x006F to receive the
+ * clear code 0x4E periodically -- ngpcspec.txt says at least every 100 ms.
+ *
+ * ⚡ REPORTED, NOT ENFORCED. Neither of these STOPS a real console at the
+ * instruction that commits them: the stack overwrite corrupts, and the watchdog
+ * raises INTWD (WDMOD bit1 picks reset or interrupt). An emulator that halts
+ * there is stricter than the silicon, and being stricter than the silicon is
+ * how you end up debugging the emulator instead of the ROM. So the core COUNTS
+ * them, keeps the first samples with their PC, and runs on -- the hygiene
+ * counters' contract, applied to hardware safety. A caller that wants a gate
+ * ("this build must be clean") arms ngpc_set_hw_guard and gets the batch
+ * stopped with the matching status instead.
+ *
+ * ⚠️ THE TIMEOUT IS AN ASSUMPTION, NOT A MEASUREMENT. The 100 ms of the SDK is
+ * the refresh rate asked of the PROGRAM, not the counter's period, and the
+ * WDMOD prescaler bits (WDTP, bits 6-5) are not modelled: the retail BIOS ends
+ * its boot with WDMOD=0xF0, so the console hands over with the watchdog ARMED
+ * on its longest setting. One CPU second at the measured 6.144 MHz is what ares
+ * uses and what we use, pending a hardware measurement. Being wrong here
+ * changes WHEN the counter reports, never whether the ROM runs. */
+constexpr uint32_t kUserStackTop          = 0x006C00;
+constexpr uint32_t kSystemRamEnd          = 0x006FFF;
+constexpr uint32_t kWatchdogModeIo        = 0x00006E;
+constexpr uint32_t kWatchdogIo            = 0x00006F;
+constexpr uint8_t  kWatchdogClearCode     = 0x4E;
+constexpr uint8_t  kWatchdogDisableCode   = 0xB1;
+constexpr uint32_t kWatchdogTimeoutCycles = 6144000;
+
+inline bool cart_pc(uint32_t pc) {
+    return (pc >= 0x200000 && pc <= 0x3FFFFF)
+        || (pc >= 0x800000 && pc <= 0x9FFFFF);
+}
+
 /* --- CHARACTER RAM AT HAND-OFF: THE BIOS'S BOOT SCREEN IS STILL IN IT --------
  *
  * The hand-off's job is to leave the cart the state a real boot would have left, and
@@ -601,6 +674,63 @@ struct Machine {
      * it was, and reports the honest reason. */
     uint8_t pending_status = NGPC_OK;
 
+    /* --- THE WATCHDOG, WITH TIME ACTUALLY PASSING FOR IT ---------------------
+     *
+     * The core used to keep the last byte written at 0x006F and nothing else, so
+     * the counter never advanced: a ROM that resets a real console by starving
+     * the watchdog ran here forever, and the emulator agreed with it.
+     *
+     * On expiry the counter RE-ARMS and the run continues (ares does the same),
+     * because that is the shape of the hardware: the event fires, software gets
+     * to be wrong about it repeatedly, and a ROM that never refreshes reports
+     * once per period rather than once per session. */
+    uint32_t watchdog_cycles = 0;
+    bool     watchdog_enabled = true;
+    void watchdog_reset(bool enabled) {
+        watchdog_enabled = enabled;
+        watchdog_cycles = 0;
+    }
+    void watchdog_clear() { watchdog_cycles = 0; }
+    /* True on the tick that crosses the timeout. */
+    bool watchdog_tick(uint32_t cycles) {
+        if (!watchdog_enabled) return false;
+        watchdog_cycles += cycles;
+        if (watchdog_cycles < kWatchdogTimeoutCycles) return false;
+        watchdog_cycles -= kWatchdogTimeoutCycles;
+        return true;
+    }
+
+    /* --- THE TWO HARDWARE-SAFETY FINDINGS ------------------------------------
+     *
+     * Same contract as the hygiene counters below: a count, plus the first few
+     * samples so a report can name the code that did it. `hw_guard_stop` is the
+     * opt-in gate -- a bitmask of NGPC_HW_* kinds that END the batch with the
+     * matching status instead of merely being counted.
+     *
+     * The stack finding is EDGE-triggered: a cart that parks XSP in the system
+     * page would otherwise report once per instruction and drown the log. What
+     * matters is the crossing, and its PC is the code that moved the stack. */
+    struct ViolationRec { uint32_t pc; uint32_t detail; uint64_t cycle; uint32_t kind; uint32_t _pad; };
+    static constexpr uint32_t kHwSize = 64;
+
+    uint32_t hw_guard_stop = 0;
+    uint64_t hw_watchdog_count = 0;
+    uint64_t hw_stack_count = 0;
+    uint32_t hw_n = 0;
+    ViolationRec hw[kHwSize] = {};
+    bool stack_in_system = false;
+
+    inline void hw_reset() {
+        hw_watchdog_count = hw_stack_count = 0;
+        hw_n = 0;
+        stack_in_system = false;
+    }
+
+    inline void note_violation(uint32_t kind, uint32_t pc, uint32_t detail) {
+        if (kind == NGPC_HW_WATCHDOG) ++hw_watchdog_count; else ++hw_stack_count;
+        if (hw_n < kHwSize) hw[hw_n++] = {pc, detail, total_cycles, kind, 0};
+    }
+
     /* A/D converter state. Owned by the machine so a conversion survives across
      * run() batches, and ticked with the cycles each instruction consumed. */
     uint16_t adc_battery = kAdcFullScale;
@@ -628,6 +758,12 @@ struct Machine {
     std::deque<uint8_t> serial_tx;
     std::deque<uint8_t> serial_rx;
     bool     serial_tx_busy = false;
+    /* ...and whether that byte has actually STARTED going out. CTS0 gates the START
+     * of a byte only: once the shift register is loaded the byte always completes,
+     * however the peer waves its RTS about (datasheet fig 3.11(16) Note 1). Without
+     * this a mid-byte CTS pulse froze a transmission hardware would have finished --
+     * see serial_tick in memory.cpp for the game that proved it. */
+    bool     serial_tx_shifting = false;
     uint8_t  serial_tx_byte = 0;
     int32_t  serial_tx_cycles = 0;
     /* CTS0 handshake input (TMP95C061 datasheet 3.11): when SC0MOD<CTSE> (bit6) is
@@ -659,6 +795,18 @@ struct Machine {
     uint32_t serial_irq_rx_count = 0;    /* INTRX0 raised (vector 0x18)        */
     uint32_t serial_cts_hold_ticks = 0;  /* ticks a byte was held by CTS0 high */
     uint32_t serial_rts_hold_ticks = 0;  /* ticks RX was held by our own RTS   */
+    /* One byte on the wire, in CPU cycles, COMPUTED from what the machine actually
+     * programmed -- see the derivation above kSerialByteCycles and specs/LINK_CABLE.md
+     * §2.2/§2.3. This used to be the constant itself, which was right only because
+     * every cartridge happens to use the same setup: the BIOS writes SC0MOD = 0x69 and
+     * BR0CR = 0x05 for all of them (measured on ten). A cartridge that programmed
+     * BR0CR = 0x15 would pick phi-T2 instead of phi-T0 -- 4800 bps, four times slower --
+     * and the old code would still have shifted a byte every 3200 cycles.
+     *
+     * For the values every game does use this returns exactly kSerialByteCycles, so the
+     * whole library is bit-identical; only configurations nobody selects change. */
+    int32_t serial_byte_cycles() const;
+
     void serial_tick(uint32_t cycles);
 
     /* --- the on-board calendar IC (RTC), I/O 0x90..0x97 --------------------
@@ -758,23 +906,43 @@ struct Machine {
      * why the SELF-TIMED games (Cool Boarders, Densha de Go) fit their frame's work in one
      * VBlank here and run at 60 fps where silicon spills to two VBlanks and 30 fps.
      *
-     * Cycles added per BYTE accessed on the cart bus -- instruction fetch AND data
-     * reads, since both cross the slow flash bus. 0 = the old free-fetch behaviour.
-     * Calibrated by cpu_calib_v1.ngc. `ngpc_set_cart_wait` is the knob; do not re-tune
-     * it by feel. `access_wait` accumulates the penalty over one instruction's reads and
-     * the run loop folds it into that instruction's cycle count. */
+     * Cycles added per BYTE of instruction FETCH off the cart bus. Calibrated by
+     * cpu_calib_v1.ngc -> 3. `ngpc_set_cart_wait` is the knob; do not re-tune it by feel.
+     * `access_wait` accumulates the penalty over one instruction's reads and the run loop
+     * folds it into that instruction's cycle count.
+     *
+     * ⚠️ THE DEFAULT HERE IS 0, AND 0 IS NOT THE SILICON VALUE. It means "the old
+     * free-fetch behaviour": when wait-states were added the field was left off so the
+     * pre-existing timing stayed bit-for-bit unchanged, so an A/B against it stayed
+     * possible, and so read8()'s hot path costs nothing when it is off. The SHIPPING
+     * default is ON and lives one layer up, in the shell -- `cart_wait_states()` in
+     * ngpc_settings.py returns True and ngpc_shell.py calls the setters on every ROM
+     * load. So the APP is silicon-timed; a bare Machine is NOT. Anything that
+     * instantiates this class directly (a bench harness, the MCP server, a test) gets
+     * free fetch and measures a machine ~2.9x too fast unless it applies the set itself:
+     *
+     *     set_cart_wait(3)  set_cart_data_wait(0)  set_ldir_cost(14)   [vram_wait: below]
+     *
+     * The trap that creates is real and has cost people weeks: with fetch free, every
+     * saving that comes from SHORTER CODE measures as exactly zero, because the thing it
+     * saves is the one thing not being billed. See README "Timing -- wait states". */
     uint32_t cart_wait = 0;
-    /* Random data reads off the cart pay MORE than sequential fetch: flash page-mode
-     * makes consecutive fetch bytes cheap, but an arbitrary LD from a cart table eats the
-     * full random-access latency. `cart_wait` is the per-fetch-byte cost (calibrated by
-     * the register-loop ROM); `cart_data_wait` the per-data-byte cost (calibrated so the
-     * silicon-confirmed 30fps of Cool Boarders reproduces). 0 => fall back to cart_wait. */
+    /* Wait-states per byte of a DATA read off the cart. SILICON SAYS ZERO: cpu_calib_v2
+     * measured a random cart read (CRND=252) and a RAM read (RRND=252) as identical, so
+     * only instruction FETCH is wait-stated. An earlier `cart_data_wait=5` was a curve-fit
+     * to Cool Boarders' frame rate and that ROM REFUTED it -- do not bring it back without
+     * a measurement. There is deliberately NO fallback to cart_wait when this is 0: here 0
+     * is the answer, not "unset". (Flash page-mode was the theory behind a fetch-vs-data
+     * asymmetry; the numbers did not support it.) */
     uint32_t cart_data_wait = 0;
-    /* EXPERIMENTAL: wait-states per byte written to the display RAM (0x8000-0xBFFF).
-     * Hypothesis under test (not yet silicon-confirmed): the K2GE "adjustment circuitry"
-     * throttles CPU VRAM access during the active drawing period, so a game doing a big
-     * per-frame ldir into char RAM (Cool Boarders -> 0xBC00) is slower on silicon than a
-     * CPU model alone predicts. 0 = off. Needs a v3 calibration ROM to confirm. */
+    /* Wait-states per byte written to display RAM (0x8000-0xBFFF): the K2GE "adjustment
+     * circuitry" throttling CPU access to VRAM during the active drawing period.
+     * THE EFFECT IS REAL AND SILICON-MEASURED -- cpu_calib_v3 came back VWR 452 < MEM 471,
+     * a VRAM write costing more than a RAM write. What is NOT settled is the cost per byte,
+     * so nothing in the shell sets this and it stays 0 (off) rather than shipping a guessed
+     * integer. It is also NOT the explanation for Cool Boarders: that game writes VRAM
+     * during vblank, and its residual turned out to be LDIR (see ldir_cost). If you pin the
+     * cost, update hw_calibration/README.md, the shell and the README table together. */
     uint32_t vram_wait = 0;
 
     /* WHICH CONSOLE WE ARE PRETENDING TO BE, for a monochrome cartridge.
@@ -784,9 +952,16 @@ struct Machine {
      * not exist on that silicon, so writes to it are ignored and the BIOS grey ramp
      * stands. Set BEFORE reset. */
     bool k1ge_console = false;
-    /* Cycles per byte for LDIR/LDDR block copies. Datasheet 7n+1 (default 7); may be a floor
-     * like MUL/DIV were. 14 reproduces Cool Boarders' silicon 30fps without touching Fatal
-     * Fury. `ngpc_set_ldir_cost` is the knob; pending a clean silicon measurement. */
+    /* WHICH LANGUAGE THE CONSOLE IS SET TO -- `Language` at 0x6F87 (see the constants).
+     * A setting, exactly like the clock: on a console the setup wizard writes it and
+     * the coin cell keeps it. Handed to the cart at the hand-off. Set BEFORE reset. */
+    uint8_t language_code = kLanguageEnglish;
+    /* Cycles per byte for LDIR/LDDR block copies. Datasheet 7n+1, so the field defaults to
+     * 7 -- but the datasheet MUL/DIV figures already turned out to be FLOORS. 14 reproduces
+     * Cool Boarders' silicon 30fps without touching Fatal Fury (one instruction-cost fix
+     * explaining both games), so the shell ships 14 via cfg.CART_LDIR_COST while the raw
+     * field keeps the datasheet number. Strongly evidenced, still pending a clean silicon
+     * measurement (hw_calibration a_cpu_calib_v6.ngc, LDRR/LDVR). `ngpc_set_ldir_cost`. */
     uint16_t ldir_cost = 7;
     mutable uint32_t access_wait = 0;
     /* Set by the run loop to the PC of the instruction being executed, so read8() can
@@ -860,6 +1035,15 @@ struct Machine {
 
     void flash_build_blocks(int chip, uint32_t size);
     void flash_adopt_capacity_from_save(int chip, uint32_t offset);
+    void flash_adopt_capacity_from_block(int chip, uint32_t block);
+    void flash_present_as(int chip, uint32_t capacity);
+    uint32_t flash_presented_capacity(int chip) const;
+    uint32_t flash_image_size(int chip) const;
+    void     flash_measure_image();           /* once, when the cartridge goes in */
+    uint32_t flash_image_bytes[2] = {0, 0};   /* data on each die, erased tail excluded */
+    /* What a game asked the BIOS for, read at the `swi 1` -- BEFORE the BIOS turns it
+     * into an address. That is the only moment the CARD NUMBER is still visible. */
+    void bios_flash_syscall_hint();
     void flash_program(int chip, uint32_t base, uint32_t addr, uint8_t data);
     void flash_erase_block(int chip, uint32_t base, uint32_t addr);
     void flash_erase_all(int chip, uint32_t base);
@@ -909,12 +1093,36 @@ struct Machine {
          * write happened to leave in the I/O page. 0x98-0x9A are the alarm's
          * day/hour/minute -- part of the same chip, so they answer from it too. */
         if (a >= 0x90 && a <= 0x9A) return rtc_read(a);
-        /* SC0BUF (0x50): when the link is presenting a received byte, reading it
-         * IS the RX handler consuming it -- return it and clear the pending flag
-         * (the overrun guard). Otherwise it is a plain I/O byte. */
-        if (a == 0x000050 && serial_rx_pending) {
-            serial_rx_pending = false;
-            ++serial_rx_read_count;    /* debugger: the CPU really consumed it */
+        /* SC0BUF (0x50) READS THE RECEIVE BUFFER. ALWAYS.
+         *
+         * ⚡ The address is shared by two SEPARATE registers: a write loads the
+         * TRANSMIT buffer, a read returns the RECEIVE buffer. The CPU cannot read
+         * back what it transmitted. The pending flag is the "new data" indicator
+         * (and our overrun guard): the FIRST read consumes it, but the buffer keeps
+         * holding its byte until the next one is shifted in.
+         *
+         * ⛔ THE BUG THIS ENDS, and it took a two-console link to see it. This used
+         * to fall through to `mem[0x50]` once the flag was clear -- and `mem[0x50]`
+         * is where a TRANSMITTED byte was left. So a receive handler that touches
+         * SC0BUF more than once for one byte (the retail BIOS's COM ISR, running
+         * from RAM at 0x6D65, does) put THE LAST BYTE WE SENT into its ring instead
+         * of the byte that arrived. MEASURED on Card Fighters' Clash, two consoles,
+         * player 1 -> player 2: 532 bytes queued, 532 read, 532 appended to the BIOS
+         * ring -- nothing lost, nothing duplicated, and byte 508 arrived as 0xA5
+         * where 0x00 was sent. One byte, one wrong value: the packet's checksum then
+         * failed (`cp H,A` at 0x24260B -> 0x242741), player 2 dropped the packet in
+         * silence and never answered, and both consoles waited for each other for
+         * ever on CHOOSE FIRST PLAYER. It was phase-dependent, which is why the same
+         * game linked on one attempt and hung on the next.
+         *
+         * Fixed in the desktop tree 2026-08-02; carried into the libretro tree
+         * 2026-08-03 when the two were reconciled. Condemning test:
+         * `test_sc0buf_reads_the_receive_buffer_not_the_byte_we_transmitted`. */
+        if (a == 0x000050 && serial_link_enabled) {
+            if (serial_rx_pending) {
+                serial_rx_pending = false;
+                ++serial_rx_read_count;    /* debugger: the CPU really consumed it */
+            }
             return serial_rx_byte;
         }
         /* Port 0xB1: bit1 = the CR2032 SUB-BATTERY, bit2 = a must-be-1 line (drop it and

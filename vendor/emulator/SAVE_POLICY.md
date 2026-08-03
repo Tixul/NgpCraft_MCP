@@ -22,6 +22,27 @@
 > feature.** Les tests ne mentaient pas sur le code qu'ils testaient ; ils visaient
 > la mauvaise machine. (Meme famille que `fe_match` visant `thc1` sans flag.)
 >
+> ## ⚠️ MISE A JOUR 2026-07-25 — deux defauts trouves DANS ce chemin, par passe adverse
+>
+> Le chemin ci-dessous etait bon ; ce qui l'encadrait ne l'etait pas. Les deux ont ete
+> trouves en cherchant a casser, pas par une panne signalee — details `specs/FLASH.md`.
+>
+> 1. **La sauvegarde etait corrompue des la 2e session** sur une cartouche sous-remplie.
+>    `commit_save` reecrivait le `.ngc` a la capacite **devinee** (16 Mbit) ; le fichier
+>    d'une cart 512 Kio grossissait a 2 Mio ; au chargement suivant ce remplissage
+>    comptait comme IMAGE, la correction de la cartouche etait refusee, et chaque save
+>    suivante etait ANDee dans un slot non efface. Mesure : sessions 2/3/4 = donnees
+>    corrompues. Corrige (`ngpc_flash_capacity`) ; un fichier deja gonfle **se repare
+>    au chargement suivant** (la queue de `0xFF` n'est pas de l'image).
+> 2. **L'octet de type de carte pouvait survivre a la carte des blocs** : un jeu
+>    demandant son bloc de save de 8 Kio se voyait effacer **64 Kio de son propre code**.
+>
+> 🔑 **Deux faux-verts evites dans la meme passe**, tous deux de la meme famille que
+> celui du haut de ce fichier : rejouer la MEME charge utile (programmer un octet sur
+> lui-meme est un no-op, donc 4 sessions "vertes" pendant que le fichier pourrissait),
+> et tester sur une image toute a `0xFF` (un effacement ecrit `0xFF`, il ne peut rien
+> montrer). **Varier les donnees ET empoisonner la zone**, toujours.
+>
 > ## ✅ STATUT 2026-07-14 — les saves in-game fonctionnent POUR DE VRAI
 >
 > **Spec complete : `specs/FLASH.md`.** Chemin reel, valide sur du code de jeu

@@ -160,10 +160,21 @@ def _line_scroll_offsets(
     no per-line history to honour, and the frame's single register snapshot applies to
     every line -- which is exactly the old behaviour, so nothing regresses.
 
-    ⚠️ NOT MODELLED, deliberately: `P.F` (plane priority) and the window registers can
-    also change mid-frame. They are latched per line by the same rule, but honouring
-    them means composing the whole frame line by line, not just the scroll. No ROM in
-    the corpus was seen to need it; when one is, this is where it goes.
+    ⚠️ NOT MODELLED, deliberately: `P.F` (plane priority) can also change mid-frame. It
+    is latched per line by the same rule, but honouring it means composing the whole
+    frame line by line, not just the scroll. No ROM in the corpus was seen to need it;
+    when one is, this is where it goes.
+
+    ⛔ AND THE WINDOW IS NOT ONE OF THEM -- an earlier version of this note said it was
+    "latched per line by the same rule". It is not, and the Tech Ref says so by omission:
+    0x8012, 0x8020/21, 0x8030, 0x8032..35 and 0x8118 each carry an explicit "reflected in
+    the next line being drawn" caution, and the window registers (§ 4-5) carry a caution
+    about WBA + WSI overflowing 256 instead. Samurai Shodown! 2 settles it in practice --
+    it blanks the one junk row above its HUD by emptying the window for a single line,
+    and that only lands on the right row if the window is read LIVE. See
+    `cpp/src/render.cpp::regs_of_line` and `tests/test_window_is_live.py`. This module
+    composes a whole frame from one register set, so "live" here IS the whole-frame
+    value; a per-line window belongs with a per-line rewrite of `render_frame`.
     """
     fallback = _scroll_offset_for_plane(control, plane)
     if raster_log is None:

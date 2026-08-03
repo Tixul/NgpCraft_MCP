@@ -32,6 +32,7 @@ NGPC_API int ngpc_load_rom(ngpc_t* h, const uint8_t* data, size_t len) {
     if (!h || !data || len < 0x30) return -1;   /* ROM_HEADER_SIZE */
     Machine* m = reinterpret_cast<Machine*>(h);
     m->rom.assign(data, data + len);
+    m->flash_measure_image();
     /* The cartridge IS the flash chip. Its block map comes from its size, and a game
      * saves by erasing and programming the small blocks at the top (SDK FlashMem.txt).
      *
@@ -260,6 +261,14 @@ NGPC_API void ngpc_reset(ngpc_t* h, int reset_mode) {
     m->z80_port_writes = 0;
     m->apu_writes = 0;
     m->total_cycles = 0;
+    /* The BIOS owns WDMOD/WDCR while it boots, and it does both things: it
+     * DISABLES the counter early (WDCR=0xB1, twice) and re-arms it at the end
+     * (WDMOD=0xF0) before handing the console over -- measured on the retail
+     * image at 0xFF204F/0xFF215D/0xFF19B6 and 0xFF1BC0. So a power-on starts
+     * with it off and the BIOS decides; a hand-off starts where the BIOS left
+     * it: ARMED, the cartridge's duty from its first instruction. */
+    m->watchdog_reset(reset_mode != NGPC_RESET_BIOS_BOOT);
+    m->hw_reset();
     m->apu.reset();
     /* The COMMAND LATCH resets; the flash CONTENTS do not. A power cycle with the
      * cartridge still in the slot does not wipe your save, and neither does this.
@@ -269,7 +278,28 @@ NGPC_API void ngpc_reset(ngpc_t* h, int reset_mode) {
     m->flash_mode[0] = m->flash_mode[1] = Machine::FlashRead;
     m->flash_step[0] = m->flash_step[1] = 0;
 
+    /* ⚡ THE LANGUAGE. `Language` (0x6F87, SDK SysWork.txt): 0 = Japanese, 1 = English,
+     * read-only to the cartridge -- and READ BY 24 GAMES of the corpus. A dual-language
+     * cartridge picks its script from this byte and nothing else.
+     *
+     * ⚠️ WHO OWNS IT DEPENDS ON HOW YOU BOOTED, because the two modes are two different
+     * machines to configure:
+     *
+     *   * CONSOLE BOOT runs the real BIOS, which HAS a setup screen. That screen is the
+     *     console's own control panel: what the player sets there is written into
+     *     battery RAM and kept (`commit_system_ram` saves that page live). Stamping a
+     *     setting over it would make the BIOS screen a decoration -- you would change
+     *     the language on it and watch the emulator undo the choice at the next launch.
+     *     So here we write nothing: the coin cell answers.
+     *   * THE HAND-OFF skips that screen entirely. Nothing would ever write the byte,
+     *     and its power-on value is 0 -- Japanese, chosen by nobody. The setting is the
+     *     only control panel this mode has, so it lands here.
+     *
+     * A first console boot on a blank cell still stops at the BIOS setup, which is where
+     * the choice belongs on that path; it is now SAVED, which it was not before. */
     if (apply_bios_handoff) {
+        m->mem[kSysLanguage] = m->language_code;
+
         /* State the real BIOS leaves for the cart at entry. Without XSP a real
          * ROM cannot execute its first instruction (it is a CALL).
          *
@@ -520,6 +550,20 @@ static void deliver_nmi(ngpc::Machine& m) {
     c.pc = m.read32(kIrqVectorTableBase + 4u * 8u);     // idx 8 = 0xFFFF20 -> 0xFF1898
 }
 
+/* The watchdog just crossed its period. Count it wherever it happened -- the
+ * counter runs during HALT and inside interrupt entry too, which is exactly
+ * where a starve hides -- and answer whether this ends the batch. It only does
+ * for a caller that asked for a gate; by default this is a diagnostic and the
+ * ROM keeps running, because that is what the console does. */
+static bool note_watchdog(ngpc::Machine& m, ngpc_summary_t& s, uint32_t pc) {
+    m.note_violation(NGPC_HW_WATCHDOG, pc, ngpc::kWatchdogTimeoutCycles);
+    if (!(m.hw_guard_stop & NGPC_HW_WATCHDOG)) return false;
+    s.stop_status = NGPC_WATCHDOG_RESET;
+    s.stop_pc     = pc;
+    s.stop_opcode = m.read8(pc);
+    return true;
+}
+
 NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                       ngpc_record_t* out_records, uint32_t records_cap,
                       ngpc_summary_t* out_summary) {
@@ -551,6 +595,37 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         m->fetch_window = pc_before;   // fetch bytes read in read8() get the cheap cart cost
         const uint8_t st = ngpc::step(*m, rec);
         if (m->callstack_on) m->note_control_flow(pc_before, sp_before);
+
+        /* User XSP=0x6C00 is the exclusive top of a descending stack. The BIOS
+         * legitimately uses the system page while executing in BIOS ROM, but a
+         * cartridge instruction that moves XSP above the boundary is precisely
+         * the corruption SysPro warns can restart or power off the console.
+         *
+         * Recorded on the CROSSING only: a cart that parks its stack up there is
+         * one bug, not one per instruction, and the crossing's PC is the code
+         * that moved it. Nothing stops unless the caller asked for a gate. */
+        /* One unsigned range test, and the expensive half (cart_pc) is reached only
+         * when the answer CHANGED -- which for a well-behaved ROM is never. This is
+         * per-instruction code in the hot loop; the readable form of the same test
+         * cost 4% of the core's throughput. */
+        const uint32_t stack_addr = m->cpu.regs[NGPC_XSP] & kAddrMask;
+        const bool stack_in_system =
+            (stack_addr - (kUserStackTop + 1)) <= (kSystemRamEnd - kUserStackTop - 1);
+        if (stack_in_system != m->stack_in_system
+            && st == NGPC_OK && cart_pc(pc_before)) {
+            m->stack_in_system = stack_in_system;
+            if (stack_in_system) {
+                m->note_violation(NGPC_HW_SYSTEM_STACK, pc_before, stack_addr);
+                if (m->hw_guard_stop & NGPC_HW_SYSTEM_STACK) {
+                    rec->status = NGPC_SYSTEM_STACK_VIOLATION;
+                    s.stop_status = NGPC_SYSTEM_STACK_VIOLATION;
+                    s.stop_pc     = pc_before;
+                    s.stop_opcode = m->read8(pc_before);
+                    if (want_record) ++s.emitted;
+                    break;
+                }
+            }
+        }
 
         if (st == NGPC_HALTED) {
             /* HALT is not a dead stop on real hardware: the CPU parks, the video
@@ -586,7 +661,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 continue;                              // resume inside the boot handler
             }
 
-            bool woke = false;
+            bool woke = false, wd_stop = false;
             for (unsigned line = 0; line <= kScanlinesPerFrame; ++line) {
                 advance_raster(*m, kCyclesPerScanline);
                 m->adc_tick(kCyclesPerScanline);
@@ -597,12 +672,17 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 m->apu.tick(kCyclesPerScanline);
                 s.total_cycles += kCyclesPerScanline;
                 m->total_cycles += kCyclesPerScanline;
+                /* A HALT with the watchdog armed and no interrupt to refresh it is
+                 * the classic starve: report it, and keep idling unless gated. */
+                if (m->watchdog_tick(kCyclesPerScanline)
+                    && note_watchdog(*m, s, pc_before)) { wd_stop = true; break; }
                 if (m->irq_pending && deliver_irq(*m)) {
                     ++s.irq_deliveries;
                     woke = true;
                     break;
                 }
             }
+            if (wd_stop) break;
             if (!woke) {
                 s.stop_status = NGPC_HALTED;
                 s.stop_pc     = pc_before;
@@ -646,6 +726,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         m->serial_tick(rec->cycles);
         z80_tick(*m, rec->cycles);
         m->apu.tick(rec->cycles);
+        if (m->watchdog_tick(rec->cycles) && note_watchdog(*m, s, pc_before)) break;
 
         /* ...and so does interrupt delivery, BETWEEN instructions. */
         if (m->irq_pending && deliver_irq(*m)) {
@@ -665,6 +746,8 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
             m->serial_tick(kIrqDeliveryCycles);
             z80_tick(*m, kIrqDeliveryCycles);
             m->apu.tick(kIrqDeliveryCycles);
+            if (m->watchdog_tick(kIrqDeliveryCycles)
+                && note_watchdog(*m, s, pc_before)) break;
         }
     }
 
@@ -820,6 +903,36 @@ NGPC_API uint32_t ngpc_get_lost_writes(ngpc_t* h, ngpc_hygiene_t* out, uint32_t 
     if (!h || !out || n == 0) return 0;
     Machine* m = reinterpret_cast<Machine*>(h);
     return copy_hygiene(m->hyg_lost, m->hyg_lost_n, out, n);
+}
+
+/* --- hardware safety. Counting is always on; only STOPPING is a choice. */
+NGPC_API void ngpc_set_hw_guard(ngpc_t* h, uint32_t stop_mask) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->hw_guard_stop =
+        stop_mask & (NGPC_HW_WATCHDOG | NGPC_HW_SYSTEM_STACK);
+}
+
+NGPC_API uint64_t ngpc_hw_violations(ngpc_t* h, uint32_t kind) {
+    if (!h) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    uint64_t n = 0;
+    if (kind & NGPC_HW_WATCHDOG)     n += m->hw_watchdog_count;
+    if (kind & NGPC_HW_SYSTEM_STACK) n += m->hw_stack_count;
+    return n;
+}
+
+NGPC_API uint32_t ngpc_get_hw_violations(ngpc_t* h, ngpc_violation_t* out, uint32_t n) {
+    if (!h || !out || n == 0) return 0;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    const uint32_t want = m->hw_n < n ? m->hw_n : n;
+    for (uint32_t i = 0; i < want; ++i) {
+        out[i].pc     = m->hw[i].pc;
+        out[i].detail = m->hw[i].detail;
+        out[i].cycle  = m->hw[i].cycle;
+        out[i].kind   = m->hw[i].kind;
+        out[i]._pad   = 0;
+    }
+    return want;
 }
 
 NGPC_API void ngpc_set_event_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
@@ -987,9 +1100,31 @@ NGPC_API void ngpc_set_flash_size(ngpc_t* h, uint32_t chip, uint32_t bytes) {
     reinterpret_cast<Machine*>(h)->flash_build_blocks(int(chip), bytes);
 }
 
+/* The console's language setting, handed to the cartridge at 0x6F87 on the hand-off:
+ * 0 = Japanese, 1 = English (SDK SysWork.txt). 24 games of the corpus read it, and a
+ * bilingual cartridge has nothing else to go on. On real hardware the setup wizard
+ * writes it and the coin cell remembers; we skip the wizard, so this is where the
+ * choice lives. Set BEFORE reset. */
+NGPC_API void ngpc_set_language(ngpc_t* h, uint32_t code) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->language_code = uint8_t(code ? 1 : 0);
+}
+
+/* What the chip currently presents as -- WHICH IS NOT ALWAYS WHAT WAS SET. The cartridge
+ * corrects us mid-session (flash_adopt_capacity_from_block / _from_save), and whoever
+ * persists the save has to know: writing the .ngc back at the size we GUESSED pads an
+ * under-filled cart out to a size it never had, and on the next load that padding reads
+ * as image -- which is precisely what stops the cart from correcting us a second time.
+ * Measured before this existed: a 512 KiB cart saved fine, its file grew to 2 MiB, and
+ * every save from the second session on was ANDed into an unerased slot. 0 = empty slot. */
+NGPC_API uint32_t ngpc_flash_capacity(ngpc_t* h, uint32_t chip) {
+    if (!h || chip > 1) return 0;
+    return reinterpret_cast<Machine*>(h)->flash_presented_capacity(int(chip));
+}
+
 NGPC_API void ngpc_raise_irq(ngpc_t* h, uint32_t vector_index) {
     if (!h || vector_index >= 32) return;
-    reinterpret_cast<Machine*>(h)->irq_pending |= (1u << vector_index);
+    reinterpret_cast<Machine*>(h)->irq_pending |= (uint64_t(1) << vector_index);
 }
 
 /* --- link cable (serial channel 0) ----------------------------------------
@@ -1012,6 +1147,7 @@ NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
         m.serial_tx.clear();
         m.serial_rx.clear();
         m.serial_tx_busy = false;
+        m.serial_tx_shifting = false;
         m.serial_rx_pending = false;
         m.serial_tx_cycles = 0;
         m.serial_rx_cycles = 0;
@@ -1082,11 +1218,13 @@ NGPC_API void ngpc_serial_state(ngpc_t* h, ngpc_serial_state_t* out) {
     out->sc0cr           = m.mem[0x000051];
     out->sc0mod          = m.mem[0x000052];
     out->br0cr           = m.mem[0x000053];
-    /* 0xB1 as the GAME sees it: read8 clears bit2 while the link is enabled --
-     * that bit IS the cable-detect the 2-player menus poll, so showing the raw
-     * memory byte here would say "no cable" on a working cable. */
-    out->port_b1         = m.serial_link_enabled ? uint32_t(m.mem[0x0000B1] & ~0x04)
-                                                 : uint32_t(m.mem[0x0000B1]);
+    /* 0xB1 as the GAME sees it, not as it sits in the I/O page. read8 forces the
+     * sub-battery bit and drives bit2 -- the cable-DETECT line Card Fighters'
+     * Clash gates its handshake on -- from the cable state, so dumping the raw
+     * byte here would report "no cable" on a working one. Mirrors machine.hpp. */
+    out->port_b1         = uint32_t(uint8_t(
+        m.serial_link_enabled ? ((m.mem[0x0000B1] | 0x02) & ~0x04)
+                              :  (m.mem[0x0000B1] | 0x02 | 0x04)));
     out->port_b2         = m.mem[0x0000B2];
 }
 
@@ -1173,6 +1311,148 @@ NGPC_API void ngpc_get_z80(ngpc_t* h, ngpc_z80_t* out) {
 NGPC_API void ngpc_set_cpu(ngpc_t* h, const ngpc_cpu_t* in) {
     if (!h || !in) return;
     reinterpret_cast<Machine*>(h)->cpu = *in;
+}
+
+/* --- the rest of the machine, for savestates -------------------------------
+ * See the contract in ngpc_core.h: this is the state a snapshot needs that does
+ * NOT live in the memory image -- the sound CPU's registers, the T6W28's, and the
+ * timer up-counters that pace them. Leaving it out is what made the sound die on
+ * every state load. */
+NGPC_API void ngpc_get_aux_state(ngpc_t* h, ngpc_aux_state_t* out) {
+    if (!h || !out) return;
+    const Machine* m = reinterpret_cast<Machine*>(h);
+    const Z80& z = m->z80;
+    const Apu& a = m->apu;
+
+    std::memset(out, 0, sizeof(*out));
+    out->version = NGPC_AUX_STATE_VERSION;
+    out->size    = uint32_t(sizeof(ngpc_aux_state_t));
+
+    out->z80_a  = z.a;  out->z80_f  = z.f;  out->z80_b  = z.b;  out->z80_c  = z.c;
+    out->z80_d  = z.d;  out->z80_e  = z.e;  out->z80_h  = z.h;  out->z80_l  = z.l;
+    out->z80_a2 = z.a_; out->z80_f2 = z.f_; out->z80_b2 = z.b_; out->z80_c2 = z.c_;
+    out->z80_d2 = z.d_; out->z80_e2 = z.e_; out->z80_h2 = z.h_; out->z80_l2 = z.l_;
+    out->z80_ix = z.ix; out->z80_iy = z.iy; out->z80_sp = z.sp; out->z80_pc = z.pc;
+    out->z80_i  = z.i;  out->z80_r  = z.r;  out->z80_im = z.im;
+    out->z80_iff1        = z.iff1 ? 1 : 0;
+    out->z80_iff2        = z.iff2 ? 1 : 0;
+    out->z80_halted      = z.halted ? 1 : 0;
+    out->z80_running     = z.running ? 1 : 0;
+    out->z80_nmi_pending = z.nmi_pending ? 1 : 0;
+    out->z80_int_pending = z.int_pending ? 1 : 0;
+    out->z80_trapped     = z.trapped ? 1 : 0;
+    out->z80_trap_prefix = z.trap_prefix;
+    out->z80_trap_opcode = z.trap_opcode;
+    out->z80_trap_pc     = z.trap_pc;
+    out->z80_int_ack     = m->z80_int_ack;
+    out->z80_cycle_credit = z.cycle_credit;
+    out->z80_executed     = z.executed;
+
+    for (int i = 0; i < 3; ++i) {
+        out->square_vol_left[i]  = a.square[i].vol_left;
+        out->square_vol_right[i] = a.square[i].vol_right;
+        out->square_period[i]    = a.square[i].period;
+        out->square_phase[i]     = a.square[i].phase;
+        out->square_counter[i]   = a.square[i].counter;
+    }
+    out->noise_vol_left      = a.noise.vol_left;
+    out->noise_vol_right     = a.noise.vol_right;
+    out->noise_shifter       = a.noise.shifter;
+    out->noise_tap           = a.noise.tap;
+    out->noise_period_select = a.noise.period_select;
+    out->noise_period_extra  = a.noise.period_extra;
+    out->noise_counter       = a.noise.counter;
+    out->latch_left          = a.latch_left;
+    out->latch_right         = a.latch_right;
+    out->dac_left            = a.dac_left;
+    out->dac_right           = a.dac_right;
+    out->apu_main_residue    = a.main_residue;
+    out->apu_step_fp         = a.step_fp;
+    out->apu_chip_residue    = a.chip_residue;
+
+    for (int i = 0; i < 4; ++i) {
+        out->timer_count[i] = m->timer_count[i];
+        out->timer_clock[i] = m->timer_clock[i];
+    }
+    out->to3_half_periods   = m->to3_half_periods;
+    out->ti0_pending_pulses = m->ti0_pending_pulses;
+    out->irq_pending        = m->irq_pending;
+    out->scanline           = m->scanline;
+    out->frame_count        = m->frame_count;
+    out->cycle_residue      = m->cycle_residue;
+}
+
+NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
+    if (!h || !in) return -1;
+    /* A blob from another build is REFUSED, not half-applied: a savestate written by
+     * an older core carries a different layout, and reading one field of it as
+     * another is how a "restored" machine ends up quietly insane. */
+    if (in->version != NGPC_AUX_STATE_VERSION || in->size != sizeof(ngpc_aux_state_t))
+        return -1;
+
+    Machine* m = reinterpret_cast<Machine*>(h);
+    Z80& z = m->z80;
+    Apu& a = m->apu;
+
+    z.a  = in->z80_a;  z.f  = in->z80_f;  z.b  = in->z80_b;  z.c  = in->z80_c;
+    z.d  = in->z80_d;  z.e  = in->z80_e;  z.h  = in->z80_h;  z.l  = in->z80_l;
+    z.a_ = in->z80_a2; z.f_ = in->z80_f2; z.b_ = in->z80_b2; z.c_ = in->z80_c2;
+    z.d_ = in->z80_d2; z.e_ = in->z80_e2; z.h_ = in->z80_h2; z.l_ = in->z80_l2;
+    z.ix = in->z80_ix; z.iy = in->z80_iy; z.sp = in->z80_sp; z.pc = in->z80_pc;
+    z.i  = in->z80_i;  z.r  = in->z80_r;  z.im = in->z80_im;
+    z.iff1        = in->z80_iff1 != 0;
+    z.iff2        = in->z80_iff2 != 0;
+    z.halted      = in->z80_halted != 0;
+    z.running     = in->z80_running != 0;
+    /* These two are EDGE state, and restoring the memory image just forged one of
+     * them: 0x00BA is a door ("fire one NMI"), not a byte of storage, so writing the
+     * image back rings the sound CPU's doorbell. Putting the snapshot's own value
+     * here is what cancels that phantom. */
+    z.nmi_pending = in->z80_nmi_pending != 0;
+    z.int_pending = in->z80_int_pending != 0;
+    z.trapped     = in->z80_trapped != 0;
+    z.trap_prefix = in->z80_trap_prefix;
+    z.trap_opcode = in->z80_trap_opcode;
+    z.trap_pc     = in->z80_trap_pc;
+    z.cycle_credit = in->z80_cycle_credit;
+    z.executed     = in->z80_executed;
+    m->z80_int_ack = in->z80_int_ack;
+
+    for (int i = 0; i < 3; ++i) {
+        a.square[i].vol_left  = in->square_vol_left[i];
+        a.square[i].vol_right = in->square_vol_right[i];
+        a.square[i].period    = in->square_period[i];
+        a.square[i].phase     = in->square_phase[i];
+        a.square[i].counter   = in->square_counter[i];
+    }
+    a.noise.vol_left      = in->noise_vol_left;
+    a.noise.vol_right     = in->noise_vol_right;
+    a.noise.shifter       = in->noise_shifter;
+    a.noise.tap           = in->noise_tap;
+    a.noise.period_select = in->noise_period_select;
+    a.noise.period_extra  = in->noise_period_extra;
+    a.noise.counter       = in->noise_counter;
+    a.latch_left          = in->latch_left;
+    a.latch_right         = in->latch_right;
+    a.dac_left            = in->dac_left;
+    a.dac_right           = in->dac_right;
+    a.main_residue        = in->apu_main_residue;
+    a.step_fp             = in->apu_step_fp;
+    a.chip_residue        = in->apu_chip_residue;
+    /* `channel_mask` and the output ring are deliberately untouched: the first is a
+     * UI setting, the second is audio the host has not played yet. */
+
+    for (int i = 0; i < 4; ++i) {
+        m->timer_count[i] = in->timer_count[i];
+        m->timer_clock[i] = in->timer_clock[i];
+    }
+    m->to3_half_periods   = in->to3_half_periods;
+    m->ti0_pending_pulses = in->ti0_pending_pulses;
+    m->irq_pending        = in->irq_pending;
+    m->scanline           = in->scanline;
+    m->frame_count        = in->frame_count;
+    m->cycle_residue      = in->cycle_residue;
+    return 0;
 }
 
 NGPC_API int ngpc_read_mem(ngpc_t* h, uint32_t addr, uint8_t* out, uint32_t n) {

@@ -121,6 +121,54 @@ La politique est respectee quand:
 
 ---
 
+## 9bis. Le levier principal : les wait-states cartouche
+
+C'est ici que se joue l'essentiel des §1-9, donc ca n'est pas optionnel.
+
+**La flash cartouche est lente, et chaque instruction est allee la chercher.** Sur
+silicium, un fetch coute des wait-states par octet. Sans ce cout, du code cartouche
+tourne **~2,9 a 3,4x trop vite** : les jeux verrouilles au VBlank (Fatal Fury) n'en
+montrent rien, mais les jeux **auto-cadences** (Cool Boarders, Densha de Go) font
+tenir leur travail dans un seul VBlank et affichent 60 fps la ou la console en donne
+30 — exactement le "embellissement" que le §2 interdit.
+
+Valeurs **mesurees** (ROMs dans `hw_calibration/`, jamais reglees a l'oreille) :
+
+| Reglage | Valeur livree | Preuve |
+|---|---|---|
+| `cart_wait` — cycles par octet de **fetch** | **3** | `cpu_calib_v1` : classes fetch-bound ~3,4x trop rapides, MUL/DIV ~2,5x, raster juste |
+| `cart_data_wait` — cycles par octet **lu en donnee** | **0** | `cpu_calib_v2` : lecture cartouche == lecture RAM (252 == 252). Une valeur de 5, calee sur un framerate, a ete **refutee** par cette ROM |
+| `ldir_cost` — cycles par octet de `LDIR` | **14** | fait tomber Cool Boarders a ses 30 fps sans toucher Fatal Fury. Fortement etaye, ROM de mesure (`v6`) encore ouverte |
+| `vram_wait` — ecriture VRAM | **0 (off)** | l'effet est reel (`cpu_calib_v3` : VWR 452 < MEM 471) mais le cout/octet n'est pas fixe : on ne livre pas un entier devine |
+
+### ⚠️ Deux defauts differents, et c'est voulu
+
+- **`Machine` (le champ C++) demarre a 0** = fetch gratuit. C'est de la
+  **retro-compatibilite**, pas une affirmation sur le materiel : quand la
+  fonctionnalite est arrivee, le champ a ete laisse eteint pour que le timing
+  existant reste identique au bit pres et que le chemin chaud ne coute rien.
+- **L'application les allume** a chaque chargement de ROM (`cart_wait_states()`
+  dans `ngpc_settings.py`). Le CLI headless `ngpc_native.py` aussi (`--timing
+  silicon`, le defaut).
+
+⇒ **Tout code qui construit une `Machine` lui-meme** (banc de mesure, test, serveur
+MCP) tourne en fetch gratuit tant qu'il n'appelle pas les setters, et mesure une
+machine ~2,9x trop rapide. Copier les trois appels de `core/romcheck.py`.
+
+### La consequence qui trompe le plus
+
+Le fetch gratuit ne fait pas qu'accelerer uniformement : **il rend invisible tout
+gain de taille de code**. Une optimisation qui ne fait que raccourcir le code mesure
+**exactement zero**, parce que ce qu'elle economise est la seule chose non facturee.
+Sur silicium chaque octet d'encodage coute 3 ticks — la taille du code *est* de la
+vitesse, et c'est aussi pourquoi aligner une struct sur une puissance de deux peut
+couter (les offsets sortent du deplacement 8 bits, l'encodage grossit).
+
+Si une optimisation plausible mesure zero, **suspecter le modele de timing avant de
+conclure qu'elle ne sert a rien.**
+
+---
+
 ## 10. Vitesse du modele de reference Python (mesure 2026-07-10)
 
 ⚠️ Ne pas confondre avec les §1-9 : celles-ci parlent de la **cadence de la

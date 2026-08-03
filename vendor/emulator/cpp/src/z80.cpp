@@ -147,6 +147,7 @@ static inline void z80_out(Machine& m, uint8_t port, uint8_t value) {
     m.log_apu_write(port, value, NGPC_APU_WRITE_PORT);
 }
 static inline uint8_t z80_in(Machine& m, uint8_t port) {
+    (void)m;
     (void)port;
     return 0xFF;   /* open bus */
 }
@@ -863,7 +864,19 @@ unsigned exec_one(Machine& m, Z80& z) {
 /* --- the seam -------------------------------------------------------------- */
 
 void io_action_write(Machine& m, uint32_t address, uint8_t value) {
-    if (address == kZ80ResetRegister || address == kZ80NmiRegister ||
+    /* WDMOD/WDCR. Bit 7 of WDMOD arms the counter and arming restarts it; WDCR
+     * takes two magic codes and ignores everything else -- 0x4E is the refresh
+     * the SDK asks for every 100 ms, 0xB1 switches the watchdog off (which is
+     * what a cartridge built with the Toshiba startup does: WDMOD=0, WDCR=0xB1).
+     * Same semantics as ares/ngp/cpu/io.cpp, and as the retail BIOS's own use. */
+    if (address == kWatchdogModeIo) {
+        m.watchdog_enabled = (value & 0x80) != 0;
+        if (m.watchdog_enabled) m.watchdog_clear();
+    } else if (address == kWatchdogIo && value == kWatchdogClearCode) {
+        m.watchdog_clear();
+    } else if (address == kWatchdogIo && value == kWatchdogDisableCode) {
+        m.watchdog_reset(false);
+    } else if (address == kZ80ResetRegister || address == kZ80NmiRegister ||
         address == kZ80CommRegister) {
         z80_control_write(m, address, value);
     } else if (address == kDacLeftRegister || address == kDacRightRegister) {
@@ -874,7 +887,8 @@ void io_action_write(Machine& m, uint32_t address, uint8_t value) {
          * still holds it, harmlessly -- the RX read path returns serial_rx_byte.) */
         m.serial_tx_byte = value;
         m.serial_tx_busy = true;
-        m.serial_tx_cycles = kSerialByteCycles;
+        m.serial_tx_shifting = false;   /* not on the wire yet: CTS may hold the START */
+        m.serial_tx_cycles = m.serial_byte_cycles();
         ++m.serial_tx_count;      /* debugger: the game IS talking, even if held */
     }
 }

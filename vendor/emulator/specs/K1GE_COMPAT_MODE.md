@@ -263,3 +263,35 @@ faite** (voir 3-bis : le trou n°1 est clos par la donnée).
 ⚠️ **Le trou n°2 (la palette compat par défaut d'un jeu MONO) N'EST PAS clos** : les jeux K1GE
 écrivent bien le LUT 3 bits (mesuré : KOF R-1 pose `00 03 05 07`) mais **ignorent la palette 12
 bits** — c'est le BIOS qui doit la poser au lancement. **Ne pas inventer une rampe de gris.**
+
+---
+
+## 5. LA CONSOLE MONO ELLE-MÊME (≠ le mode compat d'une NGPC)
+
+⚠️ **Deux situations distinctes, à ne jamais confondre — c'est la clé de tout ce fichier.**
+
+| | cartouche mono **dans une NGPC** | console **NGP monochrome** |
+|---|---|---|
+| silicium | K2GE en *mode compat* | K1GE — la palette 12 bits **n'existe pas** |
+| `0x87E2` (registre de MODE) | posé à `0x80` par le BIOS couleur | **n'existe pas** ; le BIOS mono ne l'écrit jamais |
+| `0x8380..0x83DF` | palette 12 bits, posée **par le BIOS** (thème) | **n'existe pas** — écritures ignorées |
+| niveau LUT `0x8100` → couleur | `palette × 8 + niveau` dans la palette 12 bits | **directement une nuance de gris** (K1GE Tech Ref §3-7) |
+
+L'avertissement ci-dessus — *« ne pas inventer une rampe de gris »* — **tient toujours pour la
+colonne de gauche** : sur NGPC c'est le BIOS qui pose la palette compat, et la fabriquer nous-mêmes
+masquerait son thème (celui que le joueur a choisi sur l'écran de configuration).
+
+Il **ne s'applique pas** à la colonne de droite, et pour une raison de matériel : sur K1GE il n'y a
+aucune RAM de couleur à poser. Le Tech Ref décrit le LUT comme contenant un *code couleur* 3 bits,
+« le plus petit écart de contraste étant le LSB » — le niveau **est** la nuance, et la dalle fait le
+reste. `Machine::k1ge_console` sélectionne donc :
+
+- `render.cpp` — le mode compat est vrai **parce que la machine l'est**, sans lire `0x87E2` (que le
+  BIOS mono n'écrit pas et que n'importe quel effacement de page vidéo remettrait à zéro) ;
+- le niveau va droit aux huit gris `FFF DDD BBB 999 666 444 222 000`, sans passer par de la RAM ;
+- `execute.cpp` — les écritures cartouche dans `0x8380..0x83DF` et `0x87E2` sont perdues : ce
+  silicium n'est pas atteignable depuis la cartouche.
+
+**Symptôme si on l'oublie** (mesuré) : le logo de démarrage du BIOS mono s'affichait **par-dessus la
+tapisserie de « SNK »** qui aurait dû rester invisible, et tout l'écran sortait en deux tons — la
+console mono résolvait ses pixels à travers des palettes couleur que personne n'avait remplies.

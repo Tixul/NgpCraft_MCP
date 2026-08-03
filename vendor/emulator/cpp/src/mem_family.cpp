@@ -877,7 +877,9 @@ static bool exec_dest(Machine& m, ngpc_record_t* rec, uint32_t pc,
         const bool cy = (c.flags & F_C) != 0;
         uint8_t out = mv;
         bool writes = false;
-        uint16_t base = 6;
+        /* Reuse the enclosing `base` rather than shadowing it: MSVC warns (C4456)
+         * on the shadow, and the block returns before anything else reads it. */
+        base = 6;
 
         switch (kind) {
             case 0: c.flags = uint8_t((c.flags & ~F_C) | ((cy && b) ? F_C : 0)); break;   // ANDCF

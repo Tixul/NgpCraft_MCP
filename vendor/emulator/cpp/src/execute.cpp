@@ -135,7 +135,13 @@ void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_
              * its writes there go nowhere, which leaves the BIOS grey ramp standing --
              * the difference between "a mono game on an NGPC" and "a mono game on an
              * NGP". Both are real machines; the setting picks one. */
-            if (m.k1ge_console && a >= 0x008380 && a <= 0x0083DF) { m.note_lost_write(a); continue; }
+            /* 0x87E2 joins the list for the same reason: the mode register is K2GE
+             * silicon too, and on a K1GE the machine is always in that mode. A cartridge
+             * clearing it would switch our renderer to colour on a console that has
+             * none. */
+            if (m.k1ge_console && ((a >= 0x008380 && a <= 0x0083DF) || a == 0x0087E2)) {
+                m.note_lost_write(a); continue;
+            }
             m.mem[a] = bytes[i];
             /* VRAM-write wait (see Machine::vram_wait): the K2GE throttles CPU access to
              * display RAM DURING THE ACTIVE DRAWING PERIOD only -- in vblank the bus is
@@ -419,6 +425,10 @@ uint8_t step(Machine& m, ngpc_record_t* rec) {
         case 0xF8: case 0xF9: case 0xFA: case 0xFB:
         case 0xFC: case 0xFD: case 0xFE: case 0xFF: {
             const unsigned n = op & 0x07;
+            /* `swi 1` is the BIOS's front door, and a save asks for a BLOCK NUMBER --
+             * the one form of the request that still names which CARTRIDGE this is.
+             * Read it here or lose it: the BIOS turns it into an address next. */
+            if (n == 1) m.bios_flash_syscall_hint();
             const uint16_t sr = uint16_t(c.flags)
                               | uint16_t((c.rfp & 0x03) << 8)
                               | uint16_t(1u << 11)                  // MAX

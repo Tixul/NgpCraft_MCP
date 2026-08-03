@@ -36,7 +36,9 @@ from ctypes import (
 )
 from pathlib import Path
 
-ABI_VERSION = 13
+from core import bios_fingerprint
+
+ABI_VERSION = 15
 
 # How the machine comes up (NGPC_RESET_* in ngpc_core.h). This was a bool, and a third
 # case was hiding inside it: "no hand-off" ALSO started at the cart's entry point, so
@@ -69,6 +71,8 @@ STATUS = {
     11: "silicon-undefined",
     12: "division-by-zero",
     13: "bios-shutdown",
+    14: "system-stack-violation",
+    15: "watchdog-reset",
     20: "unknown-opcode",
     21: "truncated",
     22: "unmapped",
@@ -79,6 +83,8 @@ STATUS = {
 
 STATUS_OK = 0
 STATUS_HALTED = 1
+STATUS_SYSTEM_STACK_VIOLATION = 14
+STATUS_WATCHDOG_RESET = 15
 STATUS_BREAKPOINT = 40
 STATUS_COUNT_REACHED = 41
 
@@ -200,6 +206,70 @@ class ApuState(Structure):
     ]
 
 
+AUX_STATE_VERSION = 1
+
+
+class AuxState(Structure):
+    """The machine state a SAVESTATE needs that is not in the memory image.
+
+    The sound CPU's registers, the T6W28's, and the timer up-counters that pace
+    them. A snapshot of "main CPU + memory" alone loses all three, which is why
+    loading a state used to kill the music until the game changed scene and sent
+    its driver a fresh command. Layout mirrors `ngpc_aux_state_t` FIELD FOR FIELD --
+    see the contract in cpp/include/ngpc_core.h.
+    """
+
+    _fields_ = [
+        ("version", c_uint32),
+        ("size", c_uint32),
+        # the sound CPU
+        ("z80_a", c_uint8), ("z80_f", c_uint8), ("z80_b", c_uint8), ("z80_c", c_uint8),
+        ("z80_d", c_uint8), ("z80_e", c_uint8), ("z80_h", c_uint8), ("z80_l", c_uint8),
+        ("z80_a2", c_uint8), ("z80_f2", c_uint8), ("z80_b2", c_uint8), ("z80_c2", c_uint8),
+        ("z80_d2", c_uint8), ("z80_e2", c_uint8), ("z80_h2", c_uint8), ("z80_l2", c_uint8),
+        ("z80_ix", c_uint16), ("z80_iy", c_uint16),
+        ("z80_sp", c_uint16), ("z80_pc", c_uint16),
+        ("z80_i", c_uint8), ("z80_r", c_uint8), ("z80_im", c_uint8), ("z80_iff1", c_uint8),
+        ("z80_iff2", c_uint8), ("z80_halted", c_uint8),
+        ("z80_running", c_uint8), ("z80_nmi_pending", c_uint8),
+        ("z80_int_pending", c_uint8), ("z80_trapped", c_uint8),
+        ("z80_trap_prefix", c_uint8), ("z80_trap_opcode", c_uint8),
+        ("z80_trap_pc", c_uint16),
+        ("z80_int_ack", c_uint8), ("_pad0", c_uint8),
+        ("z80_cycle_credit", c_int32),
+        ("z80_executed", c_uint64),
+        # the T6W28's registers
+        ("square_vol_left", c_int32 * 3),
+        ("square_vol_right", c_int32 * 3),
+        ("square_period", c_int32 * 3),
+        ("square_phase", c_int32 * 3),
+        ("square_counter", c_int32 * 3),
+        ("noise_vol_left", c_int32),
+        ("noise_vol_right", c_int32),
+        ("noise_shifter", c_int32),
+        ("noise_tap", c_int32),
+        ("noise_period_select", c_int32),
+        ("noise_period_extra", c_int32),
+        ("noise_counter", c_int32),
+        ("latch_left", c_uint8), ("latch_right", c_uint8),
+        ("dac_left", c_uint8), ("dac_right", c_uint8),
+        ("apu_main_residue", c_uint32),
+        ("apu_step_fp", c_uint32),
+        ("_pad1", c_uint32),
+        ("apu_chip_residue", c_uint64),
+        # the timers that pace the sound CPU, and the pending-interrupt mask
+        ("timer_count", c_uint32 * 4),
+        ("timer_clock", c_uint32 * 4),
+        ("to3_half_periods", c_uint32),
+        ("ti0_pending_pulses", c_uint32),
+        ("irq_pending", c_uint64),
+        ("scanline", c_uint32),
+        ("frame_count", c_uint32),
+        ("cycle_residue", c_uint32),
+        ("_pad2", c_uint32),
+    ]
+
+
 class SerialState(Structure):
     """A read-only look at the link cable, for the debugger. Mirrors
     `ngpc_serial_state_t`.
@@ -243,6 +313,32 @@ class HygieneRec(Structure):
     Mirrors `ngpc_hygiene_t`."""
 
     _fields_ = [("pc", c_uint32), ("addr", c_uint32)]
+
+
+# The two hardware-safety findings, as bits (`ngpc_set_hw_guard`, `Violation.kind`).
+HW_WATCHDOG = 0x1
+HW_SYSTEM_STACK = 0x2
+HW_KINDS = {HW_WATCHDOG: "watchdog-starved", HW_SYSTEM_STACK: "system-stack"}
+
+
+class Violation(Structure):
+    """One hardware-safety finding. Mirrors `ngpc_violation_t`.
+
+    `detail` is the XSP value for a stack crossing, and the watchdog period for a
+    starved watchdog. Counted, not fatal: see `set_hw_guard` for the gate.
+    """
+
+    _fields_ = [
+        ("pc", c_uint32),
+        ("detail", c_uint32),
+        ("cycle", c_uint64),
+        ("kind", c_uint32),
+        ("_pad", c_uint32),
+    ]
+
+    @property
+    def kind_name(self) -> str:
+        return HW_KINDS.get(self.kind, f"kind-{self.kind}")
 
 
 class EventRec(Structure):
@@ -370,6 +466,10 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_serial_state.restype = None
     lib.ngpc_get_apu_state.argtypes = [c_void_p, POINTER(ApuState)]
     lib.ngpc_get_apu_state.restype = None
+    lib.ngpc_get_aux_state.argtypes = [c_void_p, POINTER(AuxState)]
+    lib.ngpc_get_aux_state.restype = None
+    lib.ngpc_set_aux_state.argtypes = [c_void_p, POINTER(AuxState)]
+    lib.ngpc_set_aux_state.restype = c_int
     lib.ngpc_set_apu_channel_mask.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_apu_channel_mask.restype = None
     lib.ngpc_set_layer_mask.argtypes = [c_void_p, c_uint32]
@@ -412,6 +512,10 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_ldir_cost.restype = None
     lib.ngpc_set_flash_size.argtypes = [c_void_p, c_uint32, c_uint32]
     lib.ngpc_set_flash_size.restype = None
+    lib.ngpc_flash_capacity.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_flash_capacity.restype = c_uint32
+    lib.ngpc_set_language.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_language.restype = None
     lib.ngpc_bus_write.argtypes = [c_void_p, c_uint32, c_uint8]
     lib.ngpc_bus_write.restype = None
     lib.ngpc_flash_dirty.argtypes = [c_void_p]
@@ -440,6 +544,12 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_get_uninit_reads.restype = c_uint32
     lib.ngpc_get_lost_writes.argtypes = [c_void_p, POINTER(HygieneRec), c_uint32]
     lib.ngpc_get_lost_writes.restype = c_uint32
+    lib.ngpc_set_hw_guard.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_hw_guard.restype = None
+    lib.ngpc_hw_violations.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_hw_violations.restype = c_uint64
+    lib.ngpc_get_hw_violations.argtypes = [c_void_p, POINTER(Violation), c_uint32]
+    lib.ngpc_get_hw_violations.restype = c_uint32
     lib.ngpc_set_event_log.argtypes = [c_void_p, c_uint32, c_uint32]
     lib.ngpc_set_event_log.restype = None
     lib.ngpc_event_log_count.argtypes = [c_void_p]
@@ -500,6 +610,25 @@ def available() -> bool:
         return False
 
 
+def core_fingerprint(path: Path | None = None) -> str:
+    """Identify THIS BUILD of the core, for anything that compares two of them.
+
+    Mirror netplay (core/netplay.py) simulates the same two consoles on two PCs and
+    relies on them agreeing bit for bit, so a core built with different timing at the
+    other end is a desync waiting to happen -- and one that shows up mid-match as
+    drift, not as an error. The ABI number does not move for a timing fix, so the
+    file's own bytes are what answers "is that the same core as mine".
+    """
+    import hashlib
+
+    dll = path or _DEFAULT_DLL
+    try:
+        digest = hashlib.sha1(Path(dll).read_bytes()).hexdigest()[:16]
+    except OSError:
+        digest = "unknown"
+    return f"{ABI_VERSION}:{digest}"
+
+
 def _buf(data: bytes) -> "ctypes.Array[c_uint8]":
     return (c_uint8 * len(data)).from_buffer_copy(data)
 
@@ -515,6 +644,7 @@ class NativeMachine:
         buf = _buf(rom)
         if self._lib.ngpc_load_rom(self._h, buf, len(rom)) != 0:
             raise ValueError("native core rejected the ROM (too small for a header?)")
+        self._rom = bytes(rom)          # kept for core.bios_fingerprint (see reset)
         if bios is not None:
             bbuf = _buf(bios)
             if self._lib.ngpc_load_bios(self._h, bbuf, len(bios)) != 0:
@@ -533,19 +663,35 @@ class NativeMachine:
         return int(self._lib.ngpc_apu_write_count(self._h))
 
     def set_cart_wait(self, cycles_per_byte: int) -> None:
-        """Wait-states per byte fetched from cartridge flash (0 = free/old behaviour).
+        """Wait-states per byte of instruction FETCH from cartridge flash. Silicon = 3.
 
-        The cart flash is slow; every instruction is fetched from it, so cart code ran
-        ~3.4x too fast with free fetches. Calibrated by hw_calibration/cpu_calib_v1.ngc.
+        ⚠️ A FRESH MACHINE STARTS AT 0 -- free fetch, the pre-wait-state behaviour, NOT
+        hardware. The desktop shell turns the silicon set on for every ROM it loads
+        (ngpc_settings.cart_wait_states() is True); code that builds a Machine itself gets
+        the free-fetch machine and must ask for hardware timing explicitly:
+
+            m.set_cart_wait(3)        # cfg.CART_FETCH_WAIT -- instruction fetch
+            m.set_cart_data_wait(0)   # cfg.CART_DATA_WAIT  -- cart data reads are free
+            m.set_ldir_cost(14)       # cfg.CART_LDIR_COST  -- block copies
+
+        Without them cart code runs ~2.9-3.4x too fast, self-timed games (Cool Boarders,
+        Densha de Go) show 60fps where hardware shows 30 -- and, the subtler one, any
+        optimisation whose gain is FEWER INSTRUCTION BYTES measures as exactly zero,
+        because instruction fetch is the thing not being billed. Every byte of encoding
+        costs 3 ticks on silicon, so code size is speed.
+
+        Calibrated by hw_calibration/cpu_calib_v1.ngc. See Machine::cart_wait.
         """
         self._lib.ngpc_set_cart_wait(self._h, int(cycles_per_byte))
 
     def set_cart_data_wait(self, cycles_per_byte: int) -> None:
-        """Wait-states per byte of a RANDOM data read from cart flash (0 = same as fetch).
+        """Wait-states per byte of a DATA read from cart flash. Silicon = 0 (free).
 
-        Sequential fetch is cheap (flash page-mode); an arbitrary LD from a cart table
-        eats the full random-access latency. Calibrated so Cool Boarders' silicon-confirmed
-        30fps reproduces on top of the fetch cost. See Machine::cart_data_wait.
+        cpu_calib_v2 on real hardware read a random cart byte and a RAM byte at the same
+        cost (CRND 252 == RRND 252): only instruction fetch is wait-stated. 0 here means
+        free, NOT "unset" -- there is no fallback to the fetch cost. An earlier value of 5,
+        curve-fit to Cool Boarders' frame rate, was refuted by that ROM; don't restore it
+        without a measurement. See Machine::cart_data_wait.
         """
         self._lib.ngpc_set_cart_data_wait(self._h, int(cycles_per_byte))
 
@@ -558,20 +704,35 @@ class NativeMachine:
         BIOS grey ramp stands. Must be set BEFORE reset. See Machine::k1ge_console.
         """
         self._lib.ngpc_set_k1ge_console(self._h, 1 if on else 0)
+        # Shadowed so callers can READ it back: the C core has no getter, and a tool
+        # that renders VRAM itself (the tilemap viewer) resolves colours down a
+        # different path on a mono console. Asking 0x87E2 instead is not the same
+        # question -- the mono NGP does not have that register at all.
+        self._k1ge_console = bool(on)
+
+    @property
+    def k1ge_console(self) -> bool:
+        """Whether this machine is emulating the original mono NGP."""
+        return getattr(self, "_k1ge_console", False)
 
     def set_vram_wait(self, cycles_per_byte: int) -> None:
-        """EXPERIMENTAL wait-states per byte written to display RAM (0x8000-0xBFFF).
+        """Wait-states per byte written to display RAM (0x8000-0xBFFF). Default 0 = off.
 
-        Tests whether the K2GE active-display access throttle explains the residual
-        speed of self-timed games after the (silicon-confirmed) CPU model is exact.
-        Needs a v3 calibration ROM to confirm. See Machine::vram_wait.
+        The K2GE throttle is REAL -- cpu_calib_v3 on silicon returned VWR 452 < MEM 471,
+        a VRAM write costing more than a RAM write. What is not pinned is the cost per
+        byte, so nothing ships a value and this stays off rather than guessing an integer.
+        It is not the cause of Cool Boarders' residual either (that game writes VRAM in
+        vblank; the answer was LDIR). If you measure the cost, say so in
+        hw_calibration/README.md rather than only here. See Machine::vram_wait.
         """
         self._lib.ngpc_set_vram_wait(self._h, int(cycles_per_byte))
 
     def set_ldir_cost(self, cycles_per_byte: int) -> None:
-        """Cycles/byte for LDIR/LDDR block copies (default 7 = datasheet). 14 reproduces
-        Cool Boarders' silicon 30fps; the datasheet figure is likely a floor (as MUL/DIV
-        were). See Machine::ldir_cost."""
+        """Cycles/byte for LDIR/LDDR block copies. A fresh Machine starts at 7 (datasheet);
+        the shell and romcheck ship 14 (cfg.CART_LDIR_COST), which reproduces Cool Boarders'
+        silicon 30fps and leaves Fatal Fury at 60. The datasheet figure is likely a floor,
+        as MUL/DIV proved to be. Pass 14 if you want the shipping timing.
+        See Machine::ldir_cost."""
         self._lib.ngpc_set_ldir_cost(self._h, int(cycles_per_byte))
 
     def set_flash_size(self, size_bytes: int, *, chip: int = 0) -> None:
@@ -579,6 +740,21 @@ class NativeMachine:
         map). Lets an under-filled homebrew ROM save in its chip's top block. See
         ngpc_set_flash_size in core.cpp."""
         self._lib.ngpc_set_flash_size(self._h, int(chip), int(size_bytes))
+
+    def flash_capacity(self, chip: int = 0) -> int:
+        """What the chip presents as NOW -- not what was set. The cartridge corrects us
+        mid-session by the block number it asks for, so this is the size to persist a
+        save at; see ngpc_flash_capacity in core.cpp for what happens if you use the
+        guess instead. 0 = no cartridge in that slot."""
+        return int(self._lib.ngpc_flash_capacity(self._h, int(chip)))
+
+    LANGUAGE_JAPANESE, LANGUAGE_ENGLISH = 0, 1
+
+    def set_language(self, code: int) -> None:
+        """The console's language setting, handed to the cart at 0x6F87 (SDK SysWork:
+        0 = Japanese, 1 = English). A bilingual cartridge reads this byte and nothing
+        else -- 24 games of the corpus do. Set BEFORE reset."""
+        self._lib.ngpc_set_language(self._h, int(code))
 
     def set_timer_base(self, cycles_per_phi_t1: int) -> None:
         """phi-T1 in CPU cycles. The docs contradict each other; see ngpc_core.h."""
@@ -730,6 +906,29 @@ class NativeMachine:
     def lost_write_samples(self, limit: int = HYGIENE_SAMPLES) -> list[HygieneRec]:
         buf = (HygieneRec * limit)()
         got = self._lib.ngpc_get_lost_writes(self._h, buf, limit)
+        return list(buf[:got])
+
+    HW_SAMPLES = 64
+
+    def set_hw_guard(self, stop_mask: int) -> None:
+        """Which hardware-safety findings should STOP a run: `HW_WATCHDOG`,
+        `HW_SYSTEM_STACK`, or both OR-ed together.
+
+        Zero -- the default -- is the diagnostic mode: findings are counted and
+        sampled while the ROM keeps running, because neither halts a real console
+        at the instruction that commits it. Arm this only for a gate that wants a
+        verdict ("this build must be clean"), and read `stop_status`.
+        """
+        self._lib.ngpc_set_hw_guard(self._h, stop_mask)
+
+    def hw_violations(self, kind: int = HW_WATCHDOG | HW_SYSTEM_STACK) -> int:
+        """How many findings of the given kind(s) since the last reset."""
+        return int(self._lib.ngpc_hw_violations(self._h, kind))
+
+    def hw_violation_samples(self, limit: int = HW_SAMPLES) -> list[Violation]:
+        """The earliest findings, oldest first, so a report can name the code."""
+        buf = (Violation * limit)()
+        got = self._lib.ngpc_get_hw_violations(self._h, buf, limit)
         return list(buf[:got])
 
     EVENT_LOG_SIZE = 4096
@@ -923,6 +1122,14 @@ class NativeMachine:
         else:
             mode = RESET_HANDOFF if bios_handoff else RESET_RAW
         self._lib.ngpc_reset(self._h, mode)
+        # A game may check that the console booted from the BIOS by fingerprinting
+        # char RAM. Hand-off only: that is the path where char RAM arrives pre-filled
+        # (the core warms the loaded BIOS up to capture it), so a real bios.bin leaves
+        # the fingerprint there and this is a no-op. Under `real_bios` the BIOS is
+        # about to run for itself and char RAM is still blank -- writing there would be
+        # us pre-empting a boot that produces the data on its own.
+        if mode == RESET_HANDOFF:
+            bios_fingerprint.restore(self._rom, self.read, self.write)
 
     def cpu(self) -> CpuState:
         st = CpuState()
@@ -931,6 +1138,25 @@ class NativeMachine:
 
     def set_cpu(self, st: CpuState) -> None:
         self._lib.ngpc_set_cpu(self._h, ctypes.byref(st))
+
+    def aux_state(self) -> AuxState:
+        """The rest of the machine: sound CPU, sound chip, timers, pending IRQs.
+
+        Everything a savestate needs that `read()` cannot see, because it is chip
+        state rather than memory. See AuxState.
+        """
+        st = AuxState()
+        self._lib.ngpc_get_aux_state(self._h, ctypes.byref(st))
+        return st
+
+    def set_aux_state(self, st: AuxState) -> bool:
+        """Put it back. False if the blob is from another build (never half-applied).
+
+        ⚠️ Apply this AFTER restoring the memory image, never before: writing the
+        image goes through the control registers, and 0x00BA is a door ("fire one
+        NMI at the sound CPU"), not storage. This call is what cancels that phantom.
+        """
+        return self._lib.ngpc_set_aux_state(self._h, ctypes.byref(st)) == 0
 
     def read(self, address: int, count: int) -> bytes:
         out = (c_uint8 * count)()

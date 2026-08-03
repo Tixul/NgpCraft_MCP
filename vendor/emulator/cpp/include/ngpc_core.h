@@ -29,7 +29,7 @@
 extern "C" {
 #endif
 
-#define NGPC_ABI_VERSION 13
+#define NGPC_ABI_VERSION 15
 
 /* ---------------------------------------------------------------- status --
  * Execution status of one instruction. The tri-state "requires-known-*"
@@ -47,6 +47,10 @@ typedef enum {
     NGPC_SILICON_UNDEFINED  = 11,
     NGPC_DIVISION_BY_ZERO   = 12,
     NGPC_BIOS_SHUTDOWN      = 13,  /* BIOS powered the console off              */
+    /* The two hardware-safety findings. Counted, never terminal -- UNLESS the
+     * caller arms that kind with ngpc_set_hw_guard. See the safety section. */
+    NGPC_SYSTEM_STACK_VIOLATION = 14, /* cart XSP entered 0x6C01..0x6FFF        */
+    NGPC_WATCHDOG_RESET     = 15,  /* enabled watchdog expired without 0x4E refresh */
 
     /* --- decode / bus faults                                                  */
     NGPC_UNKNOWN_OPCODE     = 20,
@@ -422,6 +426,91 @@ NGPC_API uint64_t ngpc_apu_write_count(ngpc_t*);
 
 NGPC_API void ngpc_get_z80(ngpc_t*, ngpc_z80_t* out);
 NGPC_API void ngpc_set_cpu(ngpc_t*, const ngpc_cpu_t* in);
+
+/* ------------------------------------------------ THE REST OF THE MACHINE --
+ * Machine state a SAVESTATE needs that is NOT in the flat memory image. ABI v15.
+ *
+ * ⛔ WHY THIS EXISTS. A snapshot used to be "the main CPU struct + memory", and the
+ * sound died on every load -- reported on SNK vs. Capcom, seen on several games,
+ * and it came back only when the game happened to send its driver a fresh command
+ * (a scene change). Both halves of that are explained by what the snapshot MISSED:
+ *
+ *   - the SOUND CPU's registers. Its RAM is in the memory image (0x7000), its PC
+ *     and its pointers are not. Restoring one without the other lands a Z80 that is
+ *     halfway through some other song's playback loop on top of a driver state from
+ *     the past: it walks off into whatever the old pointers now mean. The main CPU
+ *     believes it already asked for that music, so it never asks again -- until the
+ *     game changes scene and issues a new command, which is exactly the escape the
+ *     report describes.
+ *   - the T6W28's own registers (tone periods, volumes, latches, the DAC hold).
+ *   - the timer up-counters. Timer 3's output IS the sound CPU's interrupt line;
+ *     it is chip state, not memory, so it is invisible to a memory snapshot.
+ *
+ * ⚠️ ORDER MATTERS ON RESTORE: write the memory image FIRST, then this. Writing the
+ * image replays the edge-triggered control registers (0x00BA is a "fire one NMI"
+ * door, not storage), so a restore injects a spurious NMI at the sound CPU; putting
+ * this state back afterwards is what overrules it.
+ *
+ * NOT here, on purpose: the audio output ring (host-facing, and stale samples are
+ * exactly what must not be replayed), the debug channel/layer masks (UI settings,
+ * never machine state), and the cartridge flash (a save, not a snapshot).
+ *
+ * `version`/`size` are written by the getter and CHECKED by the setter: a blob from
+ * a different build is REFUSED (-1), never half-applied. */
+#define NGPC_AUX_STATE_VERSION 1
+
+typedef struct {
+    uint32_t version;             /* NGPC_AUX_STATE_VERSION            */
+    uint32_t size;                /* sizeof(ngpc_aux_state_t)          */
+
+    /* --- the sound CPU (z80.hpp) */
+    uint8_t  z80_a,  z80_f,  z80_b,  z80_c,  z80_d,  z80_e,  z80_h,  z80_l;
+    uint8_t  z80_a2, z80_f2, z80_b2, z80_c2, z80_d2, z80_e2, z80_h2, z80_l2;  /* shadow */
+    uint16_t z80_ix, z80_iy, z80_sp, z80_pc;
+    uint8_t  z80_i, z80_r, z80_im, z80_iff1;
+    uint8_t  z80_iff2, z80_halted, z80_running, z80_nmi_pending;
+    uint8_t  z80_int_pending, z80_trapped, z80_trap_prefix, z80_trap_opcode;
+    uint16_t z80_trap_pc;
+    uint8_t  z80_int_ack;
+    uint8_t  _pad0;
+    int32_t  z80_cycle_credit;    /* SIGNED: cycles owed, never forgiven */
+    uint64_t z80_executed;
+
+    /* --- the T6W28's registers (apu.hpp) */
+    int32_t  square_vol_left[3];
+    int32_t  square_vol_right[3];
+    int32_t  square_period[3];
+    int32_t  square_phase[3];
+    int32_t  square_counter[3];
+    int32_t  noise_vol_left;
+    int32_t  noise_vol_right;
+    int32_t  noise_shifter;
+    int32_t  noise_tap;
+    int32_t  noise_period_select;
+    int32_t  noise_period_extra;
+    int32_t  noise_counter;
+    uint8_t  latch_left, latch_right, dac_left, dac_right;
+    uint32_t apu_main_residue;
+    uint32_t apu_step_fp;
+    uint32_t _pad1;
+    uint64_t apu_chip_residue;
+
+    /* --- the timers that pace the sound CPU, and the pending-interrupt mask */
+    uint32_t timer_count[4];
+    uint32_t timer_clock[4];
+    uint32_t to3_half_periods;    /* TO3 is a flip-flop: parity is state  */
+    uint32_t ti0_pending_pulses;
+    uint64_t irq_pending;
+    uint32_t scanline;
+    uint32_t frame_count;
+    uint32_t cycle_residue;
+    uint32_t _pad2;
+} ngpc_aux_state_t;
+
+NGPC_API void ngpc_get_aux_state(ngpc_t*, ngpc_aux_state_t* out);
+/* Returns 0 on success, -1 if the blob's version/size do not match this build. */
+NGPC_API int  ngpc_set_aux_state(ngpc_t*, const ngpc_aux_state_t* in);
+
 NGPC_API int  ngpc_read_mem (ngpc_t*, uint32_t addr, uint8_t* out, uint32_t n);
 NGPC_API int  ngpc_write_mem(ngpc_t*, uint32_t addr, const uint8_t* in, uint32_t n);
 
@@ -565,6 +654,49 @@ NGPC_API uint64_t ngpc_lost_writes(ngpc_t*);
 /* Up to `n` distinct early samples of each, so a report can name the code. */
 NGPC_API uint32_t ngpc_get_uninit_reads(ngpc_t*, ngpc_hygiene_t* out, uint32_t n);
 NGPC_API uint32_t ngpc_get_lost_writes(ngpc_t*, ngpc_hygiene_t* out, uint32_t n);
+
+/* ------------------------------------------------------ hardware safety --
+ * Two things a real Neo Geo Pocket minds and the running code cannot see. ABI v14.
+ *
+ *   SYSTEM STACK -- SysPro.txt gives the cartridge 0x4000..0x6BFF. XSP may EQUAL
+ *   0x6C00 (the stack descends before it writes), but a cart that leaves it above
+ *   that puts its next push or call into the BIOS's own page. Nothing complains;
+ *   the console restarts or powers off later, somewhere else entirely.
+ *
+ *   WATCHDOG -- with the counter armed, software owes I/O 0x006F the clear code
+ *   0x4E (SysPro; ngpcspec.txt asks for at least every 100 ms). The retail BIOS
+ *   hands the console over with WDMOD=0xF0, i.e. ARMED, so this is the cart's
+ *   duty from instruction one. Starve it and the console resets itself.
+ *
+ * ⚡ COUNTED, NOT ENFORCED. Neither halts a real console where it happens, so
+ * neither halts this one: they increment, keep their first samples, and the ROM
+ * runs on. This is a diagnostic, in the shape of the hygiene counters above --
+ * point it at a build and ask what it did, rather than have the emulator decide
+ * the build is dead. `ngpc_set_hw_guard` is the opt-in gate for the cases that
+ * DO want a verdict: pass a mask of NGPC_HW_* kinds, and a run that commits one
+ * ends with NGPC_SYSTEM_STACK_VIOLATION / NGPC_WATCHDOG_RESET at the offending
+ * PC. Both are on for reporting always; only stopping is a choice.
+ *
+ * ⚠️ The watchdog PERIOD is an assumption: one CPU second at 6.144 MHz, as ares
+ * models it. WDMOD's prescaler bits are not decoded, and the SDK's 100 ms is the
+ * refresh rate asked of the program, not the counter's period. A wrong period
+ * moves WHEN a starved watchdog is reported, never whether the ROM runs. */
+#define NGPC_HW_WATCHDOG     0x1u
+#define NGPC_HW_SYSTEM_STACK 0x2u
+
+typedef struct {
+    uint32_t pc;      /* the instruction that committed it                     */
+    uint32_t detail;  /* stack: the XSP value. watchdog: cycles it was armed.  */
+    uint64_t cycle;   /* machine cycle count when it happened                  */
+    uint32_t kind;    /* NGPC_HW_*                                             */
+    uint32_t _pad;
+} ngpc_violation_t;
+
+/* Which kinds should STOP a run. 0 (the default) = pure diagnostic. */
+NGPC_API void     ngpc_set_hw_guard(ngpc_t*, uint32_t stop_mask);
+NGPC_API uint64_t ngpc_hw_violations(ngpc_t*, uint32_t kind);
+/* Up to `n` earliest samples, oldest first, both kinds interleaved in time. */
+NGPC_API uint32_t ngpc_get_hw_violations(ngpc_t*, ngpc_violation_t* out, uint32_t n);
 
 NGPC_API void     ngpc_set_callstack(ngpc_t*, int enabled);
 NGPC_API uint32_t ngpc_callstack_depth(ngpc_t*);
