@@ -55,6 +55,46 @@ Two consequences of "it's a UART, not a shared bus":
 `SC0CR` holds RX error flags (framing / parity / overrun), cleared on read. There is
 **no readable CTS-status bit** — the handshake acts on the transmitter (§4).
 
+### Where 19 200 bps actually comes from ⭐
+
+`BR0CR = 0x05` is quoted everywhere as "19 200 bps"; here is the arithmetic, straight
+from the TMP95C061 datasheet §3.11 (figures 3.11(6) SC0MOD, 3.11(8) BR0CR, 3.11(12) the
+channel-0 block diagram), so it can be checked rather than trusted.
+
+```
+BR0CR bits:  bit7 fixed 0 | bits5-4 BR0CK (input clock) | bits3-0 BR0S (divider)
+
+BR0CK = 00 -> phi-T0  = fc/4     01 -> phi-T2  = fc/16
+        10 -> phi-T8  = fc/64    11 -> phi-T32 = fc/256
+BR0S  = 0000 means divide by 16; 0001 is "don't set"; 0010..1111 divide by 2..15
+
+BR0CR = 0x05  ->  BR0CK = 00 -> phi-T0 = fc/4
+                  BR0S  = 5  -> divide by 5
+SC0MOD= 0x69  ->  SM = 10   -> UART, 8 data bits
+                  SC = 01   -> clocked by the baud rate generator
+UART mode     ->  a further /16 (the transmit and receive counters are labelled
+                  "UART only /16" in the block diagram)
+
+baud = fc / 4 / 5 / 16 = fc / 320
+```
+
+With `fc = 6.144 MHz` — which you can get from the video timing alone,
+`515 cycles/line x 199 lines x 60 Hz = 6 149 100`, so it owes the serial section
+nothing — that is **19 200 bps** exactly. And 8N1 is 10 bit-times, so:
+
+```
+one byte = 10 / 19 200 = 520.83 us = 3200 CPU cycles at 6.144 MHz
+```
+
+**3200 cycles per byte** is the number an emulator needs, and it is derived, not fitted.
+
+⚠️ **The BIOS writes these registers, not the cartridge.** Measured across ten
+commercial link-capable cartridges, every one ends up at `SC0MOD = 0x69`, `BR0CR = 0x05`,
+`SC0CR = 0x00`, and **every write comes from BIOS code**, never from cartridge space.
+There is no per-game serial configuration to look up — which is exactly why the console
+needs no per-cartridge table.
+
+
 ---
 
 ## 3. The 11 BIOS COM vectors
@@ -114,6 +154,18 @@ ships and raises `INTTX0`. No polling — the silicon waits.
 Peer ready   → its RTS low  → my CTS0 low  → my queued byte ships (INTTX0 fires)
 Peer busy    → its RTS high → my CTS0 high → my byte waits in SC0BUF (back-pressure)
 ```
+
+⚠️ **CTS gates the START of a byte — never one already going out.** The datasheet says
+it twice: §3.11 *"when the CTS0 pin goes high, **after completion of the current data
+send**, data send is halted"*, and Note 1 of fig 3.11(16) *"if the CTS signal rises
+during transmission, the **next** data is not sent after the completion of the current
+transmission"*. A shift register that has begun cannot be paused. An emulator that
+re-tests CTS every tick and freezes the byte in flight will stall a transfer whenever
+the peer pulses RTS mid-byte.
+
+⚠️ **CTSE and the CTS0 pin exist on serial channel 0 only.** The channel-1 block diagram
+greys them out with "there isn't in channel 1". The link is channel 0, so this is only a
+warning against generalising from channel-1 documentation.
 
 Practical rule: **wrap any long operation** (V-blank wait, heavy compute) with
 `COMOFFRTS … COMONRTS`, so the peer parks its next byte instead of overrunning you.
@@ -353,6 +405,22 @@ while each believing it was right.
   CTSE-gated transmitter is held until the peer is ready (§4).
 - **Drive cable-detect from link state.** `0xB1` bit2 = `cable_connected ? 0 : 1` (§5).
   This one line is the difference between a peer-arbitrating game linking and hanging.
+- **SC0BUF is TWO registers on one address.** A write loads the TRANSMIT buffer; a read
+  returns the RECEIVE buffer. The CPU **cannot** read back what it transmitted. An
+  emulator that returns the received byte only while a "new data" flag is set, and then
+  falls through to the I/O page, hands back **the last byte the game sent** — and the
+  retail BIOS's COM ISR touches SC0BUF more than once per byte, so it stores that wrong
+  byte in its ring. One corrupted byte fails a packet checksum, the peer silently drops
+  the packet and never answers, and both consoles wait for each other for ever. It is
+  phase-dependent, so the same game links on one attempt and hangs on the next.
+- **Time a byte at 3200 CPU cycles**, and preferably *compute* it from `BR0CR` and
+  `SC0MOD` (§2) rather than hardcoding it, so a cartridge that programs a different
+  divider is not silently emulated at the wrong rate.
+- **Do not assume a fixed exchange cadence.** How often a game drives the cable is a
+  property of *that game's* link library in *that state*, not of the console. Measured
+  on real cartridges: Samurai Shodown! 2 and The Last Blade exchange once every 2 frames
+  when idle, while Fatal Fury drives the cable on **every** frame. There is no platform
+  constant to conform to.
 - **Do not** synchronise the two machines' clocks or frames — the real link is async.
 
 ---
@@ -377,8 +445,20 @@ they are open:
 - **Block-transfer vectors `COMCREATEBUFDATA` (0x19) / `COMGETBUFDATA` (0x1A)**: BIOS
   entry addresses not individually verified; the `xhl3`=ptr / `rb3`=size ABI is from the
   manual, not re-confirmed by trace.
-- **`BR0CR = 0x05 → 19 200 bps`**: the line works, but the exact divider→bit-rate
-  computation has not been re-derived.
+- ✅ **`BR0CR = 0x05 -> 19 200 bps` is now DERIVED, not just observed.** The divider ->
+  bit-rate computation is written out in §2: `phi-T0 = fc/4`, `/5`, `/16` for UART, with
+  `fc = 6.144 MHz` cross-checked from the video timing. It gives 19 200 bps and
+  **3200 CPU cycles per byte** exactly. *(This gap is closed.)*
+- ⏳ **What is still NOT silicon-measured is the byte time itself.** Everything above is
+  manufacturer documentation plus register values read out of an emulator. Nobody has
+  put a timer on a real console: start it on the SC0BUF write, stop it on `INTTX0`, and
+  print microseconds per byte. The expected answer is **520.83 us**. A probe ROM that
+  also programs a different `BR0CR` and reports the ratio would settle the whole
+  question in one run.
+- ⚠️ **There is no such thing as "the" exchange cadence.** How often a game drives the
+  cable is a property of that game's link library in that state — Samurai Shodown! 2 and
+  The Last Blade idle at one exchange every 2 frames, Fatal Fury drives it every frame.
+  Do not treat any single figure as a platform constant.
 - **BIOS RX counter `0x6D01`** can lag in emulation (the ring still fills). Prefer the
   drain-until-`COM_BUF_EMPTY` idiom.
 - **Online (`TcpLink`) initiator/responder sync** not re-tested since the cable-detect

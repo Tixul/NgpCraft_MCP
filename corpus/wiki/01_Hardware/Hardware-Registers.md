@@ -52,6 +52,19 @@ Complete hardware register documentation for the Neo Geo Pocket Color: memory ma
 0xFFFE00              BIOS vector table (system functions)
 ```
 
+**Inside `0x000000-0x0000FF`, the serial channel 0 block is what the link cable runs on:**
+
+```
+0x50  SC0BUF   TX buffer on write, RX buffer on read -- two registers, one address
+0x51  SC0CR    control / RX error flags (framing, parity, overrun)
+0x52  SC0MOD   UART mode, clock source, CTSE (bit6), RXE (bit5)
+0x53  BR0CR    baud rate generator -- 0x05 gives 19 200 bps (derivation in Link-Cable)
+0xB2  bit0     RTS, a GPIO OUTPUT ("I am ready to receive")
+0xB1  bit2     cable-detect INPUT (0 = peer connected)
+```
+
+Full treatment, including the baud arithmetic and the CTS/RTS rules: [Link Cable](../05_Systems/Link-Cable.md).
+
 ---
 
 ## 2. CPU / Internal Timers

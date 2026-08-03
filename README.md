@@ -93,7 +93,18 @@ For `ngpc_png_to_sprite` / `ngpc_png_to_tilemap`, PNG decoding goes through `png
 
 The `ngpc_emu_*` tools spawn `python vendor/emulator/ngpc_emu.py <cmd> --json` (Python 3 required on the host). They cover ROM parsing, memory bus reads, decode/execute and the K2GE inspectors, and they read **static** state — a ROM at reset or a save state.
 
-`ngpc_emu_native_run` is the exception: it spawns `python vendor/emulator/ngpc_native.py run --json` and **executes the machine** on the native C++ core (VDP, PSG, IRQ and timing all modelled), drawing the frame line by line as the beam passes. It needs the compiled core in `vendor/emulator/cpp/build/` and, for most commercial games, a real `bios.bin`.
+`ngpc_emu_native_run` is the exception: it spawns `python vendor/emulator/ngpc_native.py run --json` and **executes the machine** on the native C++ core (VDP, PSG, IRQ and the timing model), drawing the frame line by line as the beam passes. It needs the compiled core in `vendor/emulator/cpp/build/` and, for most commercial games, a real `bios.bin`.
+
+> ⏱️ **It is timed like hardware.** The raw core defaults to free instruction fetch for
+> backward compatibility, which runs ~2.9× too fast; this bridge applies the
+> silicon-calibrated set (`cart_wait=3`, `cart_data_wait=0`, `ldir_cost=14`) and reports
+> which model ran in the answer's `timing` field. `timing: "free"` opts back out, for
+> reproducing a pre-wait-state measurement and nothing else.
+>
+> 🩺 **Every run returns `hw_safety`** — a starved watchdog (a real console resets itself)
+> or a stack that crossed into the BIOS page. Counted, not fatal, exactly as on hardware;
+> `hw_guard: true` makes the first one stop the run. See
+> [AGENT_GUIDE.md](AGENT_GUIDE.md) for how to report them.
 
 ---
 
@@ -235,6 +246,8 @@ NgpCraft_MCP/
 ## Hardware validation claim
 
 Every entry in `src/data/bugs_silicon.json` cites the validation reference (jalon / bisect / date). These are not speculative — they were reproduced on a real NGPC flash cart during the NgpCraft toolchain development (WIP). The curated set captures findings that would otherwise only live in long-form dev logs.
+
+**Timing is calibrated too.** Cartridge-flash wait-states were measured on silicon by `hw_calibration/cpu_calib_v1.ngc` (instruction fetch = 3 cycles/byte, cart data reads = 0) and `ngpc_emu_native_run` applies them, so a cycle figure from it is comparable to hardware. The one unsettled value, `LDIR` at 14 cycles/byte, is strongly evidenced but not yet pinned by a calibration ROM — the emulator's `hw_calibration/README.md` tracks what is proven and what is not.
 
 ---
 
