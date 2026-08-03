@@ -1464,8 +1464,131 @@ through the carry, with no explicit carry handling:
 
 ---
 
+## 37. Instruction Cost — States (CPU-internal, no bus wait-states)
+
+**Source: Toshiba TLCS-900/L1 CPU manual, Appendix B "Instruction Lists".** The manual's
+own "CPU Core Different Points" table puts **900/H and 900/L1 in the same column** on
+every line, so these figures apply to the NGPC's TMP95C061 (900/H) as well. Notation is
+Toshiba's: `byte . word . long`, `−` = form does not exist.
+
+`1 state = 2 / f_FPH`. Register-register `LD` = **2 states** — the baseline everything
+else is compared against.
+
+> ⚠️ **Always say which CPU variant a cycle figure comes from.** Toshiba shipped five
+> TLCS-900 cores (900, 900/L, **900/H**, 900/L1, 900/H2) and they are not interchangeable.
+> Figures headed plain "TLCS-900" — the original core — circulate widely and **do not
+> apply here**; the NGPC is a 900/H. A table quoting `MUL` at 18/26 or `LDIR` at a flat 14
+> is not this CPU (or not a datasheet figure at all). If a number has no variant next to
+> it, treat it as unsourced.
+>
+> **Credit:** section contributed by [Napsterix](https://github.com/Napsterix), including
+> the variant caveat above. Figures transcribed from the Toshiba manual named at the top
+> of this section.
+
+### 37.1 Multiply / divide — the expensive ones
+
+| Instruction | `RR,r` | `rr,#` | `RR,(mem)` |
+|---|---|---|---|
+| `MUL` (unsigned) | 11.14.− | 12.15.− | 13.16.− |
+| `MULS` (signed) | 9.12.− | 10.13.− | 11.14.− |
+| `DIV` (unsigned) | 15.23.− | 15.23.− | 16.24.− |
+| `DIVS` (signed) | 18.26.− | 18.26.− | 19.27.− |
+| `MULA rr` | −.19.− | | |
+
+⚠️ **`MULS` is cheaper than `MUL`**, not the other way round (9 vs 11 in bytes, 12 vs 14
+in words). Do not collapse the two into one row.
+
+**Why it matters for C:** a word `MUL RR,r` at 14 states is **≈7x** a register move, so
+every `array[i].field` with a non-power-of-two `sizeof` pays that on each access. See
+[Measuring Performance §4.2](../05_Systems/Measuring-Performance.md) for the padding
+trade-off and the case where it reverses.
+
+### 37.2 Block instructions — cost scales with length
+
+| Instruction | states |
+|---|---|
+| `LDI` / `LDD` | 8.8.− |
+| `LDIR` / `LDDR` | **7n + 1** |
+| `CPI` / `CPD` | 6.6.− |
+| `CPIR` / `CPDR` | **6n + 1** |
+
+### 37.3 Modulo increment / decrement — word only
+
+`MINC1/2/4` and `MDEC1/2/4` are marked `-W-` in Table 5.2: **there is no byte form and no
+long form.**
+
+| Instruction | states |
+|---|---|
+| `MINC1` / `MINC2` / `MINC4  #, r` | −.5.− |
+| `MDEC1` / `MDEC2` / `MDEC4  #, r` | −.4.− |
+
+The immediate must be a power of two. cc900 never emits these; they are an assembly-only
+tool for ring buffers.
+
+### 37.4 Other costs worth knowing
+
+| Instruction | states | note |
+|---|---|---|
+| `LD R,r` | 2.2.2 | the baseline |
+| `LD R,(mem)` / `LD (mem),R` | 4.4.6 | + addressing-mode surcharge (§37.5) |
+| `ADD`/`SUB`/`AND`/`OR`/`XOR` `R,r` | 2.2.2 | |
+| `ADD (mem),R` etc. | 6.6.10 | read-modify-write on memory is 3x the register form |
+| shifts / rotates `#4,r` and `A,r` | **3 + n/4** | cost grows with the shift count |
+| shifts / rotates on `(mem)` | 6.6 | memory form shifts **once** only |
+| `RLD` / `RRD [A,](mem)` | 14.−.− | |
+| `CALL #16` / `CALL #24` | 9 / 10 | `RET` = 9, `RETI` = 12 |
+| `JR cc` / `JRL cc` | 5 taken / 2 not taken | |
+| `JP cc,mem` | 7 / 4 | `CALL cc,mem` = 12 / 4 |
+| `DJNZ` | 6 looping / 4 falling through | |
+| `SWI` | 19 | |
+| `HALT` | 6 | |
+| general-purpose interrupt entry | 18 | PUSH PC + PUSH SR + vector fetch |
+| micro DMA transfer | 8.8.12 | counter mode = 5 |
+
+### 37.5 Addressing-mode surcharge
+
+Add these to the instruction's own state count:
+
+| operand form | + states |
+|---|---|
+| `R` (current-bank register) | +0 |
+| `r` (any register, extension byte) | +1 |
+| `(R)` | +0 |
+| `(R+d8)`, `(#8)`, `(r)`, `(−r)`, `(r+)` | +1 |
+| `(#16)` | +2 |
+| `(#24)`, `(r+d16)`, `(r+r8)`, `(r+r16)` | +3 |
+
+### 37.6 ⚠️ These are a floor, not the cost on a cartridge
+
+The table is **CPU-internal states only**. On the NGPC the code is fetched from cartridge
+flash, and that bus is slow:
+
+- **every instruction byte costs ~3 extra cycles** on fetch (`cart_wait=3`,
+  silicon-confirmed) — so a shorter encoding is directly faster, which is why some
+  size-vs-speed trades reverse on this machine;
+- **`MUL`/`DIV` cost more on silicon than the datasheet says.** A calibration ROM run on
+  real hardware (batches completed per second — higher = cheaper per op) measured
+  `BASE 682 · SHIFT 538 · ADD 578 · MUL 444 · DIV 265`. Fetch-bound ops (BASE/SHIFT/ADD)
+  came out ~3.4x slower than a no-wait emulator, but MUL/DIV came out slower still than a
+  pure fetch-wait predicts — meaning the datasheet under-states their execution cost;
+- **`LDIR` likewise:** the datasheet's `7n+1` leaves a heavy per-frame block copy
+  measurably too cheap; **14 cycles/byte** reproduces the silicon frame rate of the games
+  that stress it.
+
+**So: the datasheet is a floor, not the cost.** Quoting §37.1 as if it were the price of a
+multiply on this machine is the specific mistake this section exists to prevent.
+
+Use this table to answer *what is expensive*; use a wait-state-calibrated measurement to
+answer *what a change will cost*. See
+[Gameplay Patterns §3](../06_Pipeline-and-Patterns/Gameplay-Patterns.md) for the
+calibration and [Measuring Performance](../05_Systems/Measuring-Performance.md) for the
+method.
+
+---
+
 ## See Also
 
+- [Measuring Performance](../05_Systems/Measuring-Performance.md) — turning §37 into a number that means something
 - [Assembly](Assembly.md) — writing TLCS-900/H assembly, assembler gotchas, ABI in practice
 - [Build Toolchain](Build-Toolchain.md) — compiler rules, ABI, codegen, toolchain pipeline
 - [Hardware Registers](../01_Hardware/Hardware-Registers.md) — full memory map and register addresses

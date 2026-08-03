@@ -261,6 +261,33 @@ The VBlank window is ~24,200 cycles. Operations safe inside VBlank:
 > stop all DMA channels before any VBlank work, then re-arm after.
 > See [DMA](../03_Graphics/DMA.md) for the full stop/re-arm pattern.
 
+⚠️ **A bulk write measured *at* the window size is already over it.** A glyph upload
+measured at ~24,200 cycles ran guaranteed into active display, where the hardware is
+reading tile data — invisible on an emulator, "the intro doesn't work" on hardware.
+Any bulk VRAM write outside the normal game frame (intros, cutscenes, text pages) needs
+its **own** VBlank sync, and a counter that paces those waits must be **reset per batch**:
+one that kept counting across text blocks started each new batch at an arbitrary phase,
+sometimes with only one or two glyphs of room left.
+
+### 4.4 Work inside the VBlank ISR overruns silently
+
+Rebuilding a data structure inside the VBlank ISR is the classic way to blow the window
+without any visible error. In one project a raster-split table rebuild inside the ISR
+overran whenever the table changed, arming the MicroDMA too late: **wrong scroll on the
+topmost scanlines *and* dropped frames** — one cause, two symptoms that look unrelated.
+
+Measured **45 VBlanks** per zoom phase against an ideal 24; rebuilding only the changed
+16-line window brought it to **32**.
+
+> Only visible **with wait-states enabled**. Without them the same test showed 27 vs 24,
+> which reads as noise. See
+> [Measuring Performance §1](Measuring-Performance.md).
+
+**Rule: the ISR consumes a table someone else built. Build it in the main loop.**
+
+*The two hardware traps above (§4.3 bulk-write warning, §4.4) contributed by
+[Napsterix](https://github.com/Napsterix).*
+
 ---
 
 ## 5. State Machine Pattern
@@ -874,7 +901,32 @@ u16 counter     : NEVER use u8 for loop counter if iterations >= 256.
                   (OAM flush = 256 bytes -> u8 counter wraps to 0 = infinite loop.)
 State cleanup   : on state transition, hide all sprites + clear tilemap.
                   Leftover sprites from previous state = garbage on screen.
+Statics at boot : hardware does NOT clear RAM at power-on (emulators do). Any static
+                  read before it is written returns whatever was in the chip.
+                  Set it explicitly in main(). See 11.1.
 ```
+
+### 11.1 RAM is not zero at power-on — and check your own crt0
+
+An emulator clears RAM at reset; **hardware does not**. A `static u8 flag;` read before
+its first write returns whatever the chip held at power-on.
+
+One such byte cost an entire title sequence: a "high scores already shown" flag was
+non-zero at power-on, so the intro tick never ran, one text band stayed at its initial
+2-scanline height, and the high-score page never appeared. **Two symptoms, one byte.**
+
+- **Set every static that is read before it is written explicitly at a deterministic
+  point in `main()`.**
+- ⚠️ **Also verify your startup code actually copies `.data` and clears `.bss`.** In one
+  project a `static u8 x = 2u;` arrived as **0** on hardware — that is a `crt0` that never
+  copied the initialized-data image out of ROM, not a CPU quirk. See
+  [TLCS-900/H Reference §10](../02_CPU-and-Toolchain/TLCS900-Reference.md).
+- **Reproduce rather than guess:** fill RAM with a pattern right after reset (`0xA5` over
+  `0x4000`–`0x6BFF`) and boot. That turns "works here" into a measurement. Remember that
+  whatever you *wait for* is then also garbage — a loop "until `lives != 0`" exits
+  immediately on a `0xA5` fill, before the game has executed anything.
+
+*Contributed by [Napsterix](https://github.com/Napsterix).*
 
 ---
 

@@ -22,10 +22,16 @@ addresses hex. Console: Neo Geo Pocket Color, Toshiba TLCS-900/H @ 6.144 MHz, 16
 | Tilemap SCR1 / SCR2 | `0x009000` / `0x009800` | 32x32 cells, 2 bytes/cell |
 | Char / tile RAM | `0x00A000` | 2bpp tiles |
 | Cartridge ROM | `0x200000`–`0x3FFFFF` | 2 MB, FAR access only (near can't reach) |
-| Flash save | block 33 @ `0x1FA000` (CPU `0x3FA000`) | block 34 = system-reserved |
+| Flash save (16 Mbit cart) | block 33 (`0x21`) @ `0x1FA000` (CPU `0x3FA000`) | block 34 = system-reserved |
+
+**Save block is per cartridge size** — 4/8/16 Mbit = block `0x09`/`0x11`/`0x21` @
+`0x07A000`/`0x0FA000`/`0x1FA000` (always `capacity − 0x6000`). The BIOS stores the card
+type at **`0x6C58`** (`0`=none, `1`/`2`/`3` = 4/8/16 Mbit) — read it, never hardcode.
+Wrong block = erasing your own ROM. See `wiki/05_Systems/Storage-and-Saves.md` §5.0.
 
 ## Key BIOS RAM variables (`0x6F80+`)
 
+`0x6C58` cartridge type (0/1/2/3 = none/4/8/16 Mbit; `0x6C59` = CS1, empty on retail) ·
 `0x6F82` joypad (active-high) · `0x6F85` shutdown-request flags · `0x6F87` language ·
 `0x6F91` hardware type (`>=0x10` = Color, else mono NGP).
 
@@ -123,6 +129,7 @@ ISR before a flash write · install VBL ISR + `ei 0` or the joypad byte never up
 - `wiki/05_Systems/Fixed-Point-Math.md` — fixed-point (8.x), LUTs, binary->BCD, compression.
 - `wiki/05_Systems/Localization.md` — BIOS language detect, bilingual ROM, string tables, system font.
 - `wiki/05_Systems/Debug-Tools.md` — on-device CPU profiler, ring-buffer log, runtime assert.
+- `wiki/05_Systems/Measuring-Performance.md` — measurement method: wait-states first (no-wait emu runs ~3.4x too fast), name the scene, A/B/A, probe traps, measured/rejected techniques, hardware traps invisible on emulator.
 
 **Pipeline & Patterns**
 - `wiki/06_Pipeline-and-Patterns/Asset-Pipeline.md` — PNG export, compression, runtime loading, tool limits.
@@ -135,6 +142,7 @@ palette/color/transparent/fade -> Colors-and-Palettes · DMA/MicroDMA/LDIRW -> D
 save/flash/RTC/checksum -> Storage-and-Saves · joypad/button/edge -> Input ·
 link/cable/serial/COM/multiplayer/2P/SC0/RTS/CTS/cable-detect -> Link-Cable ·
 VBlank/watchdog/frame budget/state machine -> Game-Loop · interrupt/timer/vector -> Hardware-Registers, BIOS ·
+benchmark/profiling/cycles/optimize/wait-states/how fast -> Measuring-Performance, TLCS900-Reference §37 ·
 opcode/encoding/ABI/register -> TLCS900-Reference, Assembly · compiler/C89/far pointer/bug -> Build-Toolchain ·
 PSG/Z80/SFX/music -> Audio · collision/AABB/tile -> Collision · fixed-point/LUT/BCD -> Fixed-Point-Math ·
 PNG/tiles/font/asset -> Asset-Pipeline · procgen/dungeon/genre -> Gameplay-Patterns.

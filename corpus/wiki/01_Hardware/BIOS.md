@@ -185,7 +185,11 @@ __asm("swi 1");
 
 ```c
 /* Step 1: erase the flash block */
-/* ra3=0 (ROM base), rb3=block number (0x1F for offset 0x1FA000), rw3=8 */
+/* ra3=0 (ROM base), rb3=block number (0x21 for offset 0x1FA000), rw3=8 */
+/* The block number is per-cartridge-size: 0x09 / 0x11 / 0x21 for 4 / 8 / 16 Mbit.  */
+/* The BIOS turns it into an address using the card-type byte it stored at 0x6C58   */
+/* at power-on — read that byte instead of hardcoding a size.                       */
+/* See Storage-and-Saves §5.0.                                                      */
 __asm("ld ra3,0");
 __asm("ld rb3," NGPC_STR(SAVE_BLOCK));
 __asm("ld rw3," NGPC_STR(BIOS_FLASHERS));

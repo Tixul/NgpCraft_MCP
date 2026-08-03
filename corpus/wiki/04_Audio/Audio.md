@@ -482,6 +482,52 @@ When a BGM/SFX conflict is suspected:
 
 Do not conclude "driver bug" before verifying all four points.
 
+### 6.4 Effects lose to music unless the driver arbitrates
+
+With four PSG channels shared between music and effects, an effect written to a channel
+the music also uses is overwritten on the next music update **if the driver updates music
+last**. The effect is not "quiet" — it is being erased.
+
+Measured in one project: the player's shot sat **11.3 dB** below the music and was
+inaudible in play. Two things made that measurable at all:
+
+- **Total RMS is the wrong metric.** The shot is narrowband (165–210 Hz) and vanishes in
+  a full-mix RMS. Measuring only its band against the music level made it quantifiable.
+- **Compare two runs from the same reset**, one firing and one not. The music runs
+  identically in both (correlation r ≈ 1.00 across 11 s), so the difference *is* the
+  effects.
+
+### 6.5 A music-only master attenuation is the right knob
+
+Raising effect volume runs out of room fast — in the case above the shot was already at
+`attn 1` of 15, and its own envelope faded it a further 8 dB while playing. Lowering the
+**music** is the lever that still has headroom.
+
+A global attenuation offset applied to the music voices **after** instrument, envelope,
+LFO and fade — and **not** to the sound effects — is the balance control between music
+and effects. 2 dB per step on the T6W28.
+
+Two implementation notes:
+
+- **A per-voice volume setter is not enough** if it writes an absolute value: the next
+  note overwrites it from the instrument table. The offset must be applied at the point
+  where the final attenuation is computed.
+- **Do not reuse the fade offset** for this. Every `Bgm_Start` resets fade state, so the
+  setting would silently disappear on the next tune.
+
+Measured against theory (2 dB/step): steps 2/4/6/8 gave −4.2 / −8.4 / −12.1 / −16.2 dB.
+
+### 6.6 T6W28 low-frequency limit
+
+With `F = 3 072 000 / (32 x n)` and n ≤ 1023, the lowest tone the chip can produce is
+`96000 / 1023` ≈ **94 Hz**. Effects ported from other hardware that sit below this must be
+transposed up by whole octaves; there is no way to reach them.
+
+Converting from PC-speaker pitches (`f = 1193182 / divisor`), the divisor maps as
+`n = divisor x 0.080457`.
+
+*Sections 6.4 to 6.6 contributed by [Napsterix](https://github.com/Napsterix).*
+
 ---
 
 ## 7. Path B — Direct PSG Pattern

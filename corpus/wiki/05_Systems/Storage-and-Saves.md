@@ -291,6 +291,94 @@ decision, not a technical one.
 
 ## 5. Flash Hardware Details
 
+### 5.0 Save geometry is per-cartridge-size — get it wrong and you erase your own ROM
+
+The `0x21` / `0x1FA000` pair below is correct **for a 16 Mbit cartridge**. Smaller
+cartridges need a different block, and **the same block number means a different address
+on each size**. Getting it wrong does not mean "the save fails" — it means **erasing
+somewhere else**, and on a small ROM that somewhere else is your own code.
+
+Manufacturer block plan (SDK `FlashMem.txt`, all three sizes): 64 KB blocks up to the
+top, with the last 64 KB split **32 / 8 / 8 / 16**. The two 8 KB blocks are where every
+game's save lives; the final 16 KB block is reserved for the system program. The save
+block conventionally used is the **second 8 KB block from the top** — exactly `0x6000`
+below the chip top on all three sizes:
+
+| Cartridge | Save block | Offset | CPU address |
+|---|---|---|---|
+| 4 Mbit (512 KB) | 9 (`0x09`) | `0x07A000` | `0x27A000` |
+| 8 Mbit (1 MB) | 17 (`0x11`) | `0x0FA000` | `0x2FA000` |
+| 16 Mbit (2 MB) | 33 (`0x21`) | `0x1FA000` | `0x3FA000` |
+
+*Contributed by [Napsterix](https://github.com/Napsterix), corroborated by two
+independent sources: freeplaytech forum reports, and reverse-engineering of the BIOS
+flash routine against the SDK block map.*
+
+#### Detect the cartridge size at runtime — do not hardcode it
+
+The BIOS answers this question at power-on and stores the answer at **`0x6C58`** in its
+own work RAM:
+
+| `0x6C58` | cartridge |
+|---|---|
+| `0` | no cartridge |
+| `1` | 4 Mbit |
+| `2` | 8 Mbit |
+| `3` | 16 Mbit |
+
+The BIOS flash routine reads **this same byte** before touching anything (and returns
+error `0xFF` if it is zero), so reading it yourself is consistent by construction rather
+than a second opinion. `0x6C59` is the same thing for CS1 — the development board's slot,
+which is empty on a production console.
+
+An **unknown value must mean "do not save"**, not a guessed default: failing to save is
+recoverable, erasing the wrong block is not.
+
+Alternative without the BIOS — CFI/autoselect query of the flash chip itself. After the
+`AA @ 5555` / `55 @ 2AAA` / `90 @ 5555` unlock the chip answers `0x98` (Toshiba) then a
+**device ID that names the size**: `0xAB` = 4 Mbit, `0x2C` = 8 Mbit, `0x2F` = 16 Mbit.
+`F0` returns the chip to being memory.
+
+#### ⚠️ 32 Mbit Flash Masta cartridges — saves reported broken below 16 Mbit
+
+> On 32 Mbit Flash Masta cartridges the save function is reported broken **for all games
+> under 16 Mbit**: those games write to block `0x11`, which on that cartridge lies inside
+> the game's own address space. The community fix repatches affected commercial games
+> from block `0x11` to `0x21` (Cotton, Biomotor Unitron and others).
+>
+> Note that block `0x11` is exactly the *correct* 8 Mbit block from the table above — so
+> a correctly implemented small homebrew game is precisely the affected class.
+>
+> **OPEN — not verified:** what `0x6C58` reports on a 32 Mbit Flash Masta holding a small
+> ROM. If it reports `2`, a correct implementation writes to `0x0FA000` and hits the
+> broken block. Until someone checks on the device, **read `0x6C58` on your target
+> cartridge before the first save** — the first save attempt is also the test, and the
+> stake is your own ROM image.
+
+*Reported by [Napsterix](https://github.com/Napsterix); source: freeplaytech forum, Flash
+Masta section, tid=92. Consequence marked OPEN deliberately — do not promote it to fact
+without an on-device check.*
+
+### 5.0b Verify the write, and verify the machine survived
+
+**"BIOS returned `SYS_SUCCESS`" and "the bytes are in the cartridge" are two different
+claims.** Always read the record back and validate it. Anything that does not verify must
+count as "no save data" — a half-written record is worse than none, because it looks like
+a working one.
+
+**Check that the machine is still running afterwards.** A wrong unit count made the BIOS
+write routine program the requested bytes correctly and then **loop forever** with
+interrupts masked by the `swi` — a dead console with a perfect-looking save record in the
+cartridge. A save-comparison test passed; only a run-on test (does the game reach the next
+screen?) caught it. A VBlank counter that stops incrementing is the tell.
+
+> **Why `swi 1` masking interrupts is not a side effect but the point:** the erase takes
+> ~1 s and the game's own ISR lives in the same cartridge. If an interrupt could fire, the
+> CPU would try to fetch instructions from a chip that is in erase mode. Reset the
+> watchdog before each call.
+
+*Contributed by [Napsterix](https://github.com/Napsterix).*
+
 ### 5.1 Confirmed BIOS Parameters
 
 Parameters confirmed by cross-analysis of multiple working NGPC homebrews with

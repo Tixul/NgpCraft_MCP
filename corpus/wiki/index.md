@@ -67,6 +67,10 @@ the machine and the techniques, not any single game or project.
   bilingual ROM, string tables, system font.
 - **[Debug Tools](05_Systems/Debug-Tools.md)** — On-device CPU profiler, ring-buffer
   log, runtime assert.
+- **[Measuring Performance](05_Systems/Measuring-Performance.md)** — Measurement *method*:
+  wait-states first, choosing the scene, A/B/A, writing emulator probes, techniques with
+  measured outcomes (including the ones that backfired), and the hardware traps an
+  emulator cannot show.
 
 ## Pipeline and Patterns
 
@@ -91,3 +95,4 @@ the machine and the techniques, not any single game or project.
 | Add save support | [Storage and Saves](05_Systems/Storage-and-Saves.md) |
 | Link two consoles (multiplayer) | [Link Cable](05_Systems/Link-Cable.md) |
 | Do a raster / HUD split | [Effects and Raster](03_Graphics/Effects-and-Raster.md) |
+| Make an optimization that actually measures | [Measuring Performance](05_Systems/Measuring-Performance.md) · [TLCS-900/H Reference §37](02_CPU-and-Toolchain/TLCS900-Reference.md) |

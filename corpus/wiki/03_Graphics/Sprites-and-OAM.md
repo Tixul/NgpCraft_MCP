@@ -129,6 +129,28 @@ The `ngpc_mspr_draw()` function handles this automatically.
 to produce up to 6 visible colors. The sprite exporter supports this
 via a two-layer split option.
 
+### 2.4 A chain slot cannot be skipped — order the overlays instead
+
+A chain entry's position is a **delta to the previous OAM entry**, so a slot in the middle
+of a chain cannot be left out: it must be written even if it draws nothing (a blank tile,
+or a delta of 0). That costs a slot for every gap.
+
+For a metasprite where only *some* cells need a second (overlay) sprite — the two-layer
+6-colour technique above, a damage flash, an equipment layer — the naive interleaved
+layout `base, overlay, base, overlay, …` costs `2 x cells` slots because the missing
+overlays still have to be written.
+
+**Emit all base cells first, then only the overlays that actually exist:** `cells +
+overlays`. The overlay run can be **appended to the base run** rather than anchored
+separately — its first slot follows the last base slot, so it still carries the chain bit
+and the whole metasprite stays **one chain**. Movement remains a single position write.
+
+> Measured on a 4-cell sprite with 2 overlays: **8 slots → 6**. Peak pool usage *rose*
+> (38 → 47) — which is the intended effect, not a leak: with smaller blocks more instances
+> get a contiguous block instead of falling back or being dropped.
+
+*Contributed by [Napsterix](https://github.com/Napsterix).*
+
 ---
 
 ## 3. Budget & Strategy

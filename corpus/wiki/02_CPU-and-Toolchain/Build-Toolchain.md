@@ -320,6 +320,41 @@ u16 result = (u16)a * (u16)b;   /* same type = hardware MUL opcode */
 
 ## 8. Known Bugs and Pitfalls
 
+### 8.0 Missing prototypes — compile with `-w3`
+
+C89 assumes `int` for a function with no visible prototype. cc900 then operates on the
+full `HL` register where the function returns `u8` — the upper byte holds whatever the
+previous call left there. This compiles without error and often works, which is what
+makes it dangerous: it fails only when the upper byte happens to be non-zero.
+
+    cc900 -c -w3 -O3 source.c
+
+`THC1-Warning-521: Undefined return type` marks every affected call. Fix by declaring
+the function before use.
+
+> Measured on a ~15 000-line file: five sites, and fixing them cost **exactly zero**
+> cycles (232 299 → 232 299 cycles/frame, 17 675 → 17 675 instructions). The generated
+> code differed in exactly one place — `cp L,0xff` instead of `ld WA,HL` / `cp A,0xff` —
+> same instruction count, same states. It went well because the definition appears later
+> in the same translation unit and cc900 corrects the call. **Do not rely on that.**
+
+*Contributed by [Napsterix](https://github.com/Napsterix); independently reproduced, and
+also reported on the freeplaytech forum (Software Development, tid=5494).*
+
+### 8.0b Reading generated assembly
+
+    cc900 -S -O3 source.c        # writes source.asm
+
+⚠️ Do **not** combine `-S` with `-o file.rel` — the driver reports
+`cc900-Warning-520: The suffix not fit for output-file` and writes nothing.
+
+*Contributed by [Napsterix](https://github.com/Napsterix).*
+
+Counting `MUL` / `MULS` / `DIV` occurrences in the output is the fastest way to find
+non-power-of-two struct indexing; see
+[Measuring Performance §4.2](../05_Systems/Measuring-Performance.md) and
+[TLCS-900/H Reference §37](TLCS900-Reference.md) for what those instructions cost.
+
 ### 8.1 u8 x Constant: Silent 8-bit Overflow
 
 **Symptom:** entities appear at completely wrong positions; coordinate calculations are

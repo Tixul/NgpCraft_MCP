@@ -113,6 +113,12 @@ const RESOURCES = {
     name: "Debugging",
     description: "On-device CPU profiler, ring-buffer log, runtime assert.",
   },
+  "ngpc://doc/measuring_performance": {
+    file: "wiki/05_Systems/Measuring-Performance.md",
+    name: "Measuring Performance",
+    description:
+      "How to get a cycle number that means something: wait-states first, name the scene, A/B/A, emulator-probe traps, measured/rejected optimizations, hardware traps invisible on emulator.",
+  },
   "ngpc://doc/gameplay_patterns": {
     file: "wiki/06_Pipeline-and-Patterns/Gameplay-Patterns.md",
     name: "Gameplay Patterns",

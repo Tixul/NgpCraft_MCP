@@ -3,6 +3,88 @@
 
 ## Unreleased
 
+- **Corpus: external contribution from [Napsterix](https://github.com/Napsterix)**, from
+  measurements taken while building a full NGPC game. New page
+  `wiki/05_Systems/Measuring-Performance.md` — the measurement *method*, which the corpus
+  had nowhere (`Debug-Tools.md` only documented the profiler API): wait-states before any
+  number, naming the scene, A/B/A, the six ways an emulator probe lies, techniques with
+  measured outcomes including the ones that backfired, and the hardware traps that produce
+  a working emulator build and a broken cartridge. Also folded in: `-w3` catches missing
+  prototypes that make cc900 compare the full `HL` (Build-Toolchain §8.0), `cc900 -S`
+  (§8.0b), music-vs-effects arbitration and the T6W28's ~94 Hz floor (Audio §6.4–6.6),
+  chain slots cannot be skipped so overlays go after the base run (Sprites-and-OAM §2.4),
+  bulk VRAM writes and ISR-side table rebuilds (Game-Loop §4.3–4.4), and RAM not being
+  zero at power-on (§11.1).
+- **Corpus: flash save geometry is per-cartridge-size** (Storage-and-Saves §5.0). The page
+  documented only the 16 Mbit case; 4 / 8 / 16 Mbit are blocks `0x09` / `0x11` / `0x21` at
+  `0x07A000` / `0x0FA000` / `0x1FA000`, and *the same block number means a different address
+  on each size* — get it wrong and you erase your own ROM rather than "fail to save". The
+  BIOS publishes the answer at **`0x6C58`** (`0`/`1`/`2`/`3`); read it, never hardcode.
+  Includes the 32 Mbit Flash Masta report, deliberately kept marked **OPEN** because its
+  interaction with `0x6C58` is not verified on device. Contributed by Napsterix,
+  corroborated against the SDK block map. Fixes a wrong comment in `BIOS.md` that named
+  block `0x1F` for offset `0x1FA000`.
+- **Corpus: instruction cost table** (TLCS900-Reference §37) — the corpus had none.
+  Transcribed from the Toshiba TLCS-900/L1 manual Appendix B, which applies to the NGPC's
+  900/H (the manual's own core-differences table puts 900/H and 900/L1 in the same column):
+  `MUL` 11.14 / `MULS` 9.12 / `DIV` 15.23 / `DIVS` 18.26 register-register, `LDIR` `7n+1`,
+  `MINC`/`MDEC` word-only at 5 / 4 states, shifts at `3 + n/4`, plus the addressing-mode
+  surcharge. ⚠️ Flagged as a **floor**, with the silicon calibration printed next to it:
+  every instruction byte costs ~3 more cycles on fetch from the cartridge, `MUL`/`DIV`
+  measure slower than a pure fetch-wait predicts, and `LDIR` lands nearer 14 cycles/byte
+  than the datasheet's `7n+1`. Also carries an explicit **variant warning** — Toshiba
+  shipped five TLCS-900 cores and figures headed plain "TLCS-900" are not this CPU.
+  Contributed by Napsterix.
+- **Emulator re-vendored** (upstream `23c5507`) and the native core rebuilt from the
+  vendored sources. Not cosmetic: the old snapshot only understood **v1 save states**
+  (`NGPCST01`), while the app now writes **v2** (`NGPCST02` — carrying the sound CPU, the
+  T6W28 and the timers). Any recent `.s0` a user handed over was rejected outright, which
+  is the *headline* workflow of `ngpc_emu_native_run`. Both formats load now.
+- `ngpc_emu_native_run` is **timed like hardware** by default. The raw core defaults to
+  free cartridge fetch for backward compatibility (~2.9× too fast); the bridge now applies
+  the silicon-calibrated set — `cart_wait = 3`, `cart_data_wait = 0`, `ldir_cost = 14` —
+  and names the model it used in a new `timing` field. New `timing: "free"` opts back out,
+  for reproducing a pre-wait-state measurement and nothing else. ⚠️ **Cycle figures from
+  this tool change with this release, and the new ones are the correct ones.** The
+  practical consequence of the old default: with instruction fetch unbilled, any
+  optimisation whose gain was *fewer instruction bytes* measured as exactly zero.
+- `ngpc_emu_native_run` now returns **`hw_safety`** on every run — a starved watchdog (the
+  BIOS hands the console over with it armed, so a cart that never writes `0x4E` to `0x006F`
+  makes a real console reset itself) and a stack that crossed into the BIOS's own page
+  `0x6C01..0x6FFF`. Counted, never fatal, exactly as on hardware. New `hw_guard: true`
+  stops the run at the first one, for a gate that wants a verdict or the exact PC.
+- `ngpc_emu_native_run` accepts **archives**: `Pack.zip` — or `Pack.zip/Game.ngc` to name
+  one title inside a multi-game archive — and `.7z`. A bare `.ngc` is unaffected.
+- `scripts/smoke_emu_tools.mjs` covers **21 cases instead of 17**: the breakpoint and
+  watchpoint registries were never exercised, and the two new `native_run` flags are run
+  both ways. Each case may now assert a **contract** rather than only that an answer
+  arrived — a tool replying without the field that matters used to count as a pass.
+- Docs (`AGENT_GUIDE.md`, `README.md`): which timing model produced a number and when it
+  may be quoted, and how to report a hardware-safety finding without overclaiming —
+  `clean` covers two specific faults, it is not a verdict on the build.
+
+- Docs: the link-cable page now **derives** `BR0CR = 0x05 -> 19 200 bps` instead of
+  quoting it. `BR0CK = 00` picks phi-T0 = fc/4, `BR0S = 5` divides by 5, UART adds a /16,
+  and `fc = 6.144 MHz` is cross-checked from the video timing (515 x 199 x 60), giving
+  19 200 bps and **3200 CPU cycles per byte** exactly. The "not re-derived" entry in the
+  known-gaps list is closed; what remains open is that nobody has timed a byte on real
+  silicon.
+- Docs: three facts added for emulator authors -- **SC0BUF is two registers on one
+  address** (a read must always return the RX buffer; falling through to the I/O page
+  hands back the byte the game just sent and silently corrupts the BIOS ring), **CTS
+  gates the start of a byte and never one already shifting** (datasheet 3.11 and Note 1
+  of fig 3.11(16)), and **CTSE/CTS0 exist on serial channel 0 only**.
+- Docs: the serial block (`0x50`-`0x53`, `0xB1` bit2, `0xB2` bit0) is now listed under
+  the low I/O page in the register map, pointing at the link-cable page.
+- ⚠️ Docs correction: **there is no platform-wide exchange cadence.** The earlier note
+  that "the wire round trip is two frames" holds for Samurai Shodown! 2 and The Last
+  Blade at idle, but Fatal Fury drives the cable on *every* frame. It is a property of a
+  given game's link library in a given state, not of the console -- do not design against
+  it as a constant.
+- Docs: measured on ten commercial link cartridges, **the BIOS programs the serial
+  registers identically for all of them** (`SC0MOD = 0x69`, `BR0CR = 0x05`,
+  `SC0CR = 0x00`) and every write comes from BIOS code, never from cartridge space. There
+  is no per-game serial configuration.
 - `ngpc_bug_check`: four measured traps added to the corpus -- `RGB()` built from `u8`
   components loses the blue nibble on cc900; palette RAM is 16-bit only and entry 0 must
   be left alone; sprite priority 0 means hidden; `COMINIT` installs the BIOS serial
