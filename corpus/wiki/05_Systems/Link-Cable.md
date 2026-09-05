@@ -182,8 +182,37 @@ bit1 = CR2032 sub-battery present   (1 = OK; 0 → BIOS "SUB BATTERY DEAD" loop)
 bit2 = LINK-CABLE DETECT            (1 = nothing plugged / idle, 0 = a peer is connected)
 ```
 
-A game that arbitrates who starts a session reads `0xB1` bit2 to know **whether a peer
-is physically there before it tries to talk**. *Card Fighters' Clash* does exactly this:
+### ⚡ MEASURED ON SILICON — it is the PEER'S RTS, not "a cable is plugged in"
+
+Two real consoles, a real cable, six physical states (2026-08-19):
+
+| what is at the other end | `0xB1` bit2 |
+|---|---|
+| nothing at all | **1** — no peer |
+| cable plugged into this console, **far end hanging loose** | **1** — no peer |
+| cable to a console that is **switched OFF** | **1** — no peer |
+| cable to a console **powered on but sitting in the BIOS** | **1** — no peer |
+| cable to a console **running a cartridge that opened its serial port** | **0** — peer |
+
+🔑 **A powered console at the BIOS, cable plugged in, does NOT register.** The bit follows
+the peer's **RTS line** — the same signal that drives your `CTS0` — so it means *"the other
+side has brought its serial channel up"*, not *"a connector is inserted"*. Nothing you can
+do locally makes it read 0; only the peer's software can.
+
+That is also why *Card Fighters' Clash*'s test is sound: `bit2 == 0` is a **rendezvous**,
+not a connector check. Waiting on it is waiting for the peer to be **ready**.
+
+⚡ **Unplugging is visible live.** Yank the cable mid-session and bit2 goes back to 1 within
+a frame; plug it back in and it returns to 0 and bytes flow again. The **wire** recovers on
+its own — but a game's own state machine may not: *Match of the Millennium* raises
+`LINK ERROR` and drops to its main menu, and never retries. If you want a recoverable
+session, design for it; the hardware will not do it for you.
+
+Measured values, same session: `B1 = 0x03` linked, `0x07` unlinked (bit0 and bit1 are set
+throughout while a cartridge runs).
+
+A game that arbitrates who starts a session reads `0xB1` bit2 to know **whether the peer
+is ready before it tries to talk**. *Card Fighters' Clash* does exactly this:
 
 ```asm
 ; sub 0x24065A — "is a cable connected?"  → A
@@ -320,9 +349,35 @@ The rule that works, and the one cable games have always used in spirit:
 Each console announces how long it has been searching; the longest search wins. In the
 module the announced token is `(frames_searching << 4) | 4 random bits`.
 
+⛔ **ANNOUNCING IS NOT DECIDING — and this is where a real link game broke.** A HELLO is a
+*snapshot*. By the time the peer's game code reads it, it is two frames old at best (§8.3)
+and more behind a queued burst. A console that weighs its own **live** search counter against
+that snapshot is comparing its present to the other's past, and the arithmetic is merciless:
+with A starting at 0, B at Δ, and d frames of announcement lag, A concludes `t > t − Δ − d`
+(always true) while B concludes `t − Δ > t − d` (true as soon as `d > Δ`). **Both consoles
+claim player one, and both are right from where they stand.**
+
+📏 Measured on two instances of the reference module, sweeping start skew against
+announcement lag: **300 disagreements in 624 runs**, forming an exact `lag > skew` triangle
+that saturates at the announcement interval. Two rules remove it:
+
+1. **Freeze the search counter at first contact** — what you announce and what you compare
+   must be the same number.
+2. **Echo the last token you heard in every HELLO, and decide only when that echo comes back
+   as your own.** At that instant both consoles provably hold the same pair, and a comparison
+   on one pair cannot disagree.
+
+Same sweep after: **0 disagreements in 624 runs.** The price is a round trip instead of a
+one-way announcement — worst-case agreement went from 25 to 51 frames. An agreed role half a
+second later beats two hosts.
+
 - **Resolution is one frame, deliberately.** Counting in seconds looks tidier but leaves
   half a second of ambiguity in which the winner is random again — a measured gate at 30
   frames of head start failed with seconds and passes with frames.
+- **The freeze costs a little accuracy, on purpose.** The two consoles do not freeze on the
+  same frame, so a start-time difference under one announcement interval can still elect the
+  one that opened the screen second. That was never resolvable to better than the
+  announcement rate anyway, and an agreed role is what a session actually needs.
 - The four random bits only separate consoles that entered within a few frames
   (~80 ms — two people never press start that close together); identical draws are
   simply re-drawn.
@@ -383,6 +438,22 @@ while each believing it was right.
   `*(volatile u8*)0xB2 &= 0xFE;` with your own `ei`.
 - **Drain RX until empty.** Read `COMGETDATA` until `COM_BUF_EMPTY (0x01)`; don't trust
   a single status guess.
+- ⛔ **DO NOT CALL THE COM ROUTINES FROM A TIGHT LOOP — IT WEDGES YOUR OWN RECEPTION.**
+  Measured on silicon and in emulation: a probe calling `COMCREATEDATA` + `COMSENDSTART`
+  every pass of its main loop (thousands of times a frame) stopped receiving entirely —
+  `COMGETDATA` answered EMPTY for a whole second while the cable was demonstrably carrying
+  ~4000 bytes and `COMRECIVESTATUS` still claimed a byte was pending. Feeding the ring
+  **once per frame** (a batch of ~40 bytes, comfortably above the 32 the wire carries in a
+  frame) makes the same run work. The COM routines share state with the receive ISR and are
+  not built to be called at that rate. ⚠️ Eliminated as causes by experiment: it is not
+  `COMRECIVESTATUS`, not draining in a tight loop (that survives), and not a missing
+  `COMINIT`.
+- ⛔ **`0x6D01` is NOT a plain "bytes waiting" count.** It is widely quoted as the RX ring
+  count and games do read it, but dumped from a live run on the retail BIOS it reads `0x83` —
+  there is a **flag bit** on top of the count. A drain loop bounded by that byte drains the
+  wrong number, and after a ring overflow it was seen stuck at `0x00` with the head/tail
+  bytes desynchronised, so the loop drained nothing at all while the cable worked fine.
+  **Bound your drain on `COMGETDATA` returning `COM_BUF_EMPTY`**, never on that address.
 - **No inter-console frame sync.** Tolerate the peer being any number of frames
   ahead/behind.
 - **`COMINIT` installs the BIOS serial handlers itself** (`0x6FE4` / `0x6FE8`). An SDK
@@ -425,19 +496,77 @@ while each believing it was right.
 
 ---
 
+## 10bis. ⚡ How fast a link REALLY goes — measured on two consoles
+
+Counting bytes tells you very little; counting **byte times** tells you everything. At
+19 200 bps a byte is 3200 CPU cycles, so a 128-frame window holds **4099 of them**. Express
+every measurement that way and the platform's real behaviour falls out:
+
+| what the software does | silicon |
+|---|---|
+| stream one way, as fast as the ring allows | **1.03 byte times per byte** — the wire is saturated |
+| stream **both ways at once** | **3818 bytes**, against **3875** one way — 1.5 % apart |
+| ping, wait for the echo, repeat (roles A/B) | **3.74 byte times per round trip** |
+| the same, measured three times in a row | **1218 / 1220 / 1217** — 0.25 % apart |
+| the CPU cost of one *received* byte | **≈ 96 µs** |
+
+Three things a link programmer can act on:
+
+1. ⚡ **The link is FULL DUPLEX.** Running both directions at once costs about 1.5 %
+   against one direction alone (3818 bytes a window vs 3875) — near enough to free that you
+   should not serialise a protocol out of caution.
+
+   ⚠️ **An earlier version of this page claimed both-ways was FASTER (3963 vs 3818).** That
+   3963 came from a run the probe ROM itself flagged `LINK OK - NOISY!` — its window opened
+   while the wire was still carrying handshake traffic, so the count was inflated. Take the
+   figure from the console whose banner reads plain `LINK OK`. **A measurement your own
+   instrument disowns is not a measurement.**
+2. ⛔ **A round trip costs ~3.7 byte times, not 2.** Only two of them are the wire; the rest
+   is your software plus the BIOS COM layer turning around. **A lock-step design that waits
+   for the peer's reply every frame pays this every frame** — that is the real budget, and
+   it is nearly double the naive estimate.
+3. **Receiving is not free.** Roughly **96 µs of CPU per byte arrives** — the interrupt, the
+   BIOS handler and the ring. At 60 Hz that is ~0.6 % of a frame per byte; a hundred bytes a
+   frame is over half of it. Budget reception, not just bandwidth.
+
+⇒ If you need throughput, **stream** and let both directions run. If you need lock-step,
+**one exchange per frame** is comfortable and three is not.
+
+### ⛔ How to measure it WITHOUT fooling yourself
+
+A round-trip probe must put one console in role A (pings) and the other in role B (echoes).
+Leave **both on role A** and neither echoes — each mistakes the peer's ping for its own
+reply, and the counter reports a number about twice as good that means nothing at all.
+
+🔑 **The witness: role B's trip counter is 0 when the roles really were set, and non-zero
+when both consoles stayed on role A.** Read it before quoting any figure. (Six runs were
+photographed on role A before anyone noticed.)
+
+✅ **And there is a second, stronger check**: role B also reports how many bytes it echoed,
+which must equal role A's round trips summed. On a good run it matches to the unit —
+`3655 = 1218 + 1220 + 1217`. Two consoles agreeing exactly is worth more than either
+number on its own.
+
+⚡ **Two consoles are extremely repeatable**: those three round-trip figures are 0.25 %
+apart. If your own numbers move more than that between runs, the instability is in your
+setup, not in the console.
+
 ## 11. Known gaps & what is *not* yet verified
 
 None of these block a working link, but a programmer or emulator author should know
 they are open:
 
-- **Cable-detect polarity is inferred, not silicon-measured with two consoles.** A
-  single-console HW probe reads `0xB1` = `0x07` (bit2 = 1 = *no cable*). "Cable present
-  ⇒ bit2 = 0" is a strong inference — it makes *Card Fighters' Clash* link in-emulator
-  and was confirmed live — but it has **not** been measured on two real consoles with a
-  cable. A 2-console probe would confirm the exact level (pull-up idle vs driven-low).
-- **The *other* GPIO input bits on `0xB0`–`0xBF` are still modelled loosely.** A single-
-  console probe measured real read-only input bits a naive core does not reproduce:
-  `B3` bit2 (input), `B6 = 0x05`, `BC = 0xFE`, `B1 = 0x07`. Only `0xB1` bit2 is modelled
+- ✅ **Cable-detect polarity — MEASURED, 2026-08-19, two consoles and a cable.** The
+  inference was right about the polarity and wrong about the meaning: `0x03` linked,
+  `0x07` unlinked, and the bit follows the **peer's RTS**, not the connector. A console
+  powered on at the BIOS reads as no peer. Full six-state table in §5. *(Gap closed.)*
+- ✅ **The other `0xB0`–`0xBF` input bits — MEASURED with a cable and a live peer.** They
+  do **not** move when a peer appears, so none of them is the detect line: `B6 = 0x05` and
+  `BC = 0xFE` in every state, and `B3` reads `0x04` on one console and `0x07` on another —
+  a **per-console constant**, identical with and without a cable. Only bit2 of `B3` is
+  common to both machines. Also measured: `SC0CR` bit 7 is a **latch** (`0x00` until any
+  byte has ever crossed, `0x80` for ever after, surviving an unplug), and `BR0CR` reads
+  back with **bit 6 set whatever you write** (`0x05` → `0x45`, `0x15` → `0x55`). Only `0xB1` bit2 is modelled
   from the cable state so far. *Fatal Fury*'s detection writes `0xFF` to `0xBC` and reads
   it back (it passes today only because a naive core echoes writes) — a game relying on
   the *true* `B3`/`B6`/`BC` input behaviour could still misread. Open (fidelity, not
@@ -449,9 +578,14 @@ they are open:
   bit-rate computation is written out in §2: `phi-T0 = fc/4`, `/5`, `/16` for UART, with
   `fc = 6.144 MHz` cross-checked from the video timing. It gives 19 200 bps and
   **3200 CPU cycles per byte** exactly. *(This gap is closed.)*
-- ⏳ **What is still NOT silicon-measured is the byte time itself.** Everything above is
-  manufacturer documentation plus register values read out of an emulator. Nobody has
-  put a timer on a real console: start it on the SC0BUF write, stop it on `INTTX0`, and
+- ✅ **THE BYTE TIME IS NOW SILICON-MEASURED.** A frame-counting probe on two real
+  consoles carried **3875 bytes in 128 frames** one-way — 2133 ms, i.e. **551 µs per byte**
+  against the 520.83 µs derived above, the 6 % sitting on the slow side where the software
+  feeding the ring can only put it. Reprogramming `BR0CR` to `0x15` gave **983 bytes against
+  3963**, a ratio of **4.03** where the φT0 → φT2 step predicts exactly 4. ⇒ **19 200 bps and
+  3200 cycles/byte are confirmed by measurement, not merely derived.** *(Gap closed.)*
+
+  Historical note on how it used to read: nobody had
   print microseconds per byte. The expected answer is **520.83 us**. A probe ROM that
   also programs a different `BR0CR` and reports the ratio would settle the whole
   question in one run.
@@ -468,7 +602,9 @@ they are open:
   emulation fidelity under real line conditions is unvalidated.
 - **Role collision is no longer an open question**: see §8.2. Do not arbitrate roles by
   asking both players for the same button; elect the console that has been searching
-  longest, at one frame of resolution.
+  longest, at one frame of resolution — and **decide on a pair both consoles hold**, never
+  on your live counter against their snapshot. That second half was measured wrong once
+  (300 both-host sessions in 624 simulated pairings) and is what the echo field fixes.
 - **Vector `0x0F`** (between `GEMODESET` and `COMINIT`) is a presumed reserved stub, not
   disassembled.
 

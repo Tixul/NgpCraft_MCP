@@ -364,3 +364,17 @@ improviser.
   devra rester clean-room comme l'APU)
 - pas de réécriture de l'UI PyQt6 ni du CLI (8 512 lignes) — ils continuent de
   tourner sur le cœur Python tant que la phase 5 n'a pas basculé la couture
+- **aucune FILE DE PREFETCH.** Le cœur exécute instruction par instruction et
+  facture le coût datasheet ; le TLCS-900/H a une file d'instructions et le
+  silicium s'en sert. Confirmé 2026-08-14 : `grep prefetch|instruction queue`
+  ne rend rien sur tout `cpp/`, et `specs/FETCH.md` n'en parle pas.
+  ⚖️ **Ce n'est pas cosmétique** : c'est le terme manquant derrière le « Case A »
+  du rapport `Emulator_vs_Hardware_20260807` — une réécriture à code plus gros
+  mais moins d'appels mesure **+1,6 % chez nous contre +7,7 % sur console**, signe
+  juste, magnitude 5× sous-estimée. Même famille suspectée pour le bloc
+  « collisions » du même rapport (facteur **1,80**, branches courtes et denses).
+  🎯 **ORACLE PRÊT À L'EMPLOI, et il n'est pas de nous** : `NGP_IQ.NGP` de mic_
+  (jiggawatt.org/badc0de/console.htm#ngp), publié avec ses sources. Sur console
+  ses trois contrôles passent (queue length 4, no flush 1, long instr 0) ; chez
+  nous ils rendent **1 / 2 / 2**. C'est donc à la fois le diagnostic ET le test
+  d'acceptation d'une implémentation future — la ROM dit quand c'est fini.

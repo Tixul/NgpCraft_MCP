@@ -409,15 +409,29 @@ def build_sprite_line_buffer(
     order showed the wrong one on **all 399** — enemies vanishing under other
     sprites, and a metasprite compositing its own tiles in reverse.
 
-    There is ONE buffer, not one per priority. A sprite that owns a pixel owns it
-    whatever its `PR.C`; `PR.C` only decides where that pixel lands relative to the
-    two scroll planes (Figure 4), which is why the caller blits in three passes.
+    ⛔ ONE BUFFER PER `PR.C` GROUP, not one for all three — and a game convicted the
+    single buffer. Yahtzee (homebrew) draws its five dice as sprites 0..19 with
+    `PR.C = 2` and the RED "this die is held" frame as sprites 20..27 with
+    `PR.C = 3`, **on the same pixels**. With one shared buffer the dice claim every
+    pixel first and the frame is erased outright: the indicator the player steers
+    the game with never appears (BizHawk shows it; measured against the player's own
+    save state, `savestates/yahtzee_08.s0`). An invisible UI element is not a
+    rendering nuance, it is an unplayable screen.
+
+    ⚖️ So the OAM-index rule is kept **inside** a group (the Sonic sprites that
+    established it share one), and ACROSS groups `PR.C` alone decides — which is
+    exactly Figure 4, and what the caller's three blit passes already express. The
+    manufacturer's sentence says the check *is* "the priority"; the figure that
+    spells that check out (Figure 3) is an image the text extraction dropped.
+
     A transparent pixel (palette index 0) claims nothing, so a lower sprite's hole
     lets a higher-indexed sprite through.
 
-    Returns the claimed pixels grouped by `PR.C` (1, 2, 3), in no particular order —
-    each pixel appears exactly once across the three lists.
+    Returns the claimed pixels grouped by `PR.C` (1, 2, 3), in no particular order.
+    A dot appears at most once **per list**, and may appear in more than one: the
+    caller blits the lists back to front, so the highest `PR.C` present wins the dot.
     """
+    # One bit per PR.C group (1..3): bit `pr_c` set = that group already owns the dot.
     owned = bytearray(NGPC_SCREEN_WIDTH * NGPC_SCREEN_HEIGHT)
     layers: dict[int, list[tuple[int, int, K2geColor]]] = {1: [], 2: [], 3: []}
 
@@ -438,6 +452,7 @@ def build_sprite_line_buffer(
             else palettes[sprite.cp_c].colors
         )
         layer = layers[sprite.pr_c]
+        claim_bit = 1 << sprite.pr_c
         for py in range(_TILE_SIZE):
             # ⚠️ The coordinate space WRAPS. The manufacturer says so outright --
             # K2GE Tech Ref § 3-1, COORDINATES AND DISPLAY AREA:
@@ -462,13 +477,13 @@ def build_sprite_line_buffer(
                 sx = (screen_x + px) & 0xFF
                 if sx >= NGPC_SCREEN_WIDTH:
                     continue
-                if owned[row_base + sx]:
-                    continue        # a lower-indexed sprite already took this pixel
+                if owned[row_base + sx] & claim_bit:
+                    continue        # a lower-indexed sprite of THIS group took it
                 px_eff = (_TILE_SIZE - 1 - px) if sprite.h_flip else px
                 value = row[px_eff]
                 if value == 0:
                     continue        # transparent: claims nothing
-                owned[row_base + sx] = 1
+                owned[row_base + sx] |= claim_bit
                 layer.append((sy, sx, palette_colors[value]))
 
     return layers

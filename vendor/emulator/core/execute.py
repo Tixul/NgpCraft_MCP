@@ -110,6 +110,18 @@ LDF_CYCLES = 2
 INCF_DECF_CYCLES = 2
 LD_REG_REG_CYCLES = 2
 LD_SMALL_IMM_CYCLES = 2
+# ⚠️ TWO FAMILIES, TWO PRICES -- and ONE constant used to serve both, which is
+# exactly how the error got in. Appendix B of the 900/L1 CPU manual:
+#
+#   LD R, #   "20 + zz + R : #"        2. 3. 5     <- the short register form
+#   LD r, #   "C8 + zz + r : 03 : #"   3. 4. 6     <- the register-code form
+#
+# The R family was being charged the r family's figures, so it read one cycle too
+# many on ALL THREE sizes (found 2026-08-20; the C++ core carried the same three
+# numbers, and the differential gate is what paired the two implementations).
+LD_R_IMM8_CYCLES = 2
+LD_R_IMM16_CYCLES = 3
+LD_R_IMM32_CYCLES = 5
 LD_IMM8_CYCLES = 3
 LD_IMM16_CYCLES = 4
 LD_IMM32_CYCLES = 6
@@ -19339,11 +19351,11 @@ def _resolved_cycles_from_decoded(
     if raw in (b"\x0C", b"\x0D"):
         return INCF_DECF_CYCLES
     if 0x20 <= first <= 0x27 and len(raw) == 2 and decoded.mnemonic == "ld":
-        return LD_IMM8_CYCLES
+        return LD_R_IMM8_CYCLES
     if 0x30 <= first <= 0x37 and len(raw) == 3 and decoded.mnemonic == "ld":
-        return LD_IMM16_CYCLES
+        return LD_R_IMM16_CYCLES
     if 0x40 <= first <= 0x47 and len(raw) == 5 and decoded.mnemonic == "ld":
-        return LD_IMM32_CYCLES
+        return LD_R_IMM32_CYCLES
     if first == 0xF2 and len(raw) == 5 and decoded.mnemonic == "lda":
         return LDA_CYCLES
     if raw == b"\x02":

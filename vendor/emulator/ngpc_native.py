@@ -28,20 +28,29 @@ from pathlib import Path
 from core import native, rom_loader
 
 # The player's save state (ngpc_shell.py, F2): magic, the CpuState struct, the
-# sound/timer block (v2 only), then the working image from 0x0000. Same contract as
-# core.savestate.load_shell_savestate.
-SHELL_MAGIC = b"NGPCST02"       # v2: carries the sound CPU, the T6W28 and the timers
+# sound/timer block (v2+), the link-cable block (v3+), then the working image from
+# 0x0000. Same contract as core.savestate.load_shell_savestate.
+#
+# ⛔ THIS FILE IS THE SECOND READER OF A FORMAT IT DOES NOT WRITE, and that is exactly
+# how it broke: v3 shipped in the shell and here nothing changed, so `--state` REFUSED
+# every state a player produces -- "is not a NGPCST02 save state" -- while the shell had
+# already stopped writing v2. A generation added at one end and not the other is not a
+# degraded read, it is a door that closes. Whatever the shell's STATE_MAGIC becomes, it
+# must appear below on the same day.
+SHELL_MAGIC = b"NGPCST04"       # v4: + l'horloge calendaire (etat machine, pas memoire)
+SHELL_MAGIC_V3 = b"NGPCST03"    # v3: + the link cable (FIFOs, shifter, CTS/RTS pins)
+SHELL_MAGIC_V2 = b"NGPCST02"    # v2: carries the sound CPU, the T6W28 and the timers
 SHELL_MAGIC_V1 = b"NGPCST01"    # v1: CPU + memory only -- loads, but the sound will not
-SHELL_MAGICS = (SHELL_MAGIC, SHELL_MAGIC_V1)
+SHELL_MAGICS = (SHELL_MAGIC, SHELL_MAGIC_V3, SHELL_MAGIC_V2, SHELL_MAGIC_V1)
 SHELL_MEM_LEN = 0x00C000
 
 # SILICON TIMING. The core's fields default to free cart fetch (back-compat, see
 # Machine::cart_wait) and the desktop shell switches these on for every ROM it loads.
 # A headless run has no QSettings to read, so the same calibrated set is spelled out
-# here -- keep it equal to CART_FETCH_WAIT / CART_DATA_WAIT / CART_LDIR_COST in
-# ngpc_settings.py. Without them cart code runs ~2.9x too fast and any optimisation
-# that only shortens the code measures as exactly zero.
-SILICON_TIMING = {"cart_wait": 3, "cart_data_wait": 0, "ldir_cost": 14}
+# here -- keep it equal to CART_FETCH_WAIT / CART_DATA_WAIT / CART_LDIR_COST /
+# CART_LDIRW_COST in ngpc_settings.py. Without them cart code runs ~2.9x too fast and any
+# optimisation that only shortens the code measures as exactly zero.
+SILICON_TIMING = {"word_wait": 10, "bios_wait": 8}
 
 # The controller, as the hardware reports it at 0x00B0.
 BUTTONS = {
@@ -69,23 +78,40 @@ def load_state(machine: native.NativeMachine, path: Path) -> None:
     blob = path.read_bytes()
     magic = blob[:len(SHELL_MAGIC)]
     if magic not in SHELL_MAGICS:
-        raise SystemExit(f"{path} is not a {SHELL_MAGIC.decode()} save state")
+        raise SystemExit(
+            f"{path} carries no known save-state magic: {magic!r} "
+            f"(known: {', '.join(m.decode() for m in SHELL_MAGICS)})")
     body = blob[len(magic):]
     cpu_t = type(machine.cpu())
     cpu_len = ctypes.sizeof(cpu_t)
-    aux_len = ctypes.sizeof(native.AuxState) if magic == SHELL_MAGIC else 0
-    if len(body) != cpu_len + aux_len + SHELL_MEM_LEN:
+    aux_len = (ctypes.sizeof(native.AuxState)
+               if magic in (SHELL_MAGIC, SHELL_MAGIC_V3, SHELL_MAGIC_V2) else 0)
+    link_len = (ctypes.sizeof(native.LinkState)
+                if magic in (SHELL_MAGIC, SHELL_MAGIC_V3) else 0)
+    # ⚡ v4 : l'horloge, en TETE. Sans elle le rejeu diverge d'un octet a 0x000096.
+    rtc_len = ctypes.sizeof(native.RtcState) if magic == SHELL_MAGIC else 0
+    head = rtc_len + cpu_len + aux_len + link_len
+    if len(body) != head + SHELL_MEM_LEN:
         raise SystemExit(
-            f"{path}: expected {cpu_len + aux_len + SHELL_MEM_LEN} bytes after the "
-            f"magic, got {len(body)}"
+            f"{path}: expected {head + SHELL_MEM_LEN} bytes after the magic "
+            f"({cpu_len} of CPU + {aux_len} of sound/timer + {link_len} of link cable "
+            f"+ {SHELL_MEM_LEN} of memory), got {len(body)}"
         )
-    machine.write(0, body[cpu_len + aux_len:])
+    machine.write(0, body[head:])
+    if rtc_len:
+        machine.set_rtc(native.RtcState.from_buffer_copy(body[:rtc_len]))
+    body = body[rtc_len:]
     machine.set_cpu(cpu_t.from_buffer_copy(body[:cpu_len]))
     # AFTER the image: writing it goes through the control registers, and 0x00BA is a
     # door ("fire one NMI at the sound CPU"), not storage. This is what cancels that.
     if aux_len:
         machine.set_aux_state(
             native.AuxState.from_buffer_copy(body[cpu_len:cpu_len + aux_len]))
+    # ...and the cable after the image for the same shape of reason: SC0MOD/BR0CR live
+    # in the image and decide how fast a byte shifts.
+    if link_len:
+        machine.set_link_state(native.LinkState.from_buffer_copy(
+            body[cpu_len + aux_len:cpu_len + aux_len + link_len]))
 
 
 def write_png(machine: native.NativeMachine, path: Path) -> None:
@@ -116,9 +142,8 @@ def apply_timing(machine: native.NativeMachine, mode: str) -> None:
     """
     if mode != "silicon":
         return
-    machine.set_cart_wait(SILICON_TIMING["cart_wait"])
-    machine.set_cart_data_wait(SILICON_TIMING["cart_data_wait"])
-    machine.set_ldir_cost(SILICON_TIMING["ldir_cost"])
+    machine.set_timing_silicon(SILICON_TIMING["word_wait"],
+                               SILICON_TIMING["bios_wait"])
 
 
 def hw_report(machine: native.NativeMachine, limit: int = 8) -> dict:
@@ -174,7 +199,14 @@ def cmd_run(args: argparse.Namespace) -> dict:
         "frame_count": summary.frame_count if summary else 0,
         # Say which timing model produced these numbers, so a cycle figure is never
         # quoted without knowing whether the cart bus was billed.
-        "timing": args.timing,
+        #
+        # ⛔ CE QUI A TOURNE, PAS CE QU'ON A DEMANDE. `--timing silicon` passe par
+        # `set_timing_silicon`, que `NGPCRAFT_TIMING=legacy` detourne vers l'ancien
+        # modele : imprimer le drapeau ferait dire au rapport « silicon » sous des
+        # chiffres produits par l'autre machine. Un rapport qui se trompe de machine est
+        # pire que pas de rapport -- c'est celui qu'on cite six mois plus tard.
+        "timing": (native.active_timing_model() if args.timing == "silicon"
+                   else args.timing),
         "hw_safety": hw_report(machine),
     }
     if args.peek:

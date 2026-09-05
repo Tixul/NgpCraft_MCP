@@ -825,11 +825,62 @@ bool exec_reg_family(Machine& m, ngpc_record_t* rec, uint8_t op, uint32_t pc,
             const uint32_t packed = ((rem & hmask) << half) | (q & hmask);
             dst = (sz == 0) ? ((dst & 0xFFFF0000u) | packed) : packed;
             c.flags = uint8_t(overflow ? (c.flags | RF_V) : (c.flags & ~RF_V));
-            /* Cost calibrated to silicon: cpu_calib_v2 on hardware read DIV word 265 vs our
-             * old 301 (under-costed); word 23->37 makes the emulator read 265. The datasheet
-             * 15/23 is a floor -- real DIV is variable-latency and slower. MUL word 14->19
-             * likewise matches silicon's 444 (was 481). Byte/signed scaled by the same ratio. */
-            out_cycles = uint16_t(is_signed ? (sz == 0 ? 29 : 42) : (sz == 0 ? 24 : 37));
+            /* ⚖️ RE-CALIBRE DEUX FOIS, ET LA SECONDE FOIS MESURE DIRECTEMENT.
+             *
+             * Historique, parce qu'il est instructif : ces nombres avaient d'abord ete
+             * cales quand l'attente de fetch valait 10 cycles/mot. Le tir v8 l'a
+             * epinglee a 8,25 et `DIV` s'est retrouve a +29,4 % ; on l'a alors ramene a
+             * 56 pour le remettre « dans la bande » des autres classes, qui portaient
+             * toutes un +5 % commun. C'etait un nombre cale par-dessus un biais, faute
+             * de mieux -- et le commentaire de l'epoque le disait.
+             *
+             * ⚡ LE BIAIS A DISPARU, ET AVEC LUI LA RAISON DE NE PAS VISER JUSTE. Le
+             * fetch est desormais facture par OCTET (`fetch_wait_byte_q16`) et la
+             * branche prise porte son propre cout (`branch_taken_extra`) : le corpus des
+             * 26 cases silicium est passe d'un ecart moyen de 4,78 % a 1,30 %. Viser
+             * l'exactitude n'est plus « masquer un biais », c'est enfin possible.
+             *
+             * ⚡ MESURE DIRECTE : ROM v14 page 3, chaines de `ld WA,#imm16` + `div WA,E`.
+             * Silicium 38,45 cy par unite, sur une droite qui ferme a 0,59 %. La forme
+             * OCTET (celle que la ROM execute -- prefixe C8-CF) tombe a **32 cycles**,
+             * soit 16 etats contre un plancher datasheet de 15.
+             *
+             * ⚡ ET LA FORME MOT A ETE MESUREE A SON TOUR (ROM v17, page 0) : silicium
+             * 62,70 cy par unite, droite a 0,11 % ⇒ **47 cycles**.
+             * ⛔⛔ MAIS ELLE RESTE A 56 ICI, ET CE N'EST PAS UN OUBLI. Les 47 ont ete
+             * mesures AVEC le modele de file en octets arme ; sans lui ils sont faux, et
+             * les poser quand meme fait passer le corpus de 0,67 % a 2,30 %. Les deux
+             * constantes MOT et `queue_bytes` forment un TRIPLET : on les bouge ensemble
+             * ou pas du tout. `ngpc_set_muldiv_word(15, 47)` les arme pour la mesure. Le nombre le plus solide des deux pages est leur
+             * DIFFERENCE, puisque les deux unites ne different que par UN OCTET (0x50
+             * contre 0x40) et que la charge s'y simplifie : `DIV - MUL` vaut **18,26 cy**
+             * sur console contre 18,11 chez nous -- nos couts RELATIFS etaient deja bons,
+             * c'est le niveau commun qui etait faux.
+             * ⛔ Mesuree AVEC le modele de file en octets arme : ces deux nombres et
+             * `queue_bytes` forment un TRIPLET, ils ne valent pas separement. */
+            /* ⛔ DEJA EN CYCLES -- voir Machine::cycles_already_measured. Ces quatre
+             * nombres sortent de `cpu_calib_v2` sur silicium, pas d'une table d'etats,
+             * donc le modele ne doit PAS les doubler. */
+            m.cycles_already_measured = true;
+            out_cycles = uint16_t(is_signed ? (sz == 0 ? 39 : 64)
+                                            : (sz == 0 ? (m.div_byte_cycles ? m.div_byte_cycles : 32u)
+                                                       : (m.div_word_cycles ? m.div_word_cycles : 58u)));
+            /* ⚡ 56 -> 58 (ROM v20 page 2, tir silicium du 30/08), et deux sources
+             * INDEPENDANTES le disent :
+             *   - l'unite `ld DE / ld XWA / div` coute **87,07 cy** sur console contre
+             *     83,82 chez nous a 56 -- il manque 3,25 cy, donc ~59 ;
+             *   - le corpus (v2/v10 `DIV`) etait a +1,9 % et +1,5 % trop RAPIDE.
+             * A 58 : corpus **0,31 % -> 0,18 %**, pire cas **1,89 % -> 0,77 %** (toutes
+             * les cases sous 1 % pour la premiere fois), `DIV` a +0,0 % et -0,4 %, et la
+             * v20 a +1,4 %. 59 colle mieux a la v20 (+0,2 %) mais rend le corpus a 0,25.
+             *
+             * ⚖️ ET CE N'EST PLUS UN COMPROMIS ENTRE MESURES CONTRADICTOIRES. La v20
+             * page 2 a REFUTE la « latence variable » qu'on avait supposee pour expliquer
+             * que trois autorites donnent trois nombres : trois divisions aux operandes
+             * tres differentes (petit/petit, grand quotient, grand/grand) coutent
+             * **87,07 / 87,09 / 87,09** -- etendue **0,02 cy**. La latence est FIXE, donc
+             * une constante unique EXISTE, et il fallait juste la mesurer proprement.
+             * ⛔ Reste a expliquer pourquoi la v17 (pente marginale) donnait 52. */
         } else {
             const uint32_t a = wide & hmask;
             uint32_t res;
@@ -843,7 +894,19 @@ bool exec_reg_family(Machine& m, ngpc_record_t* rec, uint8_t op, uint32_t pc,
                 res = a * src;
             }
             dst = (sz == 0) ? ((dst & 0xFFFF0000u) | (res & 0xFFFFu)) : res;
-            out_cycles = uint16_t(is_signed ? (sz == 0 ? 12 : 16) : (sz == 0 ? 15 : 19));
+            /* ⚡ MESURE DIRECTE : ROM v14 page 4, chaines de `ld WA,#imm16` + `mul WA,E`.
+             * Silicium 30,43 cy par unite (droite a 0,48 %) ; la forme OCTET tombe a
+             * **12 etats**, contre un plancher datasheet de 11. Meme histoire que DIV
+             * juste au-dessus : la valeur precedente (15) avait ete relevee sous un
+             * modele de fetch faux, et n'y a pas survecu.
+             * ⚡ La forme MOT l'a ete par la v17 page 1 : silicium 44,44 cy par unite
+             * (droite 0,07 %) ⇒ **15 etats**. ⛔ Laissee a 19 pour la meme raison que
+             * `div` juste au-dessus : mesuree avec le modele de file, elle ne vaut pas
+             * sans lui. Meme histoire, et mesuree avec le
+             * modele de file arme -- voir la note de `div` juste au-dessus. */
+            out_cycles = uint16_t(is_signed ? (sz == 0 ? 10 : 16)
+                                            : (sz == 0 ? (m.mul_byte_states ? m.mul_byte_states : 12u)
+                                                       : (m.mul_word_states ? m.mul_word_states : 19u)));
         }
         out_len = L(2);                                   // MUL/MULS: no flags at all
         return true;

@@ -30,7 +30,7 @@ static const uint8_t kIoPageReset[0x100] = {
     /* 0x80 */ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     /* 0x90 */ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     /* 0xA0 */ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    /* 0xB0 */ 0x00,0x00,0x00,0x00,0x0A,0x00,0x00,0x00, 0xAA,0xAA,0x00,0x00,0x00,0x00,0x00,0x00,
+    /* 0xB0 */ 0x00,0x00,0x00,0x00,0x0A,0x00,0x05,0x00, 0xAA,0xAA,0x00,0x00,0xFE,0x00,0x00,0x00,   /* B6/BC: measured 0x05/0xFE on silicon */
     /* 0xC0 */ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     /* 0xD0 */ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     /* 0xE0 */ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
@@ -105,6 +105,30 @@ uint32_t Machine::seed_user_vector_table() {
 }
 
 void Machine::reset_memory() {
+    /* ⛔ TIMING STATE IS STATE. The bus interface unit's run-ahead debt and the two
+     * serial buffer stages are per-machine, and leaving them across a reset makes a
+     * replay start from a different point than the first run -- which is exactly how
+     * the libretro smoke test caught this: "non-deterministic state after replay".
+     * Anything added to Machine that influences timing belongs here AND in the
+     * savestate, or the core stops being reproducible. */
+    biu_debt = 0;
+    /* ⚡ ET LA RETENUE FRACTIONNAIRE. Depuis le recalage silicium l'attente de
+     * lecture vaut 8,25 cycles par mot : le quart restant est REPORTE d'une
+     * instruction a l'autre, donc c'est de l'etat, pas une constante. L'oublier
+     * ici a fait tomber le test de rejeu libretro dans la seconde. */
+    access_wait_q4 = 0;
+    fetch_wait_carry = 0;
+    /* ⚡ Le drapeau « une copie de bloc vient de tourner » est efface a la fin de CHAQUE
+     * instruction, donc il ne peut pas franchir une savestate (elles sont prises entre
+     * deux instructions) -- mais il est remis a zero ici pour la meme raison que les
+     * trois du dessus : rien de ce qui influence le temps ne survit a un reset. */
+    block_transfer_ran = false;
+    serial_tx_buf_full = false;
+    serial_tx_buf_byte = 0;
+    serial_rx_shift_full = false;
+    serial_rx_shift_byte = 0;
+    serial_rx_had_pending = false;
+
     std::fill(mem.begin(), mem.end(), uint8_t(0));
 
     for (uint32_t a = 0; a < 0x100; ++a) mem[a] = kIoPageReset[a];
@@ -386,7 +410,8 @@ int32_t Machine::serial_byte_cycles() const {
     /* SC0MOD<SM1,SM0>: 00 = I/O interface mode (not a UART frame at all), 01/10/11 =
      * UART with 7 / 8 / 9 data bits. A frame is start + data + stop. */
     const unsigned sm = (sc0mod >> 2) & 0x3;
-    if (sm == 0) return kSerialByteCycles;      /* I/O interface mode: not modelled */
+    if (sm == 0) return int32_t(kSerialByteCycles)
+                      + int32_t(uint32_t(kSerialByteCycles) * serial_byte_extra_pct / 100u);
     const int32_t bits = int32_t(sm + 8);       /* 01->9, 10->10, 11->11 */
 
     /* SC0MOD<SC1,SC0> picks what clocks the shift register. */
@@ -407,11 +432,43 @@ int32_t Machine::serial_byte_cycles() const {
          * console; keep the previous behaviour rather than invent a rate. */
         return kSerialByteCycles;
     }
-    return bits * cycles_per_bit;
+    const int32_t base = bits * cycles_per_bit;
+    return base + int32_t(uint32_t(base) * serial_byte_extra_pct / 100u);
 }
 
 void Machine::serial_tick(uint32_t cycles) {
-    if (!serial_link_enabled) return;
+    if (!serial_link_enabled) {
+        /* No cable, but the UART does not know that: a byte written to SC0BUF still
+         * shifts out and still raises INTTX0. Only the wire is missing, so the byte is
+         * dropped instead of queued. */
+        if (!uart_runs_unplugged || !(serial_tx_busy || serial_tx_buf_full)) return;
+        /* ⚠️ SAME ORDER AS THE CABLED PATH, and for the same reason: count the shift
+         * register DOWN first, then load the buffer into whatever it freed. Loading
+         * first leaves the register idle until the next instruction, which is a dead
+         * gap on every single byte -- measured on the cabled path as ~2200 short stalls
+         * a window, and worth 3529 -> 4008 bytes once fixed. */
+        if (serial_tx_busy) {
+            serial_tx_cycles -= int32_t(cycles);
+            if (serial_tx_cycles <= 0) {
+                serial_tx_busy = false;
+                serial_tx_shifting = false;      /* the byte went to the pin, nowhere */
+                if (!tx_irq_on_buffer_free) {
+                    irq_pending |= 1u << kIrqVectorSerialTransmit;
+                    ++serial_irq_tx_count;
+                }
+            }
+        }
+        if (tx_irq_on_buffer_free && serial_tx_buf_full && !serial_tx_busy) {
+            serial_tx_byte     = serial_tx_buf_byte;
+            serial_tx_buf_full = false;
+            serial_tx_busy     = true;
+            serial_tx_shifting = true;
+            serial_tx_cycles   = serial_byte_cycles();
+            irq_pending |= 1u << kIrqVectorSerialTransmit;   /* SC0BUF is free */
+            ++serial_irq_tx_count;
+        }
+        return;
+    }
 
     /* TX: the BIOS wrote a byte to SC0BUF (captured in io_action_write). After one
      * baud-time it is on the wire: hand it to the host to relay, and raise the
@@ -455,12 +512,39 @@ void Machine::serial_tick(uint32_t cycles) {
                 serial_tx.push_back(serial_tx_byte);
                 serial_tx_busy = false;
                 serial_tx_shifting = false;
-                irq_pending |= 1u << kIrqVectorSerialTransmit;
                 ++serial_wire_count;
-                ++serial_irq_tx_count;
+                if (!tx_irq_on_buffer_free) {
+                    irq_pending |= 1u << kIrqVectorSerialTransmit;
+                    ++serial_irq_tx_count;
+                }
+                /* THE byte is on the wire, this exact cycle. A host that asked to
+                 * be woken (ngpc_set_serial_break) relays it now instead of at the
+                 * end of some instruction quota. */
+                serial_event = true;
             }
         } else {
             ++serial_cts_hold_ticks;       /* debugger: "held by the peer", not idle */
+        }
+    }
+
+    /* STAGE 1 -> STAGE 2, and it runs AFTER the shift countdown ON PURPOSE. The
+     * shift register may have gone idle during THIS tick; loading before the
+     * countdown would leave it empty until the next instruction, which is a dead
+     * gap on every single byte -- measured as 1200 short stalls a window. INTTX0
+     * fires here, at the START of the byte's time on the wire, not at its end.
+     * CTS gates the START of a byte, so it gates this transfer and nothing else. */
+    if (tx_irq_on_buffer_free && serial_tx_buf_full && !serial_tx_busy) {
+        const bool ctse = (mem[0x000052] & 0x40) != 0;
+        if (!(ctse && serial_cts_high)) {
+            serial_tx_byte     = serial_tx_buf_byte;
+            serial_tx_buf_full = false;
+            serial_tx_busy     = true;
+            serial_tx_shifting = true;
+            serial_tx_cycles   = serial_byte_cycles();
+            irq_pending |= 1u << kIrqVectorSerialTransmit;   /* SC0BUF is free */
+            ++serial_irq_tx_count;
+        } else {
+            ++serial_cts_hold_ticks;
         }
     }
 
@@ -469,18 +553,98 @@ void Machine::serial_tick(uint32_t cycles) {
      * overrun guard) AND our RTS says we are ready to receive (0xB2 bit0 == 0, set
      * low by COMONRTS). serial_rx_cycles starts at 0 so the first byte arrives
      * promptly, then paces at one byte-time. */
-    if (!serial_rx_pending && !serial_rx.empty() && (mem[0x0000B2] & 0x01) == 0) {
+    /* Stage 1 -> stage 2: the CPU has read SC0BUF, so the byte already in the shift
+     * register moves up and raises its interrupt at once. */
+    if (rx_double_buffered && serial_rx_shift_full && !serial_rx_pending) {
+        serial_rx_byte = serial_rx_shift_byte;
+        serial_rx_shift_full = false;
+        serial_rx_pending = true;
+        irq_pending |= 1u << kIrqVectorSerialReceive;
+        ++serial_irq_rx_count;
+    }
+
+    const bool half_duplex_block = rx_blocked_by_tx && serial_tx_busy;
+    const bool rx_slot_free = rx_double_buffered ? !serial_rx_shift_full
+                                                 : !serial_rx_pending;
+    if (rx_slot_free && !serial_rx.empty() && !half_duplex_block
+        && (mem[0x0000B2] & 0x01) == 0) {
+        /* ⛔ THE RECEIVER CHARGES THE BYTE TIME A SECOND TIME, AND THAT IS A REAL
+         * DEFECT -- but removing it ALONE makes the emulator LESS like hardware, so
+         * it stays until its counterpart is understood. MEASURED 2026-08-19 on the
+         * round-trip probe, against silicon:
+         *
+         *   pattern                       here    fixed    silicon
+         *   A pings / B echoes (1 token)   766     1278      1095
+         *   both ping        (2 tokens)   1533     2428      1021
+         *
+         * Silicon gains NOTHING from running both directions at once (x0.93 going
+         * from one pattern to the other); we very nearly double (x2.00). So hardware
+         * is bound by something we do not model -- most likely the cost of servicing
+         * the serial ISRs, which caps the exchange rate whatever the traffic shape.
+         * The double charge happens to hide that, and taking it away exposes it: A/B
+         * improves from -30% to +17%, A/A degrades from +50% to +138%.
+         *
+         * ⛔ AND ITS OLD RELEASE CONDITION IS VOID. It used to read "re-apply this
+         * together with the interrupt-cost correction". That correction has since
+         * landed (13 -> 18, datasheet 3.3.1, confirmed again by Appendix B table
+         * (11)) and it is worth NOTHING here: swept from 13 to 56, it moves the cost
+         * of a received byte from 49 us to 56 where silicon wants 96.
+         *
+         * ⚠️ AND THE MEASUREMENT THAT USED TO JUDGE THIS SITS ON A KNIFE EDGE -- OURS,
+         * not the metric's. The round trip is a LOCK-STEP counter: the token either
+         * fits inside the current frame's window or waits for the next. MEASURED
+         * 2026-08-20: correcting `LD R,#` by ONE cycle -- an unrelated instruction --
+         * moved it from 1533 to 761, and across configurations it jumps between 761,
+         * 1082, 1533, 2043 and 2154. So anything "validated" against the round trip
+         * alone is validated against a coin toss, and that includes the 2026-08-20
+         * note claiming three corrections close the model to 3%.
+         *
+         * ⛔ DO NOT shorten that to "the round trip is a bad instrument" -- it was
+         * written that way once and silicon refuted it. The AUTO campaign on real
+         * hardware (2026-08-21) returns 1218 / 1220 / 1217 on three consecutive runs:
+         * 0.25% dispersion, cross-checked by role B echoing exactly their sum, 3655.
+         * The console is rock steady and WE jump. That asymmetry is a fact about this
+         * core, not about the test.
+         *
+         * ⇒ Release it only with a CONTINUOUS metric agreeing: throughput and the
+         * test-6 CPU counters. `Machine::rx_single_charge` is the knob to try it. */
         serial_rx_cycles -= int32_t(cycles);
+        if (rx_single_charge && serial_rx_had_pending) {
+            serial_rx_cycles = 0;              /* the byte's time was already paid */
+            serial_rx_had_pending = false;
+        }
         if (serial_rx_cycles <= 0) {
-            serial_rx_byte = serial_rx.front();
+            const uint8_t got = serial_rx.front();
             serial_rx.pop_front();
-            serial_rx_pending = true;
+            serial_rx_had_pending = true;
             serial_rx_cycles = serial_byte_cycles();
-            irq_pending |= 1u << kIrqVectorSerialReceive;
-            ++serial_irq_rx_count;
+            if (rx_double_buffered && serial_rx_pending) {
+                /* SC0BUF still holds the previous byte: park this one in the shift
+                 * register. It moves up, and interrupts, when the CPU reads. */
+                serial_rx_shift_byte = got;
+                serial_rx_shift_full = true;
+            } else {
+                serial_rx_byte = got;
+                serial_rx_pending = true;
+                irq_pending |= 1u << kIrqVectorSerialReceive;
+                ++serial_irq_rx_count;
+            }
         }
     } else if (!serial_rx.empty() && (mem[0x0000B2] & 0x01) != 0) {
         ++serial_rts_hold_ticks;    /* debugger: bytes waiting, WE are not ready */
+    }
+
+    /* OUR RTS drives the PEER's CTS, and the peer's transmitter is held while it
+     * is high -- so an RTS edge is cable traffic even though no byte moved. A
+     * host that only relayed on bytes would leave the peer stalled against a
+     * handshake we already released: that is the shape of the Card Fighters'
+     * Clash hang, where each console waits for the other. Sampled here rather
+     * than hooked onto the 0xB2 write so that ONE place decides what "the cable
+     * moved" means. */
+    const uint8_t rts_now = uint8_t(mem[0x0000B2] & 0x01);
+    if (rts_now != serial_rts_last) {
+        serial_rts_last = rts_now;
+        serial_event = true;
     }
 }
 
@@ -1144,8 +1308,18 @@ bool Machine::micro_dma_service(unsigned vector_index) {
                 case 3: src -= size; break;         /* (DMAD)  <- (DMAS-) */
                 default: break;                     /* fixed              */
             }
+            /* Le transfert vient d'avoir lieu : il a pris le bus. 8 etats en 1 ou 2
+             * octets, 12 en 4 (datasheet, micro-DMA). En cycles = x2. */
+            if (micro_dma_states)
+                dma_cost_cycles += 2u * ((size == 4) ? 12u : 8u) * micro_dma_states / 8u;
         } else if (kind == 5) {
             ++src;                                   /* counter mode: nothing moves */
+            /* ⚖️ LE MODE COMPTEUR N'EST PAS DOUBLE, ET C'EST MESURE (ROM v9, tir
+             * silicium du 24/08) : la console facture **5,2 cycles** par passage en
+             * mode compteur contre 12,9 pour un transfert d'octet. Doubler les 5 etats
+             * de la datasheet comme on double le reste donnait 10,4 -- deux fois trop.
+             * Le transfert d'octet, lui, tombe pile sur le nominal double (13,0). */
+            if (micro_dma_states) dma_cost_cycles += 5u * micro_dma_states / 8u;
         } else {
             return false;                            /* not a mode the chip defines */
         }

@@ -255,6 +255,11 @@ static Ea decode_ea_masked(const Machine& m, uint32_t pc, uint8_t mem) {
 
 /* -------------------------------------------------------- memory access --- */
 static uint32_t load_sized(const Machine& m, uint32_t a, uint8_t sz) {
+    /* Cout FIXE par ACCES, pas par octet : voir `data_access_cycles` (machine.hpp).
+     * Ici et dans `store`, parce que c'est ici qu'un acces commence et finit -- `read8`
+     * ne voit que des octets et ne peut pas distinguer un acces long de quatre acces
+     * d'un octet, ce qui est precisement ce que la ROM v15 a separe. */
+    m.charge_data_access(a);
     switch (sz) {
         case 0:  return m.read8(a);
         case 1:  return uint32_t(m.read8(a)) | (uint32_t(m.read8(a + 1)) << 8);
@@ -325,6 +330,24 @@ static bool exec_source(Machine& m, ngpc_record_t* rec, uint32_t pc,
      * `ldir` is what stops 27 of the 66 commercial ROMs. */
     if (sub >= 0x10 && sub <= 0x17) {
         if (sz == 2) return false;                    // no long form
+        /* ⛔⛔ UN TRANSFERT BLOC NE PAYE PAS `data_access_cycles` -- CE SERAIT LE
+         * COMPTER DEUX FOIS, ET CA CASSE UN SPLIT RASTER.
+         *
+         * `ldir_cost` (14) et `ldirw_cost` (18) ne viennent PAS d'une table : ils ont ete
+         * MESURES par iteration, contre la tranche de 8 lignes du copieur de Bomberman
+         * (8 x 515 = 4120 cycles) et contre Cool Boarders. Ils contiennent donc deja le
+         * prix du trafic memoire. Or la boucle ci-dessous passe par `load_sized` et
+         * `store`, qui accumulent le cout d'acces : chaque mot payait 8 cycles de plus,
+         * soit **1792 cycles** sur les 4120 d'un bloc de 224 mots -- +43 %. Le copieur
+         * derivait d'une bande, le HUD de Cool Boarders partait en morceaux, et
+         * `test_bomberman_hicolor_phase` est passe au rouge le jour ou le cout d'acces a
+         * ete arme. On sauve donc l'accumulateur et on le restaure a la sortie.
+         *
+         * ⚡ La regle generale : un cout mesure PAR INSTRUCTION contient deja tout ce qui
+         * se passe pendant elle. N'y ajouter un cout par acces que pour les instructions
+         * dont le prix vient d'une TABLE. */
+        const uint32_t data_wait_before = m.data_wait_cycles;
+
         const bool is_compare = sub >= 0x14;
         const bool repeats    = (sub & 0x01) != 0;
         const bool backwards  = (sub & 0x02) != 0;
@@ -333,12 +356,24 @@ static bool exec_source(Machine& m, ngpc_record_t* rec, uint32_t pc,
         const uint8_t first = m.read8(pc);
         const uint8_t mm    = uint8_t(((first & 0x40) >> 2) | (first & 0x0F));
         if (mm > 7) return false;                     // block ops use the (R) mode
+        /* ⛔ APRES le dernier `return false`, sinon le drapeau FUIT a `true` et
+         * desarme `vram_wait` pour tout le reste de la partie, en silence.
+         * Meme garde que `data_wait_before` : voir `in_block_copy`. */
+        m.in_block_copy = true;
         const unsigned dst_reg = ((first & 0x0F) == 5) ? NGPC_XIX : NGPC_XDE;
 
         unsigned iterations = 0;
+        uint32_t cart_src_extra = 0;
         do {
             const uint32_t src = c.regs[mm] & kAddrMask;
             const uint32_t v   = load_sized(m, src, sz);
+            /* ⚡ Lire la SOURCE en cartouche coute 2 cy par octet (bus 8 bits) -- voir
+             * `block_cart_src_per_byte`. Compte ici et ajoute au total EN CYCLES : le
+             * bus est tenu par le transfert, il n'y a pas de prefetch pour l'absorber. */
+            if (m.block_cart_src_per_byte &&
+                ((src >= 0x200000u && src <= 0x3FFFFFu) ||
+                 (src >= 0x800000u && src <= 0x9FFFFFu)))
+                cart_src_extra += nb * m.block_cart_src_per_byte;
             if (iterations == 0) record_read(rec, src, v, sz);
 
             if (is_compare) {
@@ -400,14 +435,47 @@ static bool exec_source(Machine& m, ngpc_record_t* rec, uint32_t pc,
         if (is_compare) c.flags = uint8_t(c.flags | F_N);
 
         out_len = uint8_t(e.len + 1);
+        /* La garde posee a l'entree : le prix du trafic memoire est deja dans `per`. */
+        m.data_wait_cycles = data_wait_before;
+        m.in_block_copy = false;
         /* LDIR/LDDR cost per byte. Toshiba datasheet says 7n+1, but the datasheet MUL/DIV
          * figures already proved to be FLOORS (v2 silicon), and 7 leaves Cool Boarders (big
          * per-frame RAM ldir) at ~51fps vs its silicon 30. m_ldir_cost lets us test higher
          * values: 14 puts Cool Boarders at 30fps AND leaves Fatal Fury at 60 -- one fix, both
-         * games. Default 7 (datasheet); the shell can raise it, pending final confirmation. */
-        const uint16_t per = (is_compare ? 6 : m.ldir_cost);
+         * games. Default 7 (datasheet); the shell can raise it, pending final confirmation.
+         *
+         * ⚡ THE COST IS PER ITERATION, AND AN ITERATION OF THE WORD FORM MOVES TWO BYTES.
+         * Charging LDIRW the byte number bills a word copy at half price per byte, which is
+         * what left BOMBERMAN's open-loop HiColor copier running 21% fast and shearing its
+         * title screen. `ldirw_cost` (0 = follow ldir_cost, so nothing moves until a caller
+         * asks) carries the word answer; see Machine::ldirw_cost for the measurement. */
+        const uint16_t per = is_compare        ? 6
+                           : (sz && m.ldirw_cost) ? m.ldirw_cost
+                                                 : m.ldir_cost;
+        /* ⛔ DEJA EN CYCLES quand la boucle se REPETE -- voir Machine::cycles_already_measured.
+         *
+         * `ldir_cost` / `ldirw_cost` ne sortent pas d'une table d'etats : 14 vient de Cool
+         * Boarders ramene a ses 30 fps reels, 18 du copieur en boucle ouverte de Bomberman
+         * (a 17 comme a 19 l'image se dechire -- une fenetre d'UN cycle). Laisser le modele
+         * les doubler facturait chaque copie de bloc au double, et un HUD en split raster
+         * vit de ces copies : le HUD de Cool Boarders dechirait, manette en main.
+         *
+         * ⚠️ Il ne suffisait PAS de remettre le champ a 14 : le total passe par
+         * `rec->cycles`, que la boucle d'execution met a l'echelle. Le drapeau est le seul
+         * endroit qui le dit. La forme non repetee garde son cout d'annexe B (8 / 6 etats)
+         * et reste donc mise a l'echelle. */
+        if (repeats) { m.cycles_already_measured = true; m.block_transfer_ran = true; }
+        /* ⚡ ET LE TERME CONSTANT EST UN ETAT, DONC DEUX CYCLES.
+         *
+         * L'annexe B (3) donne `LDIR<W>` a **7n + 1 ETATS**. `per` porte deja la
+         * conversion (7 etats -> 14 cycles) et le drapeau ci-dessus empeche la boucle
+         * d'execution de remettre le facteur 2 -- mais le `+1` etait reste en CYCLES.
+         * Un etat vaut deux cycles (annexe B §6, « 1 state = 2 x 1/fFPH ») : c'est +2.
+         *
+         * ⚖️ Et `e.extra` n'a pas le meme probleme : les operations bloc n'acceptent que
+         * le mode `(R)` (garde `mm > 7` plus haut), que la table (10) chiffre a **+0**. */
         out_cycles = uint16_t(
-            (repeats ? per * iterations + 1
+            (repeats ? per * iterations + 2 + cart_src_extra
                      : (is_compare ? 6 : 8)) + e.extra);
         return true;
     }

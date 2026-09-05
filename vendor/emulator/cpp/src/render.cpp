@@ -194,16 +194,30 @@ void Machine::render_scanline(uint32_t line) {
     for (unsigned x = 0; x < kScreenWidth; ++x) row[x] = backdrop;
 
     /* --- the sprite line buffer -------------------------------------------------
-     * Sprite 0 WINS. "During the write to the line buffer, the hardware checks the
-     * priority [...] to avoid writing over previously written data" (Tech Ref
-     * 4-3-3-1): a contested pixel belongs to the LOWEST OAM index. PR.C does not
-     * decide who owns a pixel -- only where that pixel lands against the planes.
+     * Sprite 0 WINS -- WITHIN ITS PR.C GROUP. "During the write to the line buffer,
+     * the hardware checks the priority [...] to avoid writing over previously written
+     * data" (Tech Ref 4-3-3-1): a contested pixel belongs to the LOWEST OAM index.
+     *
+     * ⛔ THE OWNERSHIP USED TO BE ONE BUFFER FOR ALL THREE GROUPS, and a game convicted
+     * it. Yahtzee (homebrew) draws its five dice as sprites 0..19 with PR.C = 2 and the
+     * RED "this die is held" frame as sprites 20..27 with PR.C = 3, ON THE SAME PIXELS.
+     * With one buffer the dice claim every pixel first and the frame is erased outright:
+     * the selection indicator the player steers the game with never appears (BizHawk
+     * shows it; measured against the player's own save state, savestates/yahtzee_08.s0).
+     * A UI element that is invisible is not a rendering nuance, it is an unplayable
+     * screen -- so the single buffer is what the evidence rejects, not the index rule.
+     *
+     * ⚖️ SO: one line buffer PER PR.C GROUP. Inside a group the lowest OAM index still
+     * owns the pixel (the Sonic measurement that established that rule is untouched --
+     * those sprites share a group); ACROSS groups, PR.C alone decides, which is exactly
+     * what Figure 4 lays out and what the three composition passes below already do.
+     * The manufacturer's own sentence says the check IS "the priority", and the figure
+     * that spells the check out (Figure 3) is an image the text extraction dropped.
      *
      * The chain advances for EVERY entry, including hidden ones (PR.C = 0), so a
      * hidden anchor at the head of a group still positions its tail. */
-    uint8_t  owner_value[kScreenWidth] = {};   /* 0 = unclaimed */
-    uint16_t owner_color[kScreenWidth];
-    uint8_t  owner_prc[kScreenWidth];
+    uint8_t  owner_value[3][kScreenWidth] = {};   /* [PR.C-1][x], 0 = unclaimed */
+    uint16_t owner_color[3][kScreenWidth];
 
     const PaletteView spr_pv{compat, kPaletteSprite, kK1geLut[0], kK1gePal[0]};
 
@@ -242,12 +256,11 @@ void Machine::render_scanline(uint32_t line) {
         for (unsigned i2 = 0; i2 < 8; ++i2) {
             const unsigned sx = (screen_x + i2) & 0xFFu;
             if (sx >= kScreenWidth) continue;
-            if (owner_value[sx]) continue;             /* a lower OAM index took it */
+            if (owner_value[pr_c - 1u][sx]) continue;  /* a lower OAM index of THIS group took it */
             const unsigned value = px[h_flip ? (7u - i2) : i2];
             if (value == 0) continue;                  /* transparent: claims nothing */
-            owner_value[sx] = 1;
-            owner_color[sx] = resolve(*this, spr_pv, code, value);
-            owner_prc[sx] = uint8_t(pr_c);
+            owner_value[pr_c - 1u][sx] = 1;
+            owner_color[pr_c - 1u][sx] = resolve(*this, spr_pv, code, value);
         }
     }
 
@@ -259,7 +272,7 @@ void Machine::render_scanline(uint32_t line) {
     auto blit_sprites = [&](unsigned want_prc) {
         if (!(layer_mask & (kLayerSprBack << (want_prc - 1u)))) return;
         for (unsigned x = 0; x < kScreenWidth; ++x)
-            if (owner_value[x] && owner_prc[x] == want_prc) row[x] = owner_color[x];
+            if (owner_value[want_prc - 1u][x]) row[x] = owner_color[want_prc - 1u][x];
     };
 
     auto draw_plane = [&](bool scr1) {

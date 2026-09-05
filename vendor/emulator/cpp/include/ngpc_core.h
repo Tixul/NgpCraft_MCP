@@ -29,7 +29,16 @@
 extern "C" {
 #endif
 
-#define NGPC_ABI_VERSION 15
+/* 16: + ngpc_get_link_state / ngpc_set_link_state (the link cable as saveable state).
+ * ⚠️ BUMPED BECAUSE TWO SYMBOLS WERE ADDED, not because any existing one changed. The
+ * binding checks this at load and says "Rebuild."; without the bump, a stale .dll paired
+ * with the new core/native.py fails on the missing symbol instead, which reads as a
+ * ctypes bug rather than as "your DLL is old". */
+/* 17: + ngpc_set_serial_break (the core wakes the host when the cable moves). */
+/* 18: + ngpc_run_linked -- BOTH cabled consoles and the relay, inside the core;
+ *     + ngpc_link_relay_count, so "how often was the cable relayed" stays
+ *       measurable now that the relaying happens in here. */
+#define NGPC_ABI_VERSION 18
 
 /* ---------------------------------------------------------------- status --
  * Execution status of one instruction. The tri-state "requires-known-*"
@@ -62,7 +71,10 @@ typedef enum {
 
     /* --- host-requested stops                                                 */
     NGPC_BREAKPOINT         = 40,
-    NGPC_COUNT_REACHED      = 41
+    NGPC_COUNT_REACHED      = 41,
+    /* The link cable moved and the host asked to hear about it -- see
+     * ngpc_set_serial_break. Only ever returned when that is armed. */
+    NGPC_SERIAL_EVENT       = 42
 } ngpc_status_t;
 
 /* ------------------------------------------------------------------- cpu --
@@ -254,6 +266,47 @@ NGPC_API int ngpc_run(ngpc_t*, uint32_t max_instrs,
                       ngpc_record_t* out_records, uint32_t records_cap,
                       ngpc_summary_t* out_summary);
 
+/* ---------------------------------------------------- THE CABLED PAIR ------
+ * Advance two cabled consoles together, WITH THE CABLE RELAYED IN HERE.
+ *
+ * The host used to own the relay: run A for a slice, cross the FFI boundary,
+ * move the bytes, run B for a slice, cross back. That slice was counted in
+ * INSTRUCTIONS, which is not cable time -- and every emulator that shipped a
+ * working serial link (TGB Dual, BizHawk, mGBA's lockstep) put both consoles
+ * and the cable in the core instead, paced by the hardware's serial clock.
+ * See LINK_NETPLAY_STUDY.md L3.
+ *
+ * Here the console that is BEHIND IN CYCLES always runs next, in steps bounded
+ * by a fraction of the cable's own byte time, and the relay also happens the
+ * moment either console reports the cable moved. The two can therefore never be
+ * more than one quantum of emulated time apart -- the property `a slice each`
+ * never had, and the reason an answer could arrive a whole frame late in one
+ * direction. Deterministic: ties break towards `a`, the quantum comes from the
+ * machines' own registers, and no wall clock is read.
+ *
+ * Enable the serial hardware on BOTH machines before the first call -- the cable
+ * is plugged in before either console boots, which is what a game that looks for
+ * a peer during start-up requires. Summaries are per console; a console that
+ * stops stops the pair. ABI v18. */
+NGPC_API int ngpc_run_linked(ngpc_t* a, ngpc_t* b, uint32_t frames,
+                             uint32_t max_instrs,
+                             ngpc_summary_t* out_a, ngpc_summary_t* out_b);
+
+/* Relays this console has taken part in since the cable came up. The property it
+ * makes testable is "the cable is relayed MANY times inside one frame, not once"
+ * -- one relay a frame is what breaks The Last Blade's handshake. Zero unless
+ * ngpc_run_linked is driving the pair. ABI v18. */
+NGPC_API uint32_t ngpc_link_relay_count(ngpc_t*);
+
+/* The widest gap, in cycles, that opened between the two consoles during the last
+ * ngpc_run_linked call. ⚡ THIS IS THE NUMBER THAT SAYS WHETHER THEY WERE REALLY
+ * INTERLEAVED, and totals cannot say it: two consoles that run a whole frame each
+ * in sequence consume exactly the same cycles as two that take turns, while one of
+ * them sits frozen through the other's frame -- the latency a link handshake dies
+ * of. Expect roughly one interleaving quantum; a whole frame means no interleaving
+ * at all. ABI v18. */
+NGPC_API uint64_t ngpc_link_pair_max_gap(ngpc_t*);
+
 /* ------------------------------------------------------------------ state */
 /* ------------------------------------------------------------------- SAVES --
  * The cartridge IS the save medium: a NOR flash the game erases and programs in
@@ -266,6 +319,107 @@ NGPC_API int  ngpc_flash_dirty(ngpc_t*);
 NGPC_API void ngpc_flash_clear_dirty(ngpc_t*);
 NGPC_API int  ngpc_flash_restore(ngpc_t*, uint32_t address,
                                  const uint8_t* data, uint32_t len);
+
+/* --- silicon timing and machine geometry, for NATIVE front ends -------------
+ *
+ * ⛔ ALL OF THESE WERE DEFINED IN core.cpp AND DECLARED NOWHERE, and it went
+ * unnoticed for one reason only: the desktop shell reaches them through ctypes,
+ * which never reads this header. A native caller cannot call what is not
+ * declared -- so a C++ front end silently got a machine WITHOUT them, and the
+ * core's own note (machine.hpp, cart_wait) spells out what that costs: cart code
+ * runs ~2.9x too fast, and a self-timed game shows 60fps where silicon gives 30.
+ * Found while building the libretro core, which is exactly such a front end; the
+ * Android one has the same need. Declaring them changes no behaviour and breaks
+ * no ABI -- the symbols were already exported (core.cpp is one `extern "C"`).
+ *
+ * The shipping values live with the CALLER, not here: the desktop's
+ * cfg.CART_FETCH_WAIT = 3, CART_DATA_WAIT = 0, CART_LDIR_COST = 14,
+ * CART_LDIRW_COST = 18. `vram_wait` stays 0 until a calibration ROM pins it. */
+/* Instruction fetch out of the on-chip BIOS ROM. Zero (free) is the default and
+ * the only value anything ships with -- see Machine::bios_wait, where a uniform
+ * fetch wait is recorded as TESTED AND RULED OUT against silicon. */
+/* Cycles charged for accepting an interrupt; 0 = the built-in default. The
+ * datasheet gives four legal values (28/24/22/18, by bus width) -- see
+ * Machine::irq_entry_cycles. Debugging aid, not a tuning parameter. */
+/* Arms the whole silicon timing model in one call. word_wait / bios are the two
+ * calibrated numbers (10 / 8 as shipped); everything else is documented or derived.
+ * See the definition in core.cpp for the provenance of each piece. */
+NGPC_API void ngpc_set_timing_silicon(ngpc_t*, uint32_t word_wait, uint32_t bios);
+NGPC_API void ngpc_set_byte_extra(ngpc_t*, uint32_t pct);
+NGPC_API void ngpc_set_uart_unplugged(ngpc_t*, int on);
+NGPC_API void ngpc_set_micro_dma_states(ngpc_t* h, uint32_t eighths);
+NGPC_API void ngpc_set_fetch_wait_q4(ngpc_t*, uint32_t quarters);
+NGPC_API void ngpc_set_bios_data_wait(ngpc_t*, uint32_t cycles);
+NGPC_API void ngpc_set_slack_by_region(ngpc_t*, int on);
+NGPC_API void ngpc_set_branch_flush(ngpc_t*, int on);
+/* Credit d'avance qui survit a une branche prise, en cycles. 0 = vidage total. */
+NGPC_API void ngpc_set_branch_flush_keep(ngpc_t*, uint32_t cycles);
+/* Cycles ajoutes a chaque branche prise, sans condition. 0 = desarme. */
+NGPC_API void ngpc_set_branch_taken_extra(ngpc_t*, uint32_t cycles);
+/* Cout d'un octet fetche, en SEIZIEMES de cycle. 0 = ancien chemin par mot. */
+NGPC_API void ngpc_set_fetch_wait_byte_q16(ngpc_t*, uint32_t sixteenths);
+/* Cout FIXE d'un acces memoire de donnee, en cycles. 0 = gratuit. */
+NGPC_API void ngpc_set_data_access_cycles(ngpc_t*, uint32_t cycles);
+/* Avance maximale de la file, en cycles. Mesuree par la ROM v16 page 0. */
+/* Credit d'avance qui survit a une INTERRUPTION, en cycles. 0 = tout jete. */
+NGPC_API void ngpc_set_irq_flush_keep(ngpc_t*, uint32_t cycles);
+NGPC_API void ngpc_set_biu_slack(ngpc_t*, int32_t cycles);
+/* Couts OCTET de mul (etats) et div (cycles). 0 = constantes du coeur. */
+/* Taille de la file d'instructions en OCTETS (4). 0 = ancien credit en cycles. */
+NGPC_API void ngpc_set_queue_bytes(ngpc_t*, uint32_t bytes);
+/* DIAGNOSTIC : etat de la file au sortir d'une acceptation d'IRQ, en 1/16 d'octet. */
+/* EXPERIMENT : un transfert de controle qui change de REGION jette l'avance. */
+NGPC_API void ngpc_set_flush_on_region_change(ngpc_t*, int on);
+/* EXPERIMENT : une interruption est transparente pour l'etat de bus du flot
+ * interrompu (sauve a la livraison, rendu au `reti`). */
+NGPC_API void ngpc_set_irq_transparent_queue(ngpc_t*, int on);
+/* EXPERIMENT : le cout d'acces de donnee ne se paie que dans du code CARTOUCHE. */
+/* ESSAI : un transfert bloc paie l'etranglement VRAM. */
+NGPC_API void ngpc_set_block_pays_vram(ngpc_t*, int on);
+NGPC_API void ngpc_set_data_wait_cart_only(ngpc_t*, int on);
+NGPC_API void ngpc_set_irq_queue_keep_q16(ngpc_t*, int32_t q16);
+/* Instrumentation du modele en OCTETS : etat de la file a l'entree de la derniere
+ * instruction (1/16 d'octet), octets qu'elle a fait lire, calage paye, access_wait. */
+NGPC_API void ngpc_dbg_queue(ngpc_t*, int32_t* q_in, uint32_t* bytes,
+                             uint32_t* stall, uint32_t* aw);
+NGPC_API void ngpc_set_muldiv_byte(ngpc_t*, uint32_t mul_states, uint32_t div_cycles);
+NGPC_API void ngpc_set_muldiv_word(ngpc_t*, uint32_t mul_states, uint32_t div_cycles);
+NGPC_API void ngpc_set_block_drains_queue(ngpc_t*, int on);
+NGPC_API void ngpc_set_rx_double(ngpc_t*, int on);
+NGPC_API void ngpc_set_tx_irq_early(ngpc_t*, int on);
+NGPC_API void ngpc_set_fetch_pipelined(ngpc_t*, int on, int slack);
+NGPC_API void ngpc_set_half_duplex(ngpc_t*, int on);
+NGPC_API void ngpc_set_relay_gate(ngpc_t*, int on);
+NGPC_API void ngpc_set_rx_single(ngpc_t*, int on);
+NGPC_API void ngpc_set_fetch_word(ngpc_t*, int on);
+NGPC_API void ngpc_set_base_scale(ngpc_t*, uint32_t k);
+NGPC_API void ngpc_set_irq_entry(ngpc_t*, uint32_t cycles);
+NGPC_API void ngpc_set_bios_wait(ngpc_t*, uint32_t cycles_per_byte);
+NGPC_API void ngpc_set_cart_wait(ngpc_t*, uint32_t cycles_per_byte);
+NGPC_API void ngpc_set_cart_data_wait(ngpc_t*, uint32_t cycles_per_byte);
+NGPC_API void ngpc_set_vram_wait(ngpc_t*, uint32_t cycles_per_byte);
+NGPC_API void ngpc_set_ldir_cost(ngpc_t*, uint32_t cycles_per_byte);
+/* The WORD block copies (LDIRW/LDDRW), charged per ITERATION -- and an iteration
+ * of the word form moves TWO bytes, so it is NOT the same number as ldir_cost.
+ * 0 = follow ldir_cost, which is what every pre-existing caller gets. See
+ * Machine::ldirw_cost for the Bomberman measurement that pins it at 18. */
+NGPC_API void ngpc_set_ldirw_cost(ngpc_t*, uint32_t cycles_per_iteration);
+
+/* The CONSOLE TYPE: 1 = the original monochrome NGP, 0 = the colour NGPC.
+ *
+ * ⚡ THE BIOS THAT BOOTS IS THE MACHINE. This is not a display filter, it is what
+ * the console IS. A colour game in an NGP is a real situation and several titles
+ * notice it and show a different screen (SNK vs. Capcom). Booting one console's
+ * BIOS on the other's silicon is not a machine that ever existed, so the two are
+ * chosen together. Undeclared until now, which is why the Android front end had
+ * no monochrome mode -- by omission, not by choice. */
+NGPC_API void ngpc_set_k1ge_console(ngpc_t*, int on);
+
+/* Cartridge geometry and the BIOS hand-off language, same story: exported,
+ * used from ctypes, never declared. See ngpc_set_flash_size in core.cpp. */
+NGPC_API void     ngpc_set_flash_size(ngpc_t*, uint32_t chip, uint32_t bytes);
+NGPC_API uint32_t ngpc_flash_capacity(ngpc_t*, uint32_t chip);
+NGPC_API void     ngpc_set_language(ngpc_t*, uint32_t code);
 
 NGPC_API void ngpc_get_cpu(ngpc_t*, ngpc_cpu_t* out);
 
@@ -504,12 +658,139 @@ typedef struct {
     uint32_t scanline;
     uint32_t frame_count;
     uint32_t cycle_residue;
-    uint32_t _pad2;
+    /* ⚡ LA DETTE DE L'UNITE DE BUS, ET IL FAUT LA SAUVER, PAS L'EFFACER.
+     *
+     * Le modele de temps pipeline garde une avance/retard de la file d'instructions
+     * entre deux instructions. On la remettait a zero a la RESTAURATION -- ce qui parait
+     * prudent et ne l'est pas : la premiere passe continue avec sa valeur vivante, le
+     * rejeu repart de zero, et les deux divergent. **Effacer un etat a la restauration
+     * ne le rend pas deterministe, ca fait diverger le rejeu de ce qu'il rejoue.**
+     * `libretro_smoke_external_bios_priority` tombait exactement la-dessus.
+     *
+     * ⚠️ Elle prend la place de `_pad2` : la taille du bloc NE CHANGE PAS, donc aucun
+     * savestate existant n'est invalide -- ils portent 0, c'est-a-dire l'ancien
+     * comportement. Signee a l'usage, transportee telle quelle. */
+    uint32_t biu_debt;
 } ngpc_aux_state_t;
 
 NGPC_API void ngpc_get_aux_state(ngpc_t*, ngpc_aux_state_t* out);
 /* Returns 0 on success, -1 if the blob's version/size do not match this build. */
 NGPC_API int  ngpc_set_aux_state(ngpc_t*, const ngpc_aux_state_t* in);
+
+/* --- serial channel 0 == THE LINK CABLE, as SAVEABLE state ------------------
+ *
+ * ⛔ THE HOLE THIS CLOSES, MEASURED 2026-08-04. A save state was the CPU struct, the
+ * aux block above and the memory image -- and the cable is in none of the three. The
+ * FIFOs, the shift register and the handshake pins live in `Machine` and were reachable
+ * only through `ngpc_serial_state`, which is READ-ONLY by design. So restoring a state
+ * taken mid-transfer was a NO-OP on the channel: captured at rx_depth=2, run 30 frames
+ * to rx_depth=3, restored -- and every field stayed at the post-30-frame value. Two
+ * re-simulations from the "same" restored state then diverged by one cable byte inside
+ * 60 frames, which is a desync, not a rounding error.
+ *
+ * Reachable today in local two-player cable play and in direct-IP play, where F2 and
+ * the rewind ring are live (mirror netplay refuses them, for an unrelated reason). And
+ * it is the prerequisite for any rollback: rolling back two consoles means restoring
+ * the bytes in flight between them. See LINK_NETPLAY_STUDY.md and
+ * tests/test_link_savestate_roundtrip.py.
+ *
+ * ⚡ A SEPARATE BLOCK, NOT MORE FIELDS IN ngpc_aux_state_t. That struct is the sound
+ * CPU, the T6W28 and the timers; the cable is none of those. Keeping it its own
+ * versioned block also leaves every existing NGPCST02 save state byte-compatible --
+ * growing the aux struct would have silently shifted the memory image in all of them.
+ *
+ * NOT here, on purpose: `serial_byte_cycles()` is COMPUTED from SC0MOD/BR0CR, which
+ * live in the memory image and come back with it. Saving it would be saving a
+ * derivation, and a derivation that disagreed with the image would be worse than none.
+ *
+ * The counters ARE here even though nothing feeds back into emulation: a restore that
+ * left the Link tab reading somebody else's totals would be lying about the only
+ * screen a player can use to tell "no cable" from "cable fine, nobody is draining it".
+ *
+ * `version`/`size` are written by the getter and CHECKED by the setter, exactly as for
+ * the aux block: a blob from another build is REFUSED (-1), never half-applied. */
+#define NGPC_LINK_STATE_VERSION 2
+/* ⚠️ A CAPACITY, AND THEREFORE A FAILURE MODE. The in-process bridge drains every pump
+ * (measured depth 2-3 with the probe ROM), but a socket bridge hands over whatever a
+ * network burst delivered, so the receive FIFO has no natural ceiling. Truncating here
+ * would lose cable bytes -- which is the exact bug this block exists to end -- so the
+ * getter refuses to truncate silently: it clamps, and raises `overflow`. A caller that
+ * sees `overflow` has an INEXACT snapshot and must not pretend otherwise. */
+#define NGPC_LINK_FIFO_MAX 1024
+
+typedef struct {
+    uint32_t version;             /* NGPC_LINK_STATE_VERSION           */
+    uint32_t size;                /* sizeof(ngpc_link_state_t)         */
+
+    /* --- the channel itself */
+    uint8_t  link_enabled;        /* the cable is plugged in at all    */
+    uint8_t  tx_busy;             /* a byte is queued in the shifter   */
+    uint8_t  tx_shifting;         /* ...and has actually STARTED out   */
+    uint8_t  tx_byte;
+    uint8_t  cts_high;            /* the peer's RTS, on our CTS0 pin   */
+    uint8_t  rx_pending;          /* a byte is presented at SC0BUF     */
+    uint8_t  rx_byte;
+    uint8_t  overflow;            /* a FIFO was deeper than the cap    */
+
+    /* --- the SECOND stage of each channel (version 2).
+     * SC0BUF and the shift register are separate on this chip, and since the UART is
+     * modelled as running with no cable attached, an unplugged console can hold a byte
+     * in the buffer at snapshot time. Leaving these out made a restored state resume a
+     * DIFFERENT machine -- caught as "non-deterministic state after replay". */
+    uint8_t  tx_buf_full;
+    uint8_t  tx_buf_byte;
+    uint8_t  rx_shift_full;
+    uint8_t  rx_shift_byte;
+    uint8_t  rx_had_pending;
+    uint8_t  _pad_v2[3];
+    int32_t  tx_cycles;           /* baud-time countdowns, SIGNED      */
+    int32_t  rx_cycles;
+    uint32_t tx_len;              /* bytes valid in tx_fifo / rx_fifo  */
+    uint32_t rx_len;
+
+    /* --- the debugger's counters (observation only; see the note above) */
+    uint32_t tx_count, wire_count, rx_queued_count, rx_read_count;
+    uint32_t irq_tx_count, irq_rx_count, cts_hold_ticks, rts_hold_ticks;
+
+    uint8_t  tx_fifo[NGPC_LINK_FIFO_MAX];
+    uint8_t  rx_fifo[NGPC_LINK_FIFO_MAX];
+} ngpc_link_state_t;
+
+/* ⚡ STOP RUNNING WHEN THE CABLE MOVES, instead of making the host guess.
+ *
+ * A host bridging two machines has to relay bytes, and until now it had no way
+ * to know WHEN -- so it polled: pump the cable every N instructions, N picked to
+ * be small enough for the worst known game (400, because The Last Blade breaks
+ * past it). That number is an approximation of cable time measured in
+ * instructions, and it is the wrong unit: the core already counts the real one.
+ * `serial_tick` knows the exact cycle a byte finishes shifting out, because it
+ * computes the byte-time from BR0CR/SC0MOD -- it simply never told anyone.
+ *
+ * Armed, `ngpc_run` returns NGPC_SERIAL_EVENT the moment something crosses:
+ *   - a byte finished shifting out and is now in the transmit FIFO, or
+ *   - this machine's RTS changed (it drives the peer's CTS, and the peer's
+ *     handshake stalls until it is relayed -- Card Fighters' Clash lives on it).
+ * The instruction in flight is COMPLETED and counted first; the machine is
+ * always left on an instruction boundary.
+ *
+ * OFF by default, so every existing caller keeps its exact behaviour and this
+ * cannot change a single test. It is not a tuning knob and has no threshold.
+ *
+ * ⛔ IT DOES NOT LET A HOST STOP CHOOSING A QUOTA -- an earlier draft of this note
+ * said it did, and that is measured false. A quota does TWO jobs for a host that
+ * drives two machines: relay the cable promptly (this call is strictly better) and
+ * ADVANCE BOTH MACHINES IN SMALL STEPS (this call cannot do it at all). The break
+ * fires on OUR transmit and OUR RTS, so a machine that is quietly computing emits
+ * nothing and runs to the end of its frame while its peer has not run at all.
+ * Measured on the desktop relay: a free-running break gave a MEDIAN step of one
+ * whole frame, which is the exact scheduling that kills Card Fighters' Clash's VS
+ * handshake. See specs/LINK_CABLE.md 3.2 and ngpc_shell.py's LINK_SLICE.
+ */
+NGPC_API void ngpc_set_serial_break(ngpc_t*, int on);
+
+NGPC_API void ngpc_get_link_state(ngpc_t*, ngpc_link_state_t* out);
+/* Returns 0 on success, -1 if the blob's version/size do not match this build. */
+NGPC_API int  ngpc_set_link_state(ngpc_t*, const ngpc_link_state_t* in);
 
 NGPC_API int  ngpc_read_mem (ngpc_t*, uint32_t addr, uint8_t* out, uint32_t n);
 NGPC_API int  ngpc_write_mem(ngpc_t*, uint32_t addr, const uint8_t* in, uint32_t n);

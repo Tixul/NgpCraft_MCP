@@ -220,7 +220,7 @@ def _first_writes(machine, addrs: set[int], frames: int = 90) -> dict[int, tuple
     out: dict[int, tuple[int, int]] = {}
     try:
         machine.reset(bios_handoff=True, real_bios=False)
-        machine.set_cart_wait(3); machine.set_cart_data_wait(0); machine.set_ldir_cost(14)
+        machine.set_timing_silicon(10, 8)
         machine.set_write_log(lo, hi)
         for frame in range(frames):
             machine.write(JOY_PORT, bytes([_robot_frame(frame) & 0x7F]))
@@ -367,9 +367,7 @@ def analyse_dynamic(data: bytes, report: Report, bios: Path | None = None,
         # ROM looks comfortably inside its budget. Silicon-calibrated values, the same
         # ones the player uses (see ngpc_settings.CART_FETCH_WAIT and friends).
         try:
-            machine.set_cart_wait(3)
-            machine.set_cart_data_wait(0)
-            machine.set_ldir_cost(14)
+            machine.set_timing_silicon(10, 8)
         except Exception:
             pass
 

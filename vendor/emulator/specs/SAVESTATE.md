@@ -209,22 +209,27 @@ This format is already used by the implemented CLI:
 - `python ngpc_emu.py run-until-exec <rom> <target_pc> --seed-from <state.json>`
 - `step-exec`, `run-steps`, `trace-exec`, named checkpoints, and named sessions all reuse the same savestate payload shape
 
-## 8b. The player's binary format (`NGPCST01` / `NGPCST02`)
+## 8b. The player's binary format (`NGPCST01` / `NGPCST02` / `NGPCST03`)
 
 The JSON above is the CLI's format. `ngpc_shell.py` (F2 / F4, and the rewind ring)
 writes a second, binary one -- the state a player actually produces -- and the same
 readers must understand both. Layout, in order:
 
 ```
-magic      8 bytes   b"NGPCST02"  (b"NGPCST01" = the older, sound-less generation)
+magic      8 bytes   b"NGPCST03"  (the generation the shell writes today)
 cpu        sizeof(core.native.CpuState)      the main CPU, verbatim
-aux        sizeof(core.native.AuxState)      v2 ONLY -- see below
+aux        sizeof(core.native.AuxState)      v2 and v3 -- the sound/timer block
+link       sizeof(core.native.LinkState)     v3 ONLY  -- the link cable
 memory     0x00C000 bytes                    the working image from address 0
 ```
 
 `aux` is `ngpc_aux_state_t` (`cpp/include/ngpc_core.h`): the machine state that is
 NOT memory -- the SOUND CPU's registers, the T6W28's registers and DAC hold, the
 timer up-counters, and the pending-interrupt mask.
+
+`link` is `ngpc_link_state_t`: serial channel 0 -- the transmit/receive FIFOs, the
+shift register, the CTS/RTS handshake pins, the baud-time countdowns, and the Link
+tab's counters. 2112 bytes, of which 2 KiB are the two fixed-capacity FIFOs.
 
 ⛔ WHY v2 EXISTS. A `NGPCST01` state restored the main CPU and the image and nothing
 else, and **the sound died on every load** (reported on SNK vs. Capcom: Card
@@ -234,17 +239,48 @@ sitting on a driver state from elsewhere -- while the main CPU, believing it had
 already requested that music, never requested it again. A scene change did, which is
 why the sound came back "on its own" at the next screen.
 
+⛔ WHY v3 EXISTS -- the same shape of hole, one subsystem over. The cable's FIFOs,
+shift register and handshake pins live in the core's `Machine`, not in the image, and
+were reachable only through the READ-ONLY `ngpc_serial_state`. So a v2 restore was a
+**no-op on the channel**. Measured 2026-08-04: captured at `rx_depth=2`, run 30 frames
+to `rx_depth=3`, restored -- every field stayed at the post-30-frame value; and two
+re-simulations from the "same" restored state diverged by one cable byte inside 60
+frames. That is a desync, not a rounding error. Reachable wherever F2 and rewind are
+live in a cabled session (local 2P, direct-IP), and a prerequisite for any rollback.
+See `LINK_CABLE.md` and `LINK_NETPLAY_STUDY.md`.
+
+⚡ WHY `link` IS ITS OWN BLOCK AND NOT MORE FIELDS IN `aux`. `aux` is the sound CPU,
+the T6W28 and the timers; the cable is none of those. And growing `aux` would have
+**shifted the memory image inside every `NGPCST02` file a player already has** --
+a separate versioned block leaves them byte-compatible.
+
 Rules:
-- readers accept both magics; a v1 file loads without the sound block
-- ON RESTORE, THE ORDER IS FIXED: memory image first, `aux` second. Writing the image
-  passes through the control registers, and `0x00BA` is a door ("fire one NMI at the
-  sound CPU"), not storage -- restoring `aux` afterwards is what cancels the phantom
-  NMI the image write just forged
-- `aux` carries `version` + `size`; a blob from another build is REFUSED by
-  `ngpc_set_aux_state`, never partially applied
+- readers accept all three magics; an older file loads without the blocks it predates
+- ON RESTORE, THE ORDER IS FIXED: memory image first, then `aux`, then `link`. Writing
+  the image passes through the control registers, and `0x00BA` is a door ("fire one NMI
+  at the sound CPU"), not storage -- restoring `aux` afterwards is what cancels the
+  phantom NMI the image write just forged. `link` comes after the image for the same
+  shape of reason: `SC0MOD`/`BR0CR` live in the image and decide how fast a byte shifts
+- `aux` and `link` each carry `version` + `size`; a blob from another build is REFUSED
+  by `ngpc_set_aux_state` / `ngpc_set_link_state`, never partially applied
+- a `link` snapshot taken with a FIFO deeper than `NGPC_LINK_FIFO_MAX` (1024) comes back
+  with `overflow` set: it is CLAMPED, not truncated in silence, and is inexact
+- NOT in `link`, deliberately: `serial_byte_cycles()`, which is COMPUTED from
+  `SC0MOD`/`BR0CR` and therefore comes back with the image. Saving a derivation that
+  could disagree with its source would be worse than not saving it
 - NOT in `aux`, deliberately: the audio output ring (host-facing; replaying stale
   samples is the opposite of the fix), the debug channel/layer masks (UI settings),
   and the cartridge flash (a save, not a snapshot -- see `SAVE_POLICY.md`)
+
+⚠️ **THERE ARE THREE READERS, AND ADDING A GENERATION MEANS TOUCHING ALL OF THEM.**
+`ngpc_shell.py` writes the file; `core/savestate.py` (`load_shell_savestate`) and
+`ngpc_native.py` (`load_state`, the headless `--state`) read it. v3 shipped in the
+shell while `ngpc_native.py` still knew only v2, and the result was not a degraded
+read -- it was a flat refusal of every state a player produces. A reader that misses a
+block is worse still: it reads the image one struct too early and hands the tool a
+memory map shifted by a few hundred bytes, wrong and plausible and silent.
+`tests/test_savestate_sound.py::ShellSavestateReaderTests` now runs BOTH readers
+against every generation and asserts the shell's own magic is one they know.
 
 ## 9. Relation to other policies
 

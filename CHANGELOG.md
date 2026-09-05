@@ -3,6 +3,21 @@
 
 ## Unreleased
 
+- **Corpus: announcing a token is not deciding a role** (Link-Cable §8.2). The page said
+  "each console announces how long it has been searching; the longest search wins" and
+  stopped there — which is the right rule and still elects **two hosts**, because a HELLO
+  is a *snapshot*. A console weighing its own **live** counter against the peer's snapshot
+  compares its present to the other's past: with A starting at 0, B at Δ and d frames of
+  announcement lag, A concludes `t > t − Δ − d` (always true) while B concludes
+  `t − Δ > t − d` (true as soon as `d > Δ`). Both claim player one, both are right from
+  where they stand. Reported from the field by a homebrew author, then reproduced off the
+  console: **300 disagreements in 624 runs**, forming an exact `lag > skew` triangle that
+  saturates at the announcement interval. Two rules remove it — freeze the search counter
+  at first contact, and echo the last token heard so the decision only fires on a pair
+  both consoles provably hold. Same sweep after: **0 in 624**. The price is documented
+  too: a round trip instead of a one-way announcement, worst-case agreement 25 → 51 frames,
+  and a freeze that lands on different frames can still elect the console that opened the
+  screen second. Mirrors `NgpCraft_dev_ref/docs/05_Systems/Link-Cable.md`.
 - **Corpus: external contribution from [Napsterix](https://github.com/Napsterix)**, from
   measurements taken while building a full NGPC game. New page
   `wiki/05_Systems/Measuring-Performance.md` — the measurement *method*, which the corpus

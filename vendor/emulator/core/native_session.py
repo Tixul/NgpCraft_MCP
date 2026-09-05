@@ -97,6 +97,27 @@ SYSTEM_RAM_PATH = SAVE_DIR / "system.ram"
 SYSTEM_RTC_PATH = SAVE_DIR / "system.rtc"
 _RTC_BLOB_SIZE = ctypes.sizeof(native.RtcState)
 
+# The chip's sub-second `counter` is in CPU CYCLES and wraps at one second --
+# `kRtcCyclesPerSecond` in cpp/src/memory.cpp. Keep the two equal.
+RTC_CYCLES_PER_SECOND = 6_144_000
+# Half a second: the furthest two crystals can be out of phase with each other, and a
+# fixed number rather than a random one so a run stays reproducible. See
+# `NativeSession.second_console` for why a second console needs a phase of its own.
+SECOND_CONSOLE_PHASE = RTC_CYCLES_PER_SECOND // 2
+
+
+def offset_crystal_phase(machine, cycles: int = SECOND_CONSOLE_PHASE) -> None:
+    """Move a machine's RTC crystal out of phase, without moving its clock.
+
+    Only `counter` changes -- the free-running cycle count inside the current second.
+    Every displayed field (year..second) is left exactly as it was, so this invents no
+    time: it says the second console's oscillator is not the first one's, which is the
+    one thing two coin cells are guaranteed not to share.
+    """
+    st = machine.rtc()
+    st.counter = (int(st.counter) + int(cycles)) % RTC_CYCLES_PER_SECOND
+    machine.set_rtc(st)
+
 # ---------------------------------------------------------------- clock modes
 # What the console's clock should do while the emulator is CLOSED. There is no single
 # right answer, which is why it is a setting rather than a decision baked in here.
@@ -275,6 +296,7 @@ class NativeSession:
         k1ge_console: bool = False,
         language: int = 1,          # 0 = Japanese, 1 = English (SDK SysWork 0x6F87)
         hle_bios: bool = False,     # our clean-room image: no setup screen, see below
+        second_console: bool = False,   # the OTHER console of a local 2-player cable
     ):
         if not native.available():
             raise RuntimeError(
@@ -343,6 +365,39 @@ class NativeSession:
         # the game's scratch -- it is the console's, and it should keep running across
         # launches the way the hardware's does.
         self.rtc_path = SYSTEM_RTC_PATH
+        # ⛔ TWO CONSOLES CANNOT SHARE ONE COIN CELL, and local 2-player gave them one.
+        #
+        # `SYSTEM_RAM_PATH` / `SYSTEM_RTC_PATH` are the cell of THE console, and the shell
+        # builds player 2's page through this same constructor -- so both machines booted
+        # from the same file. MEASURED: two sessions created 400 ms apart came up with a
+        # bit-identical clock down to `counter`, the sub-second CYCLE phase of the crystal
+        # (1321875 on both). That is not a machine that ever existed: the counter is the
+        # oscillator's own phase, and two coin cells do not share one.
+        #
+        # It is not only a fidelity point, it is REACHABLE. A game that seeds its RNG from
+        # the clock gets the same stream on both consoles -- a two-console homebrew does
+        # exactly that (`RandomNumberCounter = Second << 5`) and its host/client election
+        # then has nothing left to break a tie. Attaching the cable power-cycles both
+        # consoles at once (`_power_cycle_for_link`, deliberate and correct), so they also
+        # boot in step. The emulator was manufacturing a role collision the hardware makes
+        # far rarer.
+        #
+        # And the write-back collided: both sessions committed to the same file, so
+        # whichever console was switched off LAST stamped its clock over the other's
+        # (measured: P1 21h on disk, then P2 closes and it reads 02h).
+        #
+        # ⚖️ SO THE SECOND CONSOLE'S CELL IS READ-ONLY AND ITS CRYSTAL IS OUT OF PHASE.
+        # It still boots from the player's configured cell -- same language, same date,
+        # which is what somebody with two consoles would have -- but it never writes back,
+        # and its sub-second phase is its own. Nothing is invented: no displayed field is
+        # altered, only the crystal phase that no screen shows.
+        #
+        # ⚠️ WHAT THIS DOES *NOT* CLOSE, and it should be said plainly: a phase offset
+        # moves the moment the second ticks over, so the two consoles read the same
+        # wall-clock SECOND roughly half the time. A game seeding on `Second` alone still
+        # collides on those. Closing that needs the second console to keep its own cell
+        # with its own date -- a real second save file, deliberately not done here.
+        self.second_console = bool(second_console)
         self.clock_mode = clock_mode if clock_mode in CLOCK_MODES else CLOCK_HARDWARE
         self.clock_manual = clock_manual
         # The console's own settings -- language, date, colour theme -- live in the coin
@@ -369,6 +424,8 @@ class NativeSession:
             # With a configured cell it leaves what it finds; with a blank one it resets
             # the date to 1998-01-01 itself, which is the real dead-battery behaviour.
             apply_saved_clock(self.machine, self.rtc_path, self.clock_mode, self.clock_manual)
+            if self.second_console:
+                offset_crystal_phase(self.machine)   # its own crystal, see above
             self.machine.reset(real_bios=True)
         else:
             self.machine.reset(bios_handoff=True)
@@ -378,6 +435,8 @@ class NativeSession:
             # dead-battery path and stamps 1998-01-01 over the chip. Restoring before the
             # reset would hand the player's clock straight to that warm-up to be wiped.
             apply_saved_clock(self.machine, self.rtc_path, self.clock_mode, self.clock_manual)
+            if self.second_console:
+                offset_crystal_phase(self.machine)   # its own crystal, see above
             # The player's language/date, laid back over the hand-off for the same reason as
             # the clock above: the fast boot skips the intro, not the settings. The warm-up
             # ran on a blank cell (its captured char RAM stays deterministic); here we put
@@ -829,9 +888,16 @@ class NativeSession:
         # The save is committed BEFORE the machine goes away, and a failure to write it
         # is not something to swallow on the way out of a `with` block.
         if self.autosave:
+            # The CARTRIDGE save is this console's own business and is always written --
+            # player 2 chose its own cartridge and played it.
             self.commit_save()
-            self.commit_system_ram()
-            self.commit_rtc()
+            # ...but the COIN CELL is not. A second console borrows the first one's cell
+            # to boot with the player's settings; writing it back would mean whichever
+            # window was closed last stamped its clock over the other's. Measured before
+            # this guard: P1 left 21h on disk, then P2 closed and the file read 02h.
+            if not self.second_console:
+                self.commit_system_ram()
+                self.commit_rtc()
         self.machine.close()
 
     def __enter__(self) -> "NativeSession":

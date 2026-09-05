@@ -38,7 +38,12 @@ from pathlib import Path
 
 from core import bios_fingerprint
 
-ABI_VERSION = 15
+# 16: + ngpc_get_link_state / ngpc_set_link_state.
+# 17: + ngpc_set_serial_break.
+# 18: + ngpc_run_linked -- both cabled consoles and the relay, inside the core.
+# Must track NGPC_ABI_VERSION in cpp/include/ngpc_core.h -- the loader compares
+# them and asks for a rebuild.
+ABI_VERSION = 18
 
 # How the machine comes up (NGPC_RESET_* in ngpc_core.h). This was a bool, and a third
 # case was hiding inside it: "no hand-off" ALSO started at the cart's entry point, so
@@ -79,6 +84,10 @@ STATUS = {
     30: "unimplemented",
     40: "breakpoint",
     41: "count-reached",
+    # Only ever seen when the host armed set_serial_break(). Named here all the same:
+    # this table is what stops a status printing as "unknown-status-42", and a planned
+    # rendezvous that reads like an unknown fault is the worst of both.
+    42: "serial-event",
 }
 
 STATUS_OK = 0
@@ -87,6 +96,9 @@ STATUS_SYSTEM_STACK_VIOLATION = 14
 STATUS_WATCHDOG_RESET = 15
 STATUS_BREAKPOINT = 40
 STATUS_COUNT_REACHED = 41
+# The link cable moved and the host armed set_serial_break(). Never seen unless
+# it did: this is a rendezvous, not a fault.
+STATUS_SERIAL_EVENT = 42
 
 # The shared library's name follows the platform. CMake strips the `lib` prefix
 # (PROPERTIES PREFIX "", see cpp/CMakeLists.txt), so it is `ngpc_core.<ext>` on
@@ -266,7 +278,8 @@ class AuxState(Structure):
         ("scanline", c_uint32),
         ("frame_count", c_uint32),
         ("cycle_residue", c_uint32),
-        ("_pad2", c_uint32),
+        # La dette de l'unite de bus : SAUVEE, pas effacee. Voir ngpc_core.h.
+        ("biu_debt", c_uint32),
     ]
 
 
@@ -291,6 +304,56 @@ class SerialState(Structure):
 
     def as_dict(self) -> dict[str, int]:
         return {name: int(getattr(self, name)) for name, _ in self._fields_}
+
+
+LINK_STATE_VERSION = 2   # v2: the second stage of each serial channel
+LINK_FIFO_MAX = 1024
+
+
+class LinkState(Structure):
+    """The link cable as SAVEABLE state. Mirrors `ngpc_link_state_t` FIELD FOR FIELD.
+
+    ⛔ WHY THIS EXISTS, MEASURED 2026-08-04. A save state was the CPU struct + AuxState
+    + the memory image, and the cable is in none of the three: its FIFOs, its shift
+    register and its handshake pins live in the core's `Machine` and were reachable only
+    through `SerialState`, which is read-only. Restoring a state taken mid-transfer was
+    a NO-OP on the channel, and two re-simulations from the "same" restored state
+    diverged by one cable byte inside 60 frames. See LINK_NETPLAY_STUDY.md and
+    tests/test_link_savestate_roundtrip.py.
+
+    ⚡ Its own block, NOT extra fields in AuxState: that struct is the sound CPU, the
+    T6W28 and the timers, and growing it would have shifted the memory image inside
+    every NGPCST02 save state a player already has.
+
+    ⚠️ `overflow` is set when a FIFO was deeper than LINK_FIFO_MAX. The snapshot is
+    then INEXACT -- clamped, not truncated in silence -- and a caller must not pretend
+    otherwise. `SerialState` is still the door for looking; this one is for keeping.
+    """
+
+    _fields_ = [
+        ("version", c_uint32),
+        ("size", c_uint32),
+        ("link_enabled", c_uint8), ("tx_busy", c_uint8),
+        ("tx_shifting", c_uint8), ("tx_byte", c_uint8),
+        ("cts_high", c_uint8), ("rx_pending", c_uint8),
+        ("rx_byte", c_uint8), ("overflow", c_uint8),
+        ("tx_cycles", c_int32), ("rx_cycles", c_int32),
+        # v2 -- SC0BUF and the shift register are SEPARATE stages on this chip, and the
+        # transmitter is modelled that way. ⛔ THIS MIRROR IS NOT DECORATION: the core
+        # memsets sizeof(ngpc_link_state_t) into whatever buffer it is handed, so a
+        # Python struct one field short is an out-of-bounds WRITE, not a wrong read.
+        # Any field added on the C side belongs here in the same commit.
+        ("tx_buf_full", c_uint8), ("tx_buf_byte", c_uint8),
+        ("rx_shift_full", c_uint8), ("rx_shift_byte", c_uint8),
+        ("rx_had_pending", c_uint8), ("_pad_v2", c_uint8 * 3),
+        ("tx_len", c_uint32), ("rx_len", c_uint32),
+        ("tx_count", c_uint32), ("wire_count", c_uint32),
+        ("rx_queued_count", c_uint32), ("rx_read_count", c_uint32),
+        ("irq_tx_count", c_uint32), ("irq_rx_count", c_uint32),
+        ("cts_hold_ticks", c_uint32), ("rts_hold_ticks", c_uint32),
+        ("tx_fifo", c_uint8 * LINK_FIFO_MAX),
+        ("rx_fifo", c_uint8 * LINK_FIFO_MAX),
+    ]
 
 
 class WriteRec(Structure):
@@ -441,6 +504,13 @@ def _bind(path: Path) -> ctypes.CDLL:
 
     lib.ngpc_run_frames.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(Summary)]
     lib.ngpc_run_frames.restype = c_int
+    lib.ngpc_run_linked.argtypes = [c_void_p, c_void_p, c_uint32, c_uint32,
+                                    POINTER(Summary), POINTER(Summary)]
+    lib.ngpc_run_linked.restype = c_int
+    lib.ngpc_link_relay_count.argtypes = [c_void_p]
+    lib.ngpc_link_relay_count.restype = c_uint32
+    lib.ngpc_link_pair_max_gap.argtypes = [c_void_p]
+    lib.ngpc_link_pair_max_gap.restype = ctypes.c_uint64
     lib.ngpc_get_z80.argtypes = [c_void_p, POINTER(Z80State)]
     lib.ngpc_get_z80.restype = None
     lib.ngpc_get_apu_writes.argtypes = [c_void_p, POINTER(ApuWrite), c_uint32]
@@ -454,6 +524,13 @@ def _bind(path: Path) -> ctypes.CDLL:
     # --- link cable (serial channel 0) ---
     lib.ngpc_serial_set_enabled.argtypes = [c_void_p, c_int]
     lib.ngpc_serial_set_enabled.restype = None
+    # Guarded, like set_ldirw_cost: a DLL built before ABI 17 is a real situation
+    # (dist/, release/, a stale cpp/build), and binding it unconditionally would
+    # take the WHOLE core down over one optional feature. set_serial_break() says
+    # so out loud instead of silently doing nothing.
+    if hasattr(lib, "ngpc_set_serial_break"):
+        lib.ngpc_set_serial_break.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_serial_break.restype = None
     lib.ngpc_serial_read_tx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
     lib.ngpc_serial_read_tx.restype = c_uint32
     lib.ngpc_serial_write_rx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
@@ -470,6 +547,10 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_get_aux_state.restype = None
     lib.ngpc_set_aux_state.argtypes = [c_void_p, POINTER(AuxState)]
     lib.ngpc_set_aux_state.restype = c_int
+    lib.ngpc_get_link_state.argtypes = [c_void_p, POINTER(LinkState)]
+    lib.ngpc_get_link_state.restype = None
+    lib.ngpc_set_link_state.argtypes = [c_void_p, POINTER(LinkState)]
+    lib.ngpc_set_link_state.restype = c_int
     lib.ngpc_set_apu_channel_mask.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_apu_channel_mask.restype = None
     lib.ngpc_set_layer_mask.argtypes = [c_void_p, c_uint32]
@@ -500,6 +581,97 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_rtc.restype = None
     lib.ngpc_rtc_advance.argtypes = [c_void_p, c_uint32]
     lib.ngpc_rtc_advance.restype = None
+    lib.ngpc_set_timing_silicon.argtypes = [c_void_p, c_uint32, c_uint32]
+    lib.ngpc_set_timing_silicon.restype = None
+    lib.ngpc_set_byte_extra.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_byte_extra.restype = None
+    lib.ngpc_set_uart_unplugged.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_uart_unplugged.restype = None
+    lib.ngpc_set_micro_dma_states.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_micro_dma_states.restype = None
+    lib.ngpc_set_fetch_wait_q4.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_fetch_wait_q4.restype = None
+    lib.ngpc_set_bios_data_wait.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_bios_data_wait.restype = None
+    lib.ngpc_set_slack_by_region.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_slack_by_region.restype = None
+    lib.ngpc_set_branch_flush.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_branch_flush.restype = None
+    if hasattr(lib, "ngpc_set_branch_flush_keep"):
+        lib.ngpc_set_branch_flush_keep.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_branch_flush_keep.restype = None
+    if hasattr(lib, "ngpc_set_branch_taken_extra"):
+        lib.ngpc_set_branch_taken_extra.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_branch_taken_extra.restype = None
+    if hasattr(lib, "ngpc_set_fetch_wait_byte_q16"):
+        lib.ngpc_set_fetch_wait_byte_q16.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_fetch_wait_byte_q16.restype = None
+    if hasattr(lib, "ngpc_set_data_access_cycles"):
+        lib.ngpc_set_data_access_cycles.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_data_access_cycles.restype = None
+    if hasattr(lib, "ngpc_set_flush_on_region_change"):
+        lib.ngpc_set_flush_on_region_change.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_flush_on_region_change.restype = None
+    if hasattr(lib, "ngpc_set_irq_transparent_queue"):
+        lib.ngpc_set_irq_transparent_queue.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_irq_transparent_queue.restype = None
+    if hasattr(lib, "ngpc_set_block_pays_vram"):
+        lib.ngpc_set_block_pays_vram.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_block_pays_vram.restype = None
+    if hasattr(lib, "ngpc_set_data_wait_cart_only"):
+        lib.ngpc_set_data_wait_cart_only.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_data_wait_cart_only.restype = None
+    if hasattr(lib, "ngpc_set_irq_queue_keep_q16"):
+        lib.ngpc_set_irq_queue_keep_q16.argtypes = [c_void_p, c_int32]
+        lib.ngpc_set_irq_queue_keep_q16.restype = None
+    if hasattr(lib, "ngpc_dbg_queue"):
+        lib.ngpc_dbg_queue.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_uint32),
+                                       POINTER(c_uint32), POINTER(c_uint32)]
+        lib.ngpc_dbg_queue.restype = None
+    if hasattr(lib, "ngpc_dbg_biu"):
+        lib.ngpc_dbg_biu.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_uint32), POINTER(c_uint32)]
+        lib.ngpc_dbg_biu.restype = None
+    if hasattr(lib, "ngpc_dbg_bios_charges"):
+        lib.ngpc_dbg_bios_charges.argtypes = [c_void_p]
+        lib.ngpc_dbg_bios_charges.restype = c_uint32
+    if hasattr(lib, "ngpc_set_irq_flush_keep"):
+        lib.ngpc_set_irq_flush_keep.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_irq_flush_keep.restype = None
+    if hasattr(lib, "ngpc_set_biu_slack"):
+        lib.ngpc_set_biu_slack.argtypes = [c_void_p, c_int32]
+        lib.ngpc_set_biu_slack.restype = None
+    if hasattr(lib, "ngpc_set_queue_bytes"):
+        lib.ngpc_set_queue_bytes.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_queue_bytes.restype = None
+    if hasattr(lib, "ngpc_set_muldiv_byte"):
+        lib.ngpc_set_muldiv_byte.argtypes = [c_void_p, c_uint32, c_uint32]
+        lib.ngpc_set_muldiv_byte.restype = None
+    if hasattr(lib, "ngpc_set_muldiv_word"):
+        lib.ngpc_set_muldiv_word.argtypes = [c_void_p, c_uint32, c_uint32]
+        lib.ngpc_set_muldiv_word.restype = None
+    if hasattr(lib, "ngpc_set_block_drains_queue"):
+        lib.ngpc_set_block_drains_queue.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_block_drains_queue.restype = None
+    lib.ngpc_set_rx_double.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_rx_double.restype = None
+    lib.ngpc_set_tx_irq_early.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_tx_irq_early.restype = None
+    lib.ngpc_set_fetch_pipelined.argtypes = [c_void_p, c_int, c_int]
+    lib.ngpc_set_fetch_pipelined.restype = None
+    lib.ngpc_set_half_duplex.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_half_duplex.restype = None
+    lib.ngpc_set_relay_gate.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_relay_gate.restype = None
+    lib.ngpc_set_rx_single.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_rx_single.restype = None
+    lib.ngpc_set_fetch_word.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_fetch_word.restype = None
+    lib.ngpc_set_base_scale.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_base_scale.restype = None
+    lib.ngpc_set_irq_entry.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_irq_entry.restype = None
+    lib.ngpc_set_bios_wait.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_bios_wait.restype = None
     lib.ngpc_set_cart_wait.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_cart_wait.restype = None
     lib.ngpc_set_cart_data_wait.argtypes = [c_void_p, c_uint32]
@@ -510,6 +682,13 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_vram_wait.restype = None
     lib.ngpc_set_ldir_cost.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_ldir_cost.restype = None
+    # Guarded, unlike its neighbours: a DLL built before this symbol existed is a real
+    # situation (dist/, release/, a stale cpp/build), and binding it unconditionally would
+    # take the WHOLE core down over one optional timing knob. set_ldirw_cost() below says
+    # so out loud rather than silently doing nothing.
+    if hasattr(lib, "ngpc_set_ldirw_cost"):
+        lib.ngpc_set_ldirw_cost.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_ldirw_cost.restype = None
     lib.ngpc_set_flash_size.argtypes = [c_void_p, c_uint32, c_uint32]
     lib.ngpc_set_flash_size.restype = None
     lib.ngpc_flash_capacity.argtypes = [c_void_p, c_uint32]
@@ -610,6 +789,21 @@ def available() -> bool:
         return False
 
 
+def active_timing_model() -> str:
+    """Le modele de temps que ce processus armera : `"silicon"` ou `"legacy"`.
+
+    ⚡ UN SEUL ENDROIT LE DECIDE. `set_timing_silicon` lit la variable d'environnement
+    pour choisir, et le netplay doit poser exactement la MEME question -- sinon deux PC
+    peuvent s'accorder sur tout ce qu'ils s'annoncent et simuler deux machines de vitesses
+    differentes, ce qui ne se voit pas au branchement mais tue le match en derive. Le
+    fingerprint du coeur ne les separe pas : il hache la DLL, et le commutateur est en
+    Python.
+    """
+    import os
+    return "legacy" if os.environ.get(
+        "NGPCRAFT_TIMING", "").strip().lower() == "legacy" else "silicon"
+
+
 def core_fingerprint(path: Path | None = None) -> str:
     """Identify THIS BUILD of the core, for anything that compares two of them.
 
@@ -662,6 +856,330 @@ class NativeMachine:
         """TOTAL writes aimed at the T6W28, ever. The log only keeps the last 4096."""
         return int(self._lib.ngpc_apu_write_count(self._h))
 
+    def set_timing_legacy(self) -> None:
+        """The timing this core shipped BEFORE 2026-08-21, for A/B comparison.
+
+        Not a supported configuration -- it is known to be wrong (a received byte cost
+        49 us against 96 measured on silicon). It exists so a suspected regression can
+        be attributed in seconds instead of argued about: set NGPCRAFT_TIMING=legacy
+        and see whether the symptom follows the model.
+        """
+        self.set_base_scale(1)
+        self.set_fetch_word(False)
+        self.set_fetch_pipelined(False, 0)
+        self.set_rx_single(False)
+        self.set_tx_irq_early(False)
+        self.set_uart_unplugged(False)
+        self.set_byte_extra(0)
+        self.set_cart_wait(3)
+        self.set_cart_data_wait(0)
+        self.set_ldir_cost(14)
+        self.set_ldirw_cost(18)
+        # ⛔ ET LE BLOC NE VIDE PAS LA FILE : c'est un morceau du modele silicium, donc
+        # « legacy » doit le RETIRER, sinon l'A/B compare l'ancien modele plus une piece
+        # du nouveau -- et n'attribue plus rien.
+        self.set_block_drains_queue(False)
+        self.set_bios_wait(0)
+        # ⛔ And the experimental knobs too: "legacy" must DEFINE the machine, exactly
+        # like set_timing_silicon does. Leaving one armed would give the old model plus
+        # a refuted hypothesis, and no measurement would say so.
+        self.set_branch_flush(False)
+        self.set_slack_by_region(False)
+        self.set_bios_data_wait(0)
+        self.set_fetch_wait_q4(0)
+        self.set_relay_gate(False)
+        self.set_half_duplex(False)
+        self.set_rx_double(False)
+        self.set_irq_entry(0)
+        # ⛔ ET LES PIECES DES CAMPAGNES v19-v21, POUR LA MEME RAISON QUE CI-DESSUS.
+        # « legacy » doit DEFINIR la machine : laisser une piece du modele courant armee
+        # ferait comparer l'ancien modele PLUS un morceau du nouveau, et l'A/B
+        # n'attribuerait plus rien. Chacune est guardee : une DLL plus ancienne que la
+        # piece n'a pas a tomber pour un bouton optionnel.
+        for name, arg in (("set_data_wait_cart_only", False),
+                          ("set_irq_transparent_queue", False),
+                          ("set_flush_on_region_change", False),
+                          ("set_block_pays_vram", False),
+                          ("set_queue_bytes", 0),
+                          ("set_irq_queue_keep_q16", 0),
+                          ("set_vram_wait", 0)):
+            fn = getattr(self, name, None)
+            if fn is not None:
+                try:
+                    fn(arg)
+                except Exception:
+                    pass
+        # `block_cart_src_per_byte` n'a pas de setter : il vit dans le modele silicium et
+        # `ldirw_cost = 18` ci-dessus porte deja, en legacy, la somme que ce surcout
+        # explique (14 + 4). Les deux ne doivent donc PAS etre armes ensemble.
+
+    def set_timing_silicon(self, word_wait: int = 10, bios_wait: int = 8) -> None:
+        """Arm the whole silicon timing model in one call.
+
+        ⚠️ `NGPCRAFT_TIMING=legacy` in the environment makes this apply the PREVIOUS
+        model instead -- the A/B switch for attributing a suspected regression.
+
+        Prefer this over setting cart_wait / ldir_cost / ... by hand: those are eight
+        settings that must agree, and a bench that arms half of them measures a machine
+        no player has. `word_wait` and `bios_wait` are the two calibrated numbers;
+        everything else is documented or derived (see ngpc_set_timing_silicon in
+        core.cpp, and OPEN_ITEMS.md for what still misses).
+        """
+        # ⚖️ LE DEFAUT EST LE MODELE SILICIUM, ET TROIS MESURES MATERIELLES LE PORTENT.
+        #
+        # Il avait ete mis par defaut le 23/08 au matin, puis retire le meme jour sur un
+        # glitch de Cool Boarders, puis remis le soir quand les trois raisons du retrait
+        # sont tombees l'une apres l'autre. Ce qui a change entre-temps n'est pas un
+        # arbitrage, ce sont des MESURES :
+        #
+        #  - **CPU** : ROM `a_irq_calib_v8.ngp` flashee sur console (RASV=198, chiffres
+        #    stables). Silicium 261/218/249 lots, ce modele 262/218/251. Le cout d'une
+        #    interruption y est de 111 cycles ; ce modele en compte 113, l'ANCIEN 59 --
+        #    il sous-facturait de moitie, ce qui deplacait tous les splits rasteurs.
+        #  - **Serie** : campagne AUTO du 21/08 (temoins tous a zero, `ECHOED` = somme des
+        #    RT a l'unite). Allers-retours +0,3 / +0,2 / −0,2 %, part du temps passee a
+        #    recevoir 18,32 % contre 18,20 %.
+        #  - **Le glitch qui avait fait reculer** : Cool Boarders, trames ou le split
+        #    derape sur 600 -- ancien timing **122**, ce modele **62**. Le modele est
+        #    DEUX FOIS meilleur sur le defaut meme qui l'avait fait retirer.
+        #
+        # ⛔ Les deux « regressions » qui avaient motive le retrait n'en etaient pas :
+        # l'une venait d'une seule scene de jeu generalisee a tort, l'autre d'un banc qui
+        # pilotait mal la ROM sonde. Voir OPEN_ITEMS.md.
+        #
+        # `--timing legacy` garde l'ancien modele pour attribuer une regression en
+        # quelques secondes au lieu d'en discuter.
+        if active_timing_model() != "silicon":
+            self.set_timing_legacy()
+            return
+        self._lib.ngpc_set_timing_silicon(self._h, int(word_wait), int(bios_wait))
+
+    def set_byte_extra(self, pct: int) -> None:
+        """EXPERIMENT: add pct% to the derived serial byte time."""
+        self._lib.ngpc_set_byte_extra(self._h, int(pct))
+
+    def set_uart_unplugged(self, on: bool) -> None:
+        """EXPERIMENT: the UART transmits with no cable attached."""
+        self._lib.ngpc_set_uart_unplugged(self._h, 1 if on else 0)
+
+    def set_micro_dma_states(self, eighths: int) -> None:
+        """Le cout d'un transfert micro-DMA, en HUITIEMES du nominal de la datasheet.
+
+        8 = le nominal (8 etats par transfert octet/mot, 12 en 4 octets, 5 en mode
+        compteur -- TMP95C061). 0 = l'ancien comportement, qui n'en facturait AUCUN :
+        un jeu qui enchaine les transferts tournait alors trop vite. Le reglage existe
+        en huitiemes pour pouvoir l'etalonner sans toucher au code.
+        """
+        self._lib.ngpc_set_micro_dma_states(self._h, int(eighths))
+
+    def set_fetch_wait_q4(self, quarters: int) -> None:
+        """Per-word fetch wait in QUARTER cycles; 0 = use the integer cart_wait."""
+        self._lib.ngpc_set_fetch_wait_q4(self._h, int(quarters))
+
+    def set_bios_data_wait(self, cycles: int) -> None:
+        """EXPERIMENT: charge BIOS-region DATA reads, not just fetches."""
+        self._lib.ngpc_set_bios_data_wait(self._h, int(cycles))
+
+    def set_slack_by_region(self, on: bool) -> None:
+        """EXPERIMENT: the BIU's run-ahead follows the region being fetched."""
+        self._lib.ngpc_set_slack_by_region(self._h, 1 if on else 0)
+
+    def set_block_drains_queue(self, on: bool) -> None:
+        """A repeating block transfer leaves the instruction queue EMPTY.
+
+        It owns the bus for its whole run, so the BIU cannot prefetch behind it and
+        the following instructions pay their own fetch in full. Guarded by `hasattr`
+        like `set_ldirw_cost`: an older DLL must not take the whole core down for an
+        optional setting.
+        """
+        if not hasattr(self._lib, "ngpc_set_block_drains_queue"):
+            raise RuntimeError(
+                "this core has no ngpc_set_block_drains_queue -- rebuild cpp/build"
+            )
+        self._lib.ngpc_set_block_drains_queue(self._h, 1 if on else 0)
+
+    def set_flush_on_region_change(self, on: bool) -> None:
+        """EXPERIMENT : un transfert de controle qui change de REGION jette l'avance."""
+        self._lib.ngpc_set_flush_on_region_change(self._h, 1 if on else 0)
+
+    def set_irq_transparent_queue(self, on: bool) -> None:
+        """EXPERIMENT : une IRQ est transparente pour l'etat de bus du flot interrompu."""
+        self._lib.ngpc_set_irq_transparent_queue(self._h, 1 if on else 0)
+
+    def set_block_pays_vram(self, on: bool) -> None:
+        """ESSAI : un transfert bloc paie l'etranglement VRAM comme toute ecriture."""
+        self._lib.ngpc_set_block_pays_vram(self._h, 1 if on else 0)
+
+    def set_data_wait_cart_only(self, on: bool) -> None:
+        """EXPERIMENT : le cout d'acces de donnee ne se paie que dans du code CARTOUCHE."""
+        self._lib.ngpc_set_data_wait_cart_only(self._h, 1 if on else 0)
+
+    def set_irq_queue_keep_q16(self, q16: int) -> None:
+        """DIAGNOSTIC : etat de la file au sortir d'une acceptation d'IRQ, en 1/16 d'octet."""
+        self._lib.ngpc_set_irq_queue_keep_q16(self._h, int(q16))
+
+    def set_queue_bytes(self, nbytes: int) -> None:
+        """Taille de la file d'instructions, en OCTETS (4 sur ce coeur).
+
+        0 = ancien modele (credit d'avance en cycles plafonne par `biu_slack`).
+        Voir `queue_bytes` dans machine.hpp : le modele en octets n'a aucun parametre
+        libre, les deux plafonds sont des faits de la machine.
+        """
+        if not hasattr(self._lib, "ngpc_set_queue_bytes"):
+            raise RuntimeError("this core has no ngpc_set_queue_bytes -- rebuild cpp/build")
+        self._lib.ngpc_set_queue_bytes(self._h, int(nbytes))
+
+    def set_muldiv_word(self, mul_states: int, div_cycles: int) -> None:
+        """Couts MOT de `mul` (etats) et `div` (cycles). 0 = constantes du coeur.
+
+        La v14 n'a mesure que la forme OCTET ; la forme mot date encore du fetch a
+        10 cy/mot. ROM v17.
+        """
+        if not hasattr(self._lib, "ngpc_set_muldiv_word"):
+            raise RuntimeError("this core has no ngpc_set_muldiv_word -- rebuild cpp/build")
+        self._lib.ngpc_set_muldiv_word(self._h, int(mul_states), int(div_cycles))
+
+    def set_muldiv_byte(self, mul_states: int, div_cycles: int) -> None:
+        """Couts OCTET de `mul` (etats) et `div` (cycles). 0 = constantes du coeur.
+
+        ⛔ Couples a `biu_slack` : ces deux instructions sont execute-bound, donc leur
+        cout apparent depend de l'avance qu'on autorise au bus. Voir machine.hpp.
+        """
+        if not hasattr(self._lib, "ngpc_set_muldiv_byte"):
+            raise RuntimeError("this core has no ngpc_set_muldiv_byte -- rebuild cpp/build")
+        self._lib.ngpc_set_muldiv_byte(self._h, int(mul_states), int(div_cycles))
+
+    def dbg_biu(self) -> tuple[int, int, int]:
+        """(biu_debt a l'entree, stall paye, access_wait) de la derniere instruction."""
+        d, st, aw = c_int32(), c_uint32(), c_uint32()
+        self._lib.ngpc_dbg_biu(self._h, ctypes.byref(d), ctypes.byref(st), ctypes.byref(aw))
+        return d.value, st.value, aw.value
+
+    def dbg_queue(self) -> tuple[int, int, int, int]:
+        """(file a l'entree en 1/16 d'octet, octets lus, calage paye, access_wait)."""
+        q = ctypes.c_int32(); b = ctypes.c_uint32()
+        st = ctypes.c_uint32(); aw = ctypes.c_uint32()
+        self._lib.ngpc_dbg_queue(self._h, ctypes.byref(q), ctypes.byref(b),
+                                 ctypes.byref(st), ctypes.byref(aw))
+        return int(q.value), int(b.value), int(st.value), int(aw.value)
+
+    def dbg_bios_charges(self) -> int:
+        """Nombre de charges `bios_wait` depuis le dernier appel (instrumentation)."""
+        return int(self._lib.ngpc_dbg_bios_charges(self._h))
+
+    def set_irq_flush_keep(self, cycles: int) -> None:
+        """Credit d'avance qui SURVIT a une interruption, en cycles (0 = tout jete).
+
+        Voir `irq_flush_keep` dans machine.hpp : la v14 a mesure qu'une branche prise
+        n'emporte que ~2,4 cy du credit, pas les 16 d'une file pleine. Une IRQ est aussi
+        un transfert de controle.
+        """
+        if not hasattr(self._lib, "ngpc_set_irq_flush_keep"):
+            raise RuntimeError("this core has no ngpc_set_irq_flush_keep -- rebuild cpp/build")
+        self._lib.ngpc_set_irq_flush_keep(self._h, int(cycles))
+
+    def set_biu_slack(self, cycles: int) -> None:
+        """Avance maximale de la file d'instructions, en cycles.
+
+        Mesuree par la ROM v16 page 0 : ~7,5 cy, soit UN MOT -- pas les deux que la
+        taille de la file (4 octets) laissait deduire.
+        """
+        if not hasattr(self._lib, "ngpc_set_biu_slack"):
+            raise RuntimeError("this core has no ngpc_set_biu_slack -- rebuild cpp/build")
+        self._lib.ngpc_set_biu_slack(self._h, int(cycles))
+
+    def set_data_access_cycles(self, cycles: int) -> None:
+        """Cout FIXE d'un acces memoire de donnee, en cycles (0 = gratuit).
+
+        Voir `data_access_cycles` : v2 avait prouve cart-data == RAM, jamais qu'elles
+        etaient gratuites. Mesure : ROM v15 pages 1-2 (~4,05 cy par ACCES, pas par octet).
+        """
+        if not hasattr(self._lib, "ngpc_set_data_access_cycles"):
+            raise RuntimeError("this core has no ngpc_set_data_access_cycles -- rebuild cpp/build")
+        self._lib.ngpc_set_data_access_cycles(self._h, int(cycles))
+
+    def set_fetch_wait_byte_q16(self, sixteenths: int) -> None:
+        """Cout d'un octet fetche, en seiziemes de cycle (0 = ancien chemin par mot).
+
+        Le bus cartouche est 8 bits : le cout d'un fetch suit les OCTETS. Voir
+        `fetch_wait_byte_q16` dans machine.hpp.
+        """
+        if not hasattr(self._lib, "ngpc_set_fetch_wait_byte_q16"):
+            raise RuntimeError(
+                "this core has no ngpc_set_fetch_wait_byte_q16 -- rebuild cpp/build")
+        self._lib.ngpc_set_fetch_wait_byte_q16(self._h, int(sixteenths))
+
+    def set_branch_taken_extra(self, cycles: int) -> None:
+        """Cycles ajoutes a chaque branche PRISE, sans condition (0 = desarme).
+
+        Hypothese concurrente de `set_branch_flush_keep` : voir `branch_taken_extra`
+        dans machine.hpp. Ne pas armer les deux ensemble.
+        """
+        if not hasattr(self._lib, "ngpc_set_branch_taken_extra"):
+            raise RuntimeError(
+                "this core has no ngpc_set_branch_taken_extra -- rebuild cpp/build")
+        self._lib.ngpc_set_branch_taken_extra(self._h, int(cycles))
+
+    def set_branch_flush_keep(self, cycles: int) -> None:
+        """Credit d'avance qui SURVIT a une branche prise, en cycles (0 = vidage total).
+
+        N'a d'effet que si `set_branch_flush(True)`. Voir `branch_flush_keep` dans
+        machine.hpp : le silicium (ROM v13) tombe entre les deux reglages extremes.
+        """
+        if not hasattr(self._lib, "ngpc_set_branch_flush_keep"):
+            raise RuntimeError(
+                "this core has no ngpc_set_branch_flush_keep -- rebuild cpp/build")
+        self._lib.ngpc_set_branch_flush_keep(self._h, int(cycles))
+
+    def set_branch_flush(self, on: bool) -> None:
+        """EXPERIMENT: a taken branch empties the 4-byte instruction queue."""
+        self._lib.ngpc_set_branch_flush(self._h, 1 if on else 0)
+
+    def set_rx_double(self, on: bool) -> None:
+        """EXPERIMENT: two-stage receiver (shift register + SC0BUF)."""
+        self._lib.ngpc_set_rx_double(self._h, 1 if on else 0)
+
+    def set_tx_irq_early(self, on: bool) -> None:
+        """EXPERIMENT: raise INTTX0 when SC0BUF frees, not when the wire frees."""
+        self._lib.ngpc_set_tx_irq_early(self._h, 1 if on else 0)
+
+    def set_fetch_pipelined(self, on: bool, slack: int = 0) -> None:
+        """EXPERIMENT: overlap instruction fetch with execution (the BIU)."""
+        self._lib.ngpc_set_fetch_pipelined(self._h, 1 if on else 0, int(slack))
+
+    def set_half_duplex(self, on: bool) -> None:
+        """EXPERIMENT: do not present a byte while our transmitter is busy."""
+        self._lib.ngpc_set_half_duplex(self._h, 1 if on else 0)
+
+    def set_relay_gate(self, on: bool) -> None:
+        """EXPERIMENT: hold a byte while the receiver's RTS is high."""
+        self._lib.ngpc_set_relay_gate(self._h, 1 if on else 0)
+
+    def set_rx_single(self, on: bool) -> None:
+        """EXPERIMENT: charge a received byte's time ONCE."""
+        self._lib.ngpc_set_rx_single(self._h, 1 if on else 0)
+
+    def set_fetch_word(self, on: bool) -> None:
+        """EXPERIMENT: bill the fetch wait per 16-bit word, not per byte."""
+        self._lib.ngpc_set_fetch_word(self._h, 1 if on else 0)
+
+    def set_base_scale(self, k: int) -> None:
+        """EXPERIMENT: multiply each instruction's own cycles."""
+        self._lib.ngpc_set_base_scale(self._h, int(k))
+
+    def set_irq_entry(self, cycles: int) -> None:
+        """Cycles charged for accepting an interrupt; 0 = built-in default."""
+        self._lib.ngpc_set_irq_entry(self._h, int(cycles))
+
+    def set_bios_wait(self, cycles_per_byte: int) -> None:
+        """Cycles per byte of instruction fetch out of the on-chip BIOS ROM.
+
+        Zero (free) is what this core has always assumed. See Machine::bios_wait --
+        measured evidence says BIOS-heavy code runs 23-30% too fast while plain
+        cartridge code is only 7-9% out.
+        """
+        self._lib.ngpc_set_bios_wait(self._h, int(cycles_per_byte))
+
     def set_cart_wait(self, cycles_per_byte: int) -> None:
         """Wait-states per byte of instruction FETCH from cartridge flash. Silicon = 3.
 
@@ -670,9 +1188,10 @@ class NativeMachine:
         (ngpc_settings.cart_wait_states() is True); code that builds a Machine itself gets
         the free-fetch machine and must ask for hardware timing explicitly:
 
-            m.set_cart_wait(3)        # cfg.CART_FETCH_WAIT -- instruction fetch
+            m.set_timing_silicon(10, 8)   # ⚠️ PREFER THIS -- it arms all eight
             m.set_cart_data_wait(0)   # cfg.CART_DATA_WAIT  -- cart data reads are free
-            m.set_ldir_cost(14)       # cfg.CART_LDIR_COST  -- block copies
+            m.set_ldir_cost(14)       # cfg.CART_LDIR_COST  -- block copies, BYTE form
+            m.set_ldirw_cost(18)      # cfg.CART_LDIRW_COST -- block copies, WORD form
 
         Without them cart code runs ~2.9-3.4x too fast, self-timed games (Cool Boarders,
         Densha de Go) show 60fps where hardware shows 30 -- and, the subtler one, any
@@ -734,6 +1253,24 @@ class NativeMachine:
         as MUL/DIV proved to be. Pass 14 if you want the shipping timing.
         See Machine::ldir_cost."""
         self._lib.ngpc_set_ldir_cost(self._h, int(cycles_per_byte))
+
+    def set_ldirw_cost(self, cycles_per_iteration: int) -> None:
+        """Cycles per ITERATION for the WORD block copies, LDIRW/LDDRW. 0 = follow
+        set_ldir_cost(), which is the pre-existing behaviour.
+
+        The two widths are different instructions and the loop is billed per iteration,
+        so one number cannot price both: an LDIRW iteration moves TWO bytes, and charging
+        it the byte figure sells a word copy at half price. Cool Boarders pinned the byte
+        form at 14 and never constrained this one. The shell ships 18 (cfg.CART_LDIRW_COST),
+        measured on Bomberman's open-loop HiColor copier, where a block must cost exactly
+        8 scanlines and the tolerance is one cycle. See Machine::ldirw_cost.
+        """
+        fn = getattr(self._lib, "ngpc_set_ldirw_cost", None)
+        if fn is None:
+            raise NativeCoreUnavailable(
+                "this ngpc_core has no ngpc_set_ldirw_cost -- it predates the "
+                "byte/word split of the block-copy cost; rebuild cpp/")
+        fn(self._h, int(cycles_per_iteration))
 
     def set_flash_size(self, size_bytes: int, *, chip: int = 0) -> None:
         """Present the cart as a flash chip of this capacity (rebuilds the erasable-block
@@ -1158,6 +1695,26 @@ class NativeMachine:
         """
         return self._lib.ngpc_set_aux_state(self._h, ctypes.byref(st)) == 0
 
+    def link_state(self) -> LinkState:
+        """The link cable, as something a savestate can keep. See LinkState.
+
+        `serial_state()` is the debugger's read-only view of the same channel; this is
+        the one that round-trips. A snapshot taken with a FIFO deeper than
+        LINK_FIFO_MAX comes back with `overflow` set and is inexact.
+        """
+        st = LinkState()
+        self._lib.ngpc_get_link_state(self._h, ctypes.byref(st))
+        return st
+
+    def set_link_state(self, st: LinkState) -> bool:
+        """Put the cable back. False if the blob is from another build.
+
+        ⚠️ Like the aux block, AFTER the memory image: SC0MOD/BR0CR live in the image
+        and decide how fast a byte shifts, so restoring the channel first would run it
+        against the previous timeline's baud setup for one call.
+        """
+        return self._lib.ngpc_set_link_state(self._h, ctypes.byref(st)) == 0
+
     def read(self, address: int, count: int) -> bytes:
         out = (c_uint8 * count)()
         self._lib.ngpc_read_mem(self._h, address, out, count)
@@ -1176,6 +1733,30 @@ class NativeMachine:
     # (serial_write_rx). See core/link.py for the in-process / TCP bridges.
     def serial_set_enabled(self, on: bool) -> None:
         self._lib.ngpc_serial_set_enabled(self._h, 1 if on else 0)
+
+    def set_serial_break(self, on: bool) -> None:
+        """Stop `run()` the moment the cable moves, instead of polling for it.
+
+        A host bridging two machines has to relay bytes and had no way to know
+        when, so it pumped every N instructions -- N chosen for the worst known
+        game (400: The Last Blade breaks past it). That is cable time measured in
+        instructions, and the core already counts the real unit: `serial_tick`
+        knows the exact cycle a byte finishes shifting, from BR0CR/SC0MOD.
+
+        Armed, `run()` returns with `stop_status == STATUS_SERIAL_EVENT` as soon
+        as a byte reaches the transmit FIFO or this machine's RTS changes (it
+        drives the peer's CTS, and Card Fighters' Clash's handshake stalls on it).
+        The instruction in flight is completed first, so the machine is always
+        left on an instruction boundary and the run simply resumes.
+
+        Off by default: every existing caller keeps its exact behaviour.
+        """
+        fn = getattr(self._lib, "ngpc_set_serial_break", None)
+        if fn is None:
+            raise NativeCoreUnavailable(
+                "this ngpc_core has no ngpc_set_serial_break -- it predates ABI 17; "
+                "rebuild cpp/")
+        fn(self._h, 1 if on else 0)
 
     def serial_read_tx(self, max_bytes: int = 64) -> bytes:
         """Drain the bytes this machine has transmitted since the last call."""
@@ -1209,6 +1790,24 @@ class NativeMachine:
         self._lib.ngpc_serial_state(self._h, ctypes.byref(st))
         return st
 
+    def link_pair_max_gap(self) -> int:
+        """Widest cycle gap between the two consoles during the last linked call.
+
+        The number that says whether they were really interleaved -- totals cannot,
+        because a whole frame each in sequence costs exactly the same cycles as
+        taking turns while leaving one console frozen throughout the other's frame.
+        """
+        return int(self._lib.ngpc_link_pair_max_gap(self._h))
+
+    def link_relay_count(self) -> int:
+        """Relays the CORE has done for this console since the cable came up.
+
+        Zero while a host owns the relay itself. The question it answers is the one
+        The Last Blade's handshake cares about: was the cable relayed many times
+        inside a frame, or once at the end of it?
+        """
+        return int(self._lib.ngpc_link_relay_count(self._h))
+
     def run_frames(self, frames: int = 1, *, max_instrs: int | None = None) -> Summary:
         """Advance whole FRAMES. The core owns the raster, so it owns the boundary.
 
@@ -1235,6 +1834,35 @@ class NativeMachine:
             return summary, list(recs[: summary.emitted])
         self._lib.ngpc_run(self._h, count, None, 0, ctypes.byref(summary))
         return summary, []
+
+
+def run_linked(a: "NativeMachine", b: "NativeMachine", frames: int = 1, *,
+               max_instrs: int | None = None) -> "tuple[Summary, Summary]":
+    """Advance two CABLED consoles together, with the relay done inside the core.
+
+    This replaces the host-side pattern it was written from -- run `a` for a slice of
+    instructions, cross the FFI boundary, move the bytes, run `b` for a slice, cross
+    back -- and it replaces it for a reason that is not performance.
+
+    ⛔ AN INSTRUCTION COUNT IS NOT CABLE TIME. `CABLE_SLICE = 400` approximated one by
+    the other, and the two link faults this project paid most for -- Card Fighters'
+    Clash's versus handshake and The Last Blade's threshold -- are the same symptom of
+    that approximation rather than two separate bugs. Every emulator that shipped a
+    working serial link reached the same conclusion first (LINK_NETPLAY_STUDY.md L3):
+    put BOTH consoles and the cable in the core, paced by the hardware's serial clock.
+
+    ⚡ The core now advances whichever console is BEHIND IN CYCLES, in steps bounded by
+    a fraction of the cable's own byte time, and relays the moment either console says
+    the cable moved. The pair can never be more than one quantum of emulated time apart.
+
+    Both machines must have the serial hardware enabled first: the cable goes in before
+    either console boots. Returns one summary per console, in the order given.
+    """
+    budget = max_instrs if max_instrs is not None else max(frames, 1) * 400_000
+    sa, sb = Summary(), Summary()
+    a._lib.ngpc_run_linked(a._h, b._h, frames, budget,
+                           ctypes.byref(sa), ctypes.byref(sb))
+    return sa, sb
 
 
 def status_name(code: int) -> str:

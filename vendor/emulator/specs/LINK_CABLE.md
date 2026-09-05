@@ -51,9 +51,37 @@ Consequences that matter:
 - **Interrupt vectors are CROSSED on the retail BIOS.** Vector `0x18` FILLS the
   receive ring, `0x19` DRAINS the transmit ring. Raise them by BEHAVIOUR, not by
   the SDK's names.
-- **0xB1 bit2 is the cable-DETECT input** (0 = a peer is connected). Games gate
-  their handshake on it; it is forced from the link state, never from the I/O
-  page.
+- ⚡ **0xB1 bit2 is the PEER'S RTS, not "a cable is plugged in"** — MEASURED on two
+  real consoles, 2026-08-19, in six physical states
+  (`04_MY_PROJECTS/hw_test_link_suite/result/RELEVE_2026-08-19.md`):
+
+  | peer at the other end | bit2 |
+  |---|---|
+  | nothing · cable with the far end loose · console **switched off** · console **sitting in the BIOS** | **1** = no peer |
+  | console running a cartridge that opened its serial port | **0** = peer present |
+
+  A powered console at the BIOS, cable plugged in, **does not register**. The core
+  used to derive this from `serial_link_enabled`, i.e. from the host attaching a
+  cable, so a game saw a peer where silicon sees none. It now reads
+  `serial_cts_high` — the peer's RTS, crossed by the bridge — guarded by
+  `serial_cts_seen`, because that flag's default means "peer ready" for the
+  transmitter's sake and a lone cabled console would otherwise report a peer
+  (`B1=0x02` where silicon reads `0x07`; SNK Gals' Fighter reports a link error on
+  exactly that).
+
+  🔑 Two behaviours come free with the right signal: a merely-powered peer no longer
+  registers, and **unplugging mid-session becomes visible to the game**. That is how
+  Match of the Millennium raises its own `LINK ERROR` on hardware — the wire itself
+  recovers (bit2 goes 0 → 1 → 0 and bytes flow again), but the GAME's state machine
+  treats the cut as fatal. Our peer-loss handling was entirely host-side precisely
+  because the game could never see the cut.
+
+- Other port bits, same measurement: `B3` bit2 reads 1 on every console (the whole
+  byte is `0x04` on one machine and `0x07` on another — a per-CONSOLE constant, not
+  the cable, and it does not move when a peer appears); `B6` = `0x05` and `BC` =
+  `0xFE` at reset; `SC0CR` bit 7 is a **latch**, `0x00` until any byte has ever
+  crossed and `0x80` for ever after, surviving an unplug; `BR0CR` reads back with
+  bit 6 set whatever is written (`0x05` → `0x45`).
 - **Flow control.** Our RTS = 0xB2 bit0 (0 = ready to receive). The peer's RTS
   drives our CTS0 pin, which halts our transmitter when the game set
   SC0MOD<CTSE>. **CTS gates the START of a byte, never one already going out**
@@ -124,6 +152,57 @@ Two consequences that are easy to get wrong:
 
 `core.link.run_two_consoles_interleaved` is the same loop, shared with mirror netplay,
 which owns two consoles for the same reason.
+
+**And because that loop refuses to drive a paused peer, pause and speed are NOT
+per-window.** The refusal is deliberate — a console must stay where the user put it —
+but it means a one-sided pause leaves the OTHER console running against a partner that
+has stopped answering, until the game's own link protocol times out. It reads as a link
+failure, not as a pause. So `PlayPage._link_both()` applies pause, speed and
+fast-forward to `_link_peer` too, from either window; the propagation lives there and
+nowhere else (the `_apply_*` helpers never mirror in turn, so no loop is possible).
+Every path that pauses needs a matching wake-up, and the one that is easy to miss is
+`_on_menu_choice` leaving the pause menu for Video/Audio/Controls: it does **not** go
+through `close_menu` — it stays paused on purpose and returns via `resume_play`.
+
+🔑 **Mirror netplay is deliberately excluded.** There both consoles run on both PCs from
+one shared input stream, and `MirrorSession.step()` returns `"waiting"` until the peer's
+input for THIS frame has arrived — so neither PC can run ahead whatever its speed dial
+says. Already self-limiting: nothing to propagate, nothing to refuse.
+
+### Finding the peer — the session above the transport
+
+`TcpLink` is the transport; the rendezvous is a layer above it, in the shell, and that
+is where a reported *"direct host/client mode never seems to actually get through"*
+actually lived. Three properties it must have, each of which it once lacked:
+
+- **The wait is bounded** (`_NetConnect.HOST_TIMEOUT_S` / `JOIN_TIMEOUT_S`). The host's
+  `accept()` had no timeout at all, while the joining side did.
+- **The wait is interruptible.** `accept()` waits in `POLL_S` slices on a `select()` so a
+  cancel lands within a quarter second, and `cancel()` is reachable from the 🔗 menu and
+  from closing the host panel. ⚠️ Guard the **accept** as well as the select: a socket
+  closed under a `select()` is reported *readable*, so the accept that follows raises
+  `WSAENOTSOCK` — and a cancel the player asked for comes back as an error message.
+- **Nothing is refused in silence.** `_start_net` returns a bool and its callers honour
+  it: `_mirror_pending` must be armed only after a real start, or an earlier CABLE
+  attempt still in flight connects and silently opens a MIRROR session instead.
+
+⚡ **Joining retries** rather than failing on the first `ECONNREFUSED`: being the first of
+the two to be ready is the normal case, not an error.
+
+Two lifetime rules that Qt punishes hard:
+
+- **A cancelled worker keeps its Python reference until it has really stopped**
+  (`_net_retiring`). Dropping the last reference to a running `QThread` destroys the C++
+  object under the OS thread still inside it, and `~QThread` answers "Destroyed while
+  thread is still running" then `terminate()` — the same hard death the root `conftest.py`
+  documents. `cancel()` is not instantaneous: a blocking connect holds for its slice.
+- **Signals are identified by their sender, not by a flag.** `connected` is queued, so one
+  emitted just before a cancel is delivered *after* it — and both `QMessageBox.question`
+  and `QMenu.exec` run nested event loops in which it can land mid-decision.
+  `_from_current_worker()` compares `sender()` to `_net_thread`. A boolean "abandoned"
+  flag does **not** work: the next attempt resets it, and the cancelled worker gets in.
+
+Covered by `tests/test_link_direct_connect.py` (31 tests).
 
 ⚠️ `TcpLink` writes with `send()` plus a pending buffer, **never `sendall()`**: on a
 non-blocking socket `sendall` raises `BlockingIOError` the moment the kernel buffer
@@ -421,10 +500,64 @@ constant's comment in `cpp/src/machine.hpp` as well.
 This also independently confirms two things the core already modelled: **CTSE is bit 6 of
 SC0MOD and exists only on channel 0**, and **UART framing is 8 bits with 16x oversampling**.
 
-⚠️ Still not established by this: that real silicon *honours* those numbers. Everything here
-is documentation plus register values our own emulator observed. The hardware probe in §2.1
-remains the only way to close that last step — but the value it would check is now a
-prediction with a derivation behind it, not a constant taken on trust.
+✅ **CLOSED ON SILICON, 2026-08-19.** The probe ran on two real consoles
+(`04_MY_PROJECTS/hw_test_link_suite`). Saturated one-way transfer carried **3875 bytes in
+128 frames** = 2133 ms, i.e. **551 µs per byte** against the 520.83 µs derived here — the 6 %
+sitting on the slow side, where the software feeding the ring can only put it. And
+reprogramming `BR0CR` to `0x15` gave **983 bytes against 3963**, a ratio of **4.03** where the
+φT0 → φT2 step predicts exactly 4.
+
+⇒ **`kSerialByteCycles = 3200` and `serial_byte_cycles()` are both confirmed by measurement**,
+not merely derived. The one thing this project had never checked on hardware, and it holds.
+
+## 2.2b 🧭 THE GAP, DECOMPOSED — two independent axes (2026-08-20)
+
+Put every probe counter in **byte times** (the window is 128 frames = 4099 byte times of
+3200 cycles) and the whole file finally reads straight:
+
+| | silicon | here |
+|---|---|---|
+| one-way stream | **1.03** byte times per byte | 1.10 |
+| round trip, roles A/B | **3.74** | 5.35 |
+| **CPU** cost of one received byte | **93 µs** | 48.9 |
+
+⚡ **The two axes are independent, and that is measured, not argued.** Dropping the
+receiver's double charge moves the round trip (766 → 1285) and changes the CPU cost by
+**nothing**: 48.9 → 48.8 µs, on a 120-frame average over thousands of bytes.
+
+- **WIRE AXIS** — the double charge delays delivery. Round trip **43% too slow**; without
+  it, **17% too fast**. No CPU effect whatsoever.
+- **CPU AXIS** — receiving a byte is **1.9x too cheap**. Untouched by anything shipped so
+  far.
+
+🔑 **And 1.9 is exactly what the unit defect predicts** (Toshiba states billed as cycles,
+a factor of two — `PERF_TIMING_POLICY.md §9ter`): the receive path is BIOS code. Two
+measurements with nothing in common land on the same number.
+
+⇒ **They are fixed together or not at all.** The wire axis speeds the round trip up, the
+CPU axis slows it down; treating one alone MOVES the error instead of shrinking it. That
+is the whole history of this file since 2026-08-19.
+
+### ✅ The link is FULL DUPLEX on silicon
+
+Test 1 is "SPEED BOTH WAYS" and the console runs it at **3963** bytes a window against
+**3818** one way. Both directions at once cost nothing. A half-duplex model was built and
+measured (`Machine::rx_blocked_by_tx`, default **false**): throughput collapses to **153**
+bytes, 26.8 byte times each. Refuted.
+
+### ⛔ Never model from the A/A pattern
+
+The half-duplex idea came from "silicon gains nothing from two tokens in flight while we
+halve". **Both halves were wrong.** That pattern is both consoles left on **role A**, where
+**neither echoes** — each mistakes the peer's ping for its own reply. It is not a round
+trip at all.
+
+⚠️ The probe ROM says so itself, in a comment written after six runs came back
+photographed on role A: *"Role B's TRIPS is 0 when the roles are set correctly and NON-ZERO
+when both consoles were left on role A — the only thing that tells the two apart
+afterwards."* Read that witness before quoting any round-trip number. With the roles
+actually set, our two patterns give 766 and 771 — **the same**, exactly like silicon. The
+halving never existed; it was a badly driven run.
 
 ## 2.3 End-to-end alignment check (2026-08-03)
 
@@ -532,6 +665,209 @@ names the EARLIEST stuck stage: no cable → total silence → held by peer CTS 
 held by our own RTS → arrived but no INTRX0 → INTRX0 but never read (and, at
 interrupt mask level 6, why: `COMOFFRTS` does `ei 6`) → nothing shifted out →
 flowing.
+
+## 3.1 Keeping: `ngpc_link_state` (read **and** write) — ABI 16
+
+`ngpc_serial_state` above is the door for **looking**. It is read-only by design,
+and that was the whole hole: a save state was the CPU struct, the aux block and the
+memory image, and the cable is in **none of the three**. Its FIFOs, its shift
+register and its handshake pins live in `Machine`, so restoring a state taken
+mid-transfer was a **no-op on the channel**.
+
+⛔ MEASURED 2026-08-04. Captured at `rx_depth=2`, ran 30 frames to `rx_depth=3`,
+restored — every field stayed at the post-30-frame value. And two re-simulations
+from the "same" restored state diverged **by one cable byte inside 60 frames**.
+That is a desync, not a rounding error. Reachable wherever F2 and the rewind ring
+are live in a cabled session (local 2P, direct-IP; mirror refuses them for its own
+reason), and a prerequisite for any rollback — rolling back two consoles means
+restoring the bytes *in flight between them*.
+
+`ngpc_link_state_t` / `core.native.LinkState`, via `ngpc_get_link_state` /
+`ngpc_set_link_state`:
+
+- the channel: `link_enabled`, `tx_busy`, `tx_shifting`, `tx_byte`, `cts_high`,
+  `rx_pending`, `rx_byte`, the signed baud countdowns `tx_cycles`/`rx_cycles`
+- the FIFOs: `tx_fifo`/`rx_fifo`, `NGPC_LINK_FIFO_MAX` = 1024 bytes each, with
+  `tx_len`/`rx_len`
+- the §3 counters, so a restore does not leave the Link tab reading somebody
+  else's totals
+
+Rules, and each one is load-bearing:
+
+- **its own versioned block, not more fields in `ngpc_aux_state_t`.** That struct
+  is the sound CPU, the T6W28 and the timers; the cable is none of those. And
+  growing it would have silently shifted the memory image inside **every
+  `NGPCST02` save state a player already has**
+- `version` + `size` are written by the getter and CHECKED by the setter: a blob
+  from another build is REFUSED (`-1`), never half-applied
+- **restore it AFTER the memory image**, like the aux block: `SC0MOD`/`BR0CR` live
+  in the image and decide how fast a byte shifts
+- **`overflow` means the snapshot is inexact.** The in-process bridge drains every
+  pump (depth 2–3 with the probe ROM), but a socket bridge hands over whatever a
+  network burst delivered, so the receive FIFO has no natural ceiling. The getter
+  **clamps and raises `overflow`** rather than truncating in silence — a caller
+  that sees it must not pretend otherwise
+- **NOT saved, on purpose:** `serial_byte_cycles()` is COMPUTED from `SC0MOD`/`BR0CR`
+  (§2.2), which come back with the image. A saved derivation that disagreed with
+  its source would be worse than none
+
+The player-facing format is `NGPCST03` — see `SAVESTATE.md` §8b, which also lists
+the three readers that must learn each new generation together.
+
+## 3.2 Waking the host: `ngpc_set_serial_break` — ABI 17
+
+A host bridging two machines has to relay bytes, and until now it had no way to
+know **when**, so it polled: pump the cable every N instructions, N picked for the
+worst known game (400, because The Last Blade breaks past it). That number is cable
+time measured in *instructions*, and it is the wrong unit — the core already counts
+the real one (§2.2: `serial_tick` knows the exact cycle a byte finishes shifting,
+because it computes the byte time from `BR0CR`/`SC0MOD`). It simply never told
+anyone.
+
+Armed, `ngpc_run` returns `NGPC_SERIAL_EVENT` (status **42**,
+`core.native.STATUS_SERIAL_EVENT`) the moment something crosses:
+
+- a byte finished shifting out and is now in the transmit FIFO, **or**
+- this machine's RTS changed — it drives the peer's CTS, and the peer's handshake
+  stalls until it is relayed. Card Fighters' Clash lives on this one, and a host
+  that only woke on *bytes* would leave the peer waiting against a handshake we
+  had already released
+
+The instruction in flight is **completed and counted first**, so the machine is
+always left on an instruction boundary: this is a **rendezvous, not a trap**, and
+the next `ngpc_run` resumes as if nothing had happened. `serial_event` is cleared
+on entry to every `ngpc_run`, so the question is asked fresh each call, and arming
+clears it too — the first run afterwards answers only for its own traffic.
+
+⚠️ **OFF by default, and not used by the shell.** Every existing caller keeps its
+exact behaviour; the relay still polls. This is the prerequisite for "the pair and
+the cable in the core" in `LINK_NETPLAY_STUDY.md` §6, not that step itself.
+Covered by `tests/test_link_serial_break.py`.
+
+### ⛔ It does NOT replace `LINK_SLICE`, and that was measured
+
+The obvious next move — arm the break, drop the shell's 400-instruction quota, stop
+guessing — is **wrong**, and it is worth writing down because the reasoning for it is
+sound right up to the point where it fails. MEASURED 2026-08-14.
+
+`LINK_SLICE` does **two** jobs. The break does one of them:
+
+| | slice | break |
+|---|---|---|
+| relay the cable promptly | approximate | exact |
+| advance BOTH consoles in small steps | guaranteed | **cannot** |
+
+The break fires on *our* transmit and *our* RTS. A console that is quietly computing
+emits no event, so it runs to the end of its frame — and the peer has not run at all
+meanwhile. Step size per `run()` call, same harness, 120 frames:
+
+```
+slice 400    every step 400 instructions,  0 of 4901 steps >= 0.8 frame
+break, free  median step 6263 (A WHOLE FRAME), 242 of 484 steps >= 0.8 frame
+```
+
+That is exactly the "a frame each, then relay" scheduling that `_run_frame_interleaved`
+exists to replace, and which the Card Fighters' Clash bench scores **2 of 5** against
+**5 of 5**. Note the trap in the first measurement that suggested this: a probe ROM that
+transmits constantly stops constantly, so it *looks* fine — the granularity is a property
+of how often the GAME talks, which is not a guarantee at all.
+
+Keeping the cap **and** arming the break is safe and buys nothing: 20 544 FFI calls
+against 19 164, the same wall time to two decimals, and cable throughput identical
+either way (1.7 bytes/frame on the probe ROM). The relay was never the bottleneck —
+two consoles cost 2× by construction, the slicing on top is 6%, and that leaves ~880
+emulated fps on a 2026 desktop, 14.7× realtime.
+
+## 3.3 The pair itself: `ngpc_run_linked` — ABI 18
+
+⚡ **BOTH CONSOLES AND THE RELAY, INSIDE THE CORE.** §3.2 gave the core a way to hand back
+the moment the cable moves; this gives it the pair. The host used to own the schedule: run
+console A for a slice of INSTRUCTIONS, cross the FFI boundary, move the bytes, run console
+B for a slice, cross back. An instruction count is not cable time, and §4/L3 of
+LINK_NETPLAY_STUDY.md found the same answer in every emulator that shipped a working
+serial link (TGB Dual, BizHawk/DualGambatte, mGBA's lockstep): both consoles and the cable
+belong in the core, paced by the hardware's own serial clock.
+
+The rule has two halves, and the second one is a CLOCK rather than a count:
+
+1. always advance whichever console is **behind in cycles**, in steps bounded by a
+   fraction of the cable's own byte time — `serial_byte_cycles() / 8`, which is 400
+   CYCLES where the host-side slice was 400 INSTRUCTIONS, roughly ten times coarser and
+   in the wrong unit;
+2. and relay the moment either console reports the cable moved (§3.2's break, armed for
+   the duration of the call and restored afterwards).
+
+⛔ **NEITHER HALF WORKS ALONE, and §3.2 already recorded why the event does not: it fires
+on what WE send, so a console that is quietly computing says nothing and runs to the end
+of its frame while its peer has not run at all.** The cycle cap is what makes progress
+unconditional; the event is what makes the relay exact.
+
+### The lag is measured WITHIN the call — a bug worth keeping written down
+
+The first version compared the two machines' **lifetime** cycle counts, which looks
+equivalent and is not. The two consoles drift apart OUTSIDE this function: the shell runs
+one alone whenever its peer is paused, rewinding or already holds queued frames, and a
+restored save state moves one wholesale. After that, the console that was "behind" ran its
+whole frame first while its peer stood still — precisely the latency the interleaving
+exists to remove, reappearing only SOMETIMES, according to how the frame pacer had batched
+its work.
+
+📏 **MEASURED**, drifted pair, one linked frame: gap **102 487 cycles** against a frame of
+**102 485** — a whole frame, to the cycle. Counting from zero at each call: **77 cycles**,
+and the same at every drift tested (0, 1, 5, 20, 100 frames).
+
+🔑 **The player found this before any test did**, and the shape of the report is what
+identified it: *"it does not crash in the same place or the same way twice — white screen,
+frozen screen, a character select that never ends."* **A deterministic core that fails
+differently each run is deciding on something outside itself.**
+
+### ⚠️ Totals cannot measure interleaving — `ngpc_link_pair_max_gap`
+
+The obvious assertion — compare the cycles each console consumed during the call — passes
+either way: **a whole frame each, in sequence, costs exactly the same cycles as taking
+turns**, while leaving one console frozen throughout the other's frame. The first test
+written for this bug was green against it. What discriminates is the widest gap that opens
+DURING the call, which is why the core exposes it.
+
+### The relay rule, settled by measurement
+
+`relay_pair` pushes bytes **unconditionally**, and does not gate on the receiver's RTS.
+Two rules existed in this project and disagreed: the shell's local two-player path and the
+Android front end push unconditionally (serial_tick is the real gate; holding back here
+can strand a handshake byte and read to the game as "no cable"), while
+`InProcessLink._relay` gates. Project memory recorded that as unsettled, so it was not
+inherited: measured on the probe ROM, 300 frames, both rules give `767 / 767` bytes with
+the same last byte and the same wire counts. ⚠️ That established **no regression**, not
+equivalence — the probe drains constantly, so it never exercised RTS back-pressure.
+
+### ✅ NOW SETTLED, and against gating (2026-08-20)
+
+The question was re-opened for a good reason: on silicon the receiver's RTS drives the
+sender's CTS, so a held byte is **never put on the wire**, and when RTS drops the sender
+still has to shift it out — a whole byte time this core skips by pushing early. And
+`rts_hold_ticks` runs to ~18 000 a round-trip run, so the gate is engaged constantly.
+
+A knob was added to try it (`Machine::relay_gates_on_rts`, default **false**). Measured
+against silicon on the round-trip and throughput tests:
+
+| | débit (bytes/window) | byte times per byte | round trip A/B |
+|---|---|---|---|
+| **silicon** | **3963** | **1.03** | **1095** |
+| unconditional (shipped) | 3730 | 1.10 | 766 |
+| gated on the receiver's RTS | **2750** | **1.49** | 766 — *unchanged* |
+
+⇒ Gating **costs a third of the throughput and does not move the round trip by one unit**.
+Whatever the missing cost is, it is not the byte waiting for the gate to open. The
+unconditional rule stays, now on evidence rather than on inheritance.
+
+### Who still uses the host relay, on purpose
+
+- an armed **link monitor** (`core/link_debug.py`) — it records, delays, drops and injects
+  bytes from Python, and a relay inside the core cannot call it;
+- a **net link** — that relay goes to a socket, not to the console beside it;
+- `NGPCRAFT_HOST_RELAY=1` — the A/B switch (`core.link.host_relay_forced`). When a link
+  game misbehaves, "does the old scheduling still do it?" must be answerable without a
+  rebuild. That is how the regression above was pinned on this change in one test.
 
 ## 4. Instrumentation: `core/link_debug.py`
 

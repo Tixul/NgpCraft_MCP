@@ -193,6 +193,45 @@ Et le **K2GE Tech Ref, §4-5-2** :
 ⇒ TI0 ne pulse que sur les **152 lignes VISIBLES**, pas sur les 198 d'une trame.
 Corrigé (ce cœur comptait les 198 : trente pour cent de ticks en trop).
 
+# 9ter. ⛔ ET CE N'EST PAS LE RÉSIDU DE TEMPS — mesuré 2026-08-21
+
+Le coût manquant du micro-DMA était le dernier candidat identifié pour l'écart de temps
+du chemin série (le CPU y est ~2× trop bon marché). **Éliminé par la mesure** :
+`DMA0V..DMA3V` (0x7C..0x7F) sont **relus à zéro en permanence** — après le boot BIOS, dans
+le menu, pendant la phase muette et pendant la réception d'un flux d'octets.
+
+⇒ **Aucun canal n'est jamais armé, pas même par la couche COM du BIOS.** Le §10 disait
+qu'aucun jeu du corpus n'écrit `DMA0V` ; c'est maintenant vérifié pour le BIOS aussi, sur
+le chemin qui comptait. Le coût manquant reste un vrai défaut de fidélité — il n'explique
+simplement **rien** de l'écart de temps.
+
+---
+
+# 9bis. ⛔ LE TRANSFERT EST GRATUIT CHEZ NOUS — la datasheet le facture
+
+`Machine::micro_dma_service` déplace l'octet et rend la main **sans facturer un seul
+cycle**. La fiche TMP95C061B, détail des registres de mode (p. 27), donne le coût :
+
+| mode | états | ⇒ cycles (1 état = 2 périodes de `fc`) |
+|---|---|---|
+| transfert octet / mot | **8** | 16 |
+| transfert 4 octets | **12** | 24 |
+| mode compteur | **5** | 10 |
+
+⚠️ Ce n'est pas du temps « en plus » : le micro-DMA **vole le bus au CPU**. Ne rien
+prélever fait tourner tout jeu qui s'en sert plus vite que le silicium.
+
+**Non corrigé volontairement.** Le micro-DMA touche beaucoup de jeux et le corpus n'a
+jamais bougé dessus ; on ne lâche pas un coût nouveau à l'aveugle. Avant de l'appliquer :
+identifier au moins un jeu où il tourne réellement, mesurer, puis passer le corpus A/B.
+
+⚠️ Et attention au piège d'unité : nos gestionnaires d'instructions facturent des **états
+comptés comme des cycles** (voir `PERF_TIMING_POLICY.md §9ter`). Facturer le micro-DMA en
+cycles vrais pendant que les instructions sont en demi-états créerait une incohérence de
+plus. **Les deux se règlent ensemble ou pas du tout.**
+
+---
+
 # 10. ⚠️ CE QUI RESTE OUVERT — et pourquoi je ne devine pas
 
 Le micro-DMA est implémenté, correct et sourcé. **Le corpus n'a pas bougé d'un

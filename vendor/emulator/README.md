@@ -177,6 +177,7 @@ so games run, save and link out of the box.
 | 2-player link cable | ✅ real ring driver, same byte rate | ✅ |
 | Clock / RTC / alarm | ✅ incl. *Set by hand* | ✅ + the BIOS setup screen |
 | Library covers | ✅ | ✅ |
+| System font (SYSFONTSET) | ✅ ours, corrected 30/08 — it was unreadable before | ✅ the console's own |
 | NEO·GEO POCKET intro, setup screens | ❌ deliberately skipped | ✅ |
 | Console settings kept in the coin cell | via the emulator's settings | ✅ its own screens |
 | A game that reads BIOS work RAM directly | ⚠️ sees ours, not SNK's | ✅ |
@@ -496,6 +497,24 @@ timers, for instance). Pull one
 and you would have a console that runs its first-boot setup while still insisting it knows the
 date, which is why the reset below clears both.
 
+**Two-player on one PC is two consoles, and two consoles cannot share one battery.** Player 2
+boots from your configured cell — same language, same date, which is what somebody with two
+consoles would have — but it is **read-only** for it: player 2 never writes the cell back, so
+closing its window cannot stamp its clock over yours. Its crystal also runs on its own
+sub-second phase: both consoles used to come up with a bit-identical clock down to the
+oscillator's own phase, which is not a machine that ever existed — on hardware two coin cells
+never share one. A game seeding on the *second* alone can still see both consoles agree about
+half the time; giving player 2 a genuinely separate date would mean a second saved cell, which
+is deliberately not done.
+
+⚠️ This was found while chasing a homebrew author's report of a link game electing **two
+hosts**, on the theory that an identical clock gives both consoles an identical random stream.
+**That theory is not established** — the author reports their RNG does diverge between the two
+windows, and their own handshake has a sufficient bug of its own (it compares its current draw
+against the peer's previous one, so the two consoles weigh different pairs). What is fixed here
+is the shared cell, which is a fidelity and save-safety defect on its own terms and was
+measured directly. Do not cite it as the cause of that report.
+
 The clock **runs while you play** and, by default, **keeps running while the emulator is
 closed** — shut it for three days and the console comes back three days later, exactly as the
 coin cell does on hardware. Choose in **Settings ▸ Console (BIOS) ▸ "Clock while the emulator
@@ -565,7 +584,10 @@ player toolbar's **🔗** button:
 
 - **Two players — this PC** — opens a second window. Player 2 loads their **own** cartridge
   (its flash save loads normally); each player has their own controls (keyboard or pad),
-  routed by player regardless of which window has focus.
+  routed by player regardless of which window has focus. **Pause, speed and fast-forward
+  apply to both consoles**, from either window: they are wired together, and a console left
+  running against a partner that has stopped answering makes the *game's* link protocol time
+  out, which reads as a link failure rather than as a pause.
 - **Online lobby…** — connect to a lobby server, set a nickname, and **create** or **join**
   a game (public, or private with a password). The list shows each game's title, server
   name and creator. When you create one you also pick **which link it is for** — the
@@ -577,17 +599,38 @@ player toolbar's **🔗** button:
   be reachable (port-forwarding, or a zero-config option like **Tailscale**/**playit.gg**).
   The host dialog auto-detects your public IP, gives a ready-to-share line, and **explains
   the risks of opening a port** honestly.
+
+  Whoever is ready first simply waits: **joining retries** until the host clicks Host, so the
+  two of you do not have to press within the same instant. The wait is bounded and can be
+  taken back at any time — **✖ Cancel the pending connection**, at the top of the 🔗 menu
+  while an attempt is running, or just close the host panel. And when it does not work, the
+  message says *which* thing failed — nobody listening, a name that does not resolve, a port
+  already taken, a firewall — instead of an error number.
+
+  ⚠️ **If nothing gets through at all, it is almost never the emulator: it is the inbound
+  connection.** Behind a router with no port forward — or behind carrier-grade NAT, where no
+  forward is even possible — nothing can reach you, whatever you click. Use the **online
+  lobby** instead: it relays through the server, so it needs no port forwarding and no public
+  address. Think of direct mode as the LAN/Tailscale option.
 - **🪞 Mirror play — host / join** — the *other* online mode, for when your ping is the
   problem (also reachable from the lobby above, as a 🪞 room). Instead of sending the cable's bytes, each PC runs **both** consoles and only
   the **controller bytes** cross the network, so the cable is local and the delay is spent
-  on slightly late controls rather than on the speed of the game. Both players type the
-  **same input delay** (roughly ping-in-ms / 17, plus one). The two consoles swap their
+  on slightly late controls rather than on the speed of the game. **Only the host picks the
+  input delay** (roughly ping-in-ms / 17, plus one); whoever joins takes the host's, so
+  there is no number for two people to get wrong. Hosting shows you your own address, the
+  same panel as the direct cable mode. The two consoles swap their
   cartridges when the session opens — a few MiB, once, with progress on screen — so you
   may hold **different games and different saves**, exactly like two people with two
-  cartridges. What must match is the **BIOS and the emulator build**, because those
+  cartridges. Your own settings travel with your console too (cartridge language, NGP or
+  NGPC, flash size), so the other PC mirrors *your* machine rather than rebuilding it from
+  theirs. What must match is the **BIOS and the emulator build**, because those
   decide how the code runs; it refuses to start otherwise, since a mismatch does not
   fail loudly, it drifts. Savestates, rewind and reset are refused during a mirror match
   for the same reason.
+
+  ⚠️ **"Same build" means the same .exe on both PCs** — compare the file's date, not a
+  version shown anywhere. The check behind it inspects the emulation core, and two builds
+  can share a core while differing elsewhere: they will accept each other and fail anyway.
 
 Both players must run a **compatible game** (same title), exactly like real hardware.
 
@@ -632,6 +675,15 @@ If a game refuses to see the other console, the debugger's [**Link** tab](#link-
 (`F1`) shows the cable byte by byte and names the end that is at fault — and can drive the
 serial path with **one** console, so you can test without a partner.
 
+**Writing a link game?** Two symptoms look like emulator faults and are not. *Both consoles
+claiming to be player one* is your own role election, decided above the cable — the console
+is a UART with no master, so nothing in the hardware breaks the tie for you. And *the ball
+jumping backwards* when a game hands authority over an object between consoles is a protocol
+without a step number: each side keeps applying the peer's last known state, which is its own
+state from a few frames back. The link is asynchronous by design and the two consoles are
+never on the same frame — see the *Link Cable* page of the NgpCraft dev reference for the
+role rule and for input lockstep, which removes the handover problem rather than managing it.
+
 ## Timing — wait states, and the default that catches embedders
 
 The cartridge flash is **slow**, and on this console that is not a detail: every instruction
@@ -646,10 +698,43 @@ numbers are in [`hw_calibration/`](hw_calibration/README.md).
 
 | Knob | Ships as | Where it comes from |
 |---|---|---|
-| `cart_wait` — cycles per **instruction-fetch** byte off the cart | **3** | `cpu_calib_v1` on hardware: fetch-bound classes came back ~3.4× slower than this core, execution-bound ones ~2.5×, raster exact — the signature of a per-fetch-byte cost |
-| `cart_data_wait` — cycles per **data** byte read off the cart | **0** | `cpu_calib_v2`: a random cart read and a RAM read cost the same (252 == 252). Only fetch is wait-stated. An earlier guess of **5** was curve-fit to a frame rate and this ROM **refuted** it |
-| `ldir_cost` — cycles per byte of `LDIR`/`LDDR` | **14** | The datasheet says 7, but its MUL/DIV figures already proved to be floors. 14 puts Cool Boarders at its hardware 30 fps and leaves Fatal Fury at 60 — one fix, both games. Strongly evidenced, not yet pinned by a clean ROM |
-| `vram_wait` — cycles per byte written to display RAM | **0 (off)** | The K2GE throttle is **real**: `cpu_calib_v3` on silicon gave VWR 452 < MEM 471. The cost per byte is not pinned, so nothing ships a number rather than shipping a guess |
+| `fetch_wait_byte_q16` — cost of one **instruction-fetch byte**, in sixteenths of a cycle | **64** (= 4.00 cy/byte) | `cpu_calib_v14` page 1 measured it **directly**: 4.03 cy/byte on a line closing to 0.35 %. The cart bus is **8-bit**, so a fetch is priced per byte — charging per *word* made an instruction's price depend on its **parity** (5 bytes paid 3 charges from an even address, 2 from an odd one) and was what made this core address-sensitive where silicon is not (`cpu_calib_v12`: `682/682/683/682` on hardware) |
+| `branch_taken_extra` — cycles added to a **taken** control transfer, **cart code only** | **4** | `cpu_calib_v14` page 0, rotation C (branch taken on an *empty* queue, so no flush component): silicon 16.3 cy/branch against 11.3 here. ⛔ **The cart-only condition is measured, not stylistic**: this models queue *refill on the 8-bit cart bus*. BIOS and RAM are not on that bus and their fetch is billed zero here, so charging them a refill they never pay over-billed every interrupt (which goes through the BIOS dispatch). Conditioning it cut the corpus from 0.67 % to 0.59 % |
+| `data_access_cycles` — cycles for one **data** memory access, **cart code only** | **4** | `cpu_calib_v15` pages 1-2: ~4.05 cy **per access**, identical for reads and writes, and **independent of width** — a 1-byte read and a 2-byte read cost the same (215 vs 216 counts). An earlier per-**byte** form, fitted to the single width v14 had measured, was **refuted** by this ROM. ⛔ **The cart-only condition is measured** (`data_wait_cart_only`, 2026-08-29): the corpus's `MEM` loop *requires* these 4 cy (silicon 65.3 cy/iteration, 62 without / 66 with) while the interrupt path *refuses* them (silicon 111.5, 114 without / 130 with) — and **both write to RAM**, so what separates them is the region of the **code**, not of the data. Mechanism: this is bus **contention** — the data access steals a bus cycle from the prefetch — so it can only bite where the fetch is expensive, i.e. the 8-bit cart bus. Same rule and same reason as `branch_taken_extra` |
+| `cart_data_wait` — *extra* cycles for a cart data byte, on top of the above | **0** | `cpu_calib_v2`: a random cart read and a RAM read cost the same (252 == 252). ⚠️ That proves they are **equal to each other**, never that they are free — and v15 has since priced both at 4 cy/access |
+| `mul` / `div`, **byte** form | **12 states / 32 cycles** | `cpu_calib_v14` pages 3-4, lines closing to 0.5 %. Both land just above the datasheet floor (11 and 15 states) — consistent with variable latency |
+| `mul` / `div`, **word** form | 19 states / 56 cycles | ⚠️ **No single constant can be right.** Three silicon-backed authorities give three numbers: Appendix B table (4) **14 / 23 states**, `cpu_calib_v17` (marginal slope) **17 / 52**, the corpus (loop level) **19 / 56**. That is not a contradiction — the 900/L1 divide has **variable latency**, the table is a *floor*, and the two ROMs divide **different operands**. The corpus value ships; re-deriving from v17 and arming it puts `MUL` at **+6.1 %** |
+| interrupt entry (`kIrqDeliveryCycles`) | 18 states (36 cy) | `cpu_calib_v8`, and **cleared** by v18: a `nop` inside an ISR costs 4.03 cy (same as outside), so the handler's code is billed correctly and the entry was never the suspect. Appendix B table (11) gives **18 states**, `JP (FFFF00H + vector)` included — a single value, not the 28/24/22/18 set quoted elsewhere |
+| `irq_transparent_queue` — an interrupt is **transparent** to the interrupted stream's bus state (queue/debt saved on delivery, restored on `reti`) | **on** | `cpu_calib_v19` (silicon, 2026-08-29). Without it the ISR's cycles **refill the interrupted code's queue**, so an interrupt made the interrupted code *cheaper* (−0.574 cy/instruction) — impossible, since during the ISR the bus is fetching the ISR's own bytes. ⚡ v19 measures the per-interrupt cost against how bus-bound the interrupted loop is: **112.6 / 112.0 / 110.7 / 110.5**, contrast **+1.5**, where both overlap models predicted **+18.0** and **+11.6**. Armed, our contrast is **−1.2**. ⛔ And `branch_taken_extra` is **not** charged on a transparent `reti`: it models queue *refill*, and a restored queue is not refilled |
+| `ldir_cost` / `ldirw_cost` — per iteration of the byte / word block copy | **14 / 14** | `cpu_calib_v20` and `v21` on silicon: a `ldirb` **and** a `ldirw` both cost **14,0x cy per iteration** RAM→RAM — exactly Appendix B (3), `7n + 1` **states**. ⚠️ Our long-standing **18** was not wrong, it was **mis-attributed**: fitted against Bomberman's HiColor copier, which copies **ROM → VRAM**, it carried 14 (the instruction) **+ 4** (the price of reading its source over the cart's **8-bit** bus). Applying it to every transfer made us **29 % too expensive** on any RAM→RAM or RAM→VRAM copy — most of what games do |
+| `block_cart_src_per_byte` — extra cycles per byte a block transfer reads **from the cart** | **2** | `cpu_calib_v21`, four paths of the same `ldirw`: RAM→RAM **14,04**, RAM→VRAM **14,12** (the destination costs **nothing**, +0,08), ROM→RAM **18,16**, ROM→VRAM **18,16** — the **source** carries all of it, +4,12 per word iteration, and the two effects are **additive** (+4,20 predicted). ⛔ The **byte** form's 2 cy is *derived* from the word measurement (4 ÷ 2), not measured directly |
+| `vram_wait` — cycles per **data access** to display RAM **during active display**, **block copies excluded** | **10** | `cpu_calib_v3` on silicon: **VWR 452** against **MEM 471**. Shipped at 0 until 2026-08-30, where VWR read **503** (+11.3 %) — and worse, a VRAM write cost *less* than a RAM write, since VRAM is excluded from `charge_data_access`. ⚡ **Per ACCESS, not per byte** — `cpu_calib_v20` page 3, silicon: a word write and a byte write to VRAM both cost **2,95 cy** more than the same write to RAM, ratio **1,00**. v3 could not tell (it only writes bytes, where the two forms coincide). The two shots agree on the value (2,74 and 2,95 cy/write) ⇒ **10**, which balances both (v3 −0,9 %, v20 +1,3 %). ⛔ **Not charged during a block transfer** (`in_block_copy`), and `cpu_calib_v21` says why: on a block copy the **destination costs nothing at all** — RAM→RAM 14,04 against RAM→VRAM 14,12, a difference of +0,08. The K2GE throttle is real on an isolated write and simply does not bite there. (Billing it anyway made Bomberman's HiColor copier drift off its 4120-cycle slice and corrupt one line per band; `test_bomberman_hicolor_phase` catches it.) |
+
+**Where this lands.** Against 26 silicon measurements from five calibration ROMs, the model
+is at **0.18 % mean error, 0.77 % worst case** — every one of the 26 cells now under 1 %.
+Before this campaign: 4.78 % and 12.31 %. Re-run it with `python hw_calibration/corpus_gate.py`.
+
+⚡ **And the interrupt path now lands on the official tables to the cycle.** Appendix B for
+the full TI0 path — 18 states (entry) + 8 + 8 (`PUSH<W> (mem)` 6 + `(#16)` 2) + 9 (`ret`) +
+12 (`reti`) = **110 cy**; silicon measures **111.5**; this core spends **110.0** (direct
+sum over hundreds of interrupts, σ = 0). It used to spend 130, and *looked* right at 115 in
+throughput only because **+20 cy of double-billing and −17 cy of an impossible rebate
+cancelled out**. ⚖️ Two errors of opposite sign is why no single-knob sweep ever converged
+across two campaigns — each knob touched only one of them.
+
+⛔ **Two of these do not move alone.** Charging the fetch per byte *without* charging the
+taken branch makes the model **worse** (corpus 4.78 % → 7.13 %): the old 8.25 cy/word was
+over-charging the bus to make up for a branch that cost nothing.
+
+⛔⛔ **And a measured per-instruction cost already contains its own memory traffic.**
+`data_access_cycles` is charged in `load_sized`/`store`, so three paths must be excluded by
+hand or they are billed twice: **block transfers** (`ldir_cost`/`ldirw_cost` were measured
+against Bomberman's 4120-cycle slice — double-charging cost +43 % per block and shredded
+Cool Boarders' HUD), **interrupt entry** (Toshiba's 28/24/22/18 states are keyed on the
+*stack area's* bus width, so they already include pushing PC and SR), and the interrupt's
+**own vector read** — that last one was a real bug, billed to the first instruction of every
+handler until it was found by instrumentation. Only instructions whose price comes from a
+**table** may take a per-access cost on top.
 
 ### ⚠️ The application and the library do not start the same way
 
@@ -667,7 +752,8 @@ So anything measuring performance must ask for hardware timing explicitly:
 ```python
 m.set_cart_wait(cfg.CART_FETCH_WAIT)      # 3
 m.set_cart_data_wait(cfg.CART_DATA_WAIT)  # 0
-m.set_ldir_cost(cfg.CART_LDIR_COST)       # 14
+m.set_ldir_cost(cfg.CART_LDIR_COST)       # 14  -- byte block copies
+m.set_ldirw_cost(cfg.CART_LDIRW_COST)     # 18  -- word block copies
 ```
 
 (`core/romcheck.py` does exactly this; copy it rather than re-deriving the numbers.)

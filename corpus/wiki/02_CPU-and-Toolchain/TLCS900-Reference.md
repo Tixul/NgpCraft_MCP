@@ -1471,8 +1471,51 @@ own "CPU Core Different Points" table puts **900/H and 900/L1 in the same column
 every line, so these figures apply to the NGPC's TMP95C061 (900/H) as well. Notation is
 Toshiba's: `byte . word . long`, `−` = form does not exist.
 
-`1 state = 2 / f_FPH`. Register-register `LD` = **2 states** — the baseline everything
-else is compared against.
+### ⚙️ AND THE FETCH DOES NOT SIMPLY ADD — the bus unit runs ahead
+
+Before using the tables below to budget code, know how the chip actually spends the time:
+
+- **The external bus is 16 bits**, so an instruction's fetch costs one bus access per
+  WORD, not per byte. A 6-byte instruction is three accesses.
+- **The bus interface unit runs independently of the execution unit** (datasheet 3.3.1
+  notes), so a fetch OVERLAPS the instruction being executed. It is not added on top — the
+  CPU only stalls when the queue has run dry.
+- **The instruction queue is 4 bytes** (900/L1 manual, Table 1 "Differences between CPUs",
+  the feature list, and the note on `LDC` — three places). So the bus can run at most two
+  words ahead.
+- ⚠️ **A taken branch throws the queue away**: on this core, *jump address code is fetched
+  only when the branch condition is true* (Table 1). The 900H2 prefetches both ways; this
+  one does not.
+
+🔑 **What that means when you write code.** A long instruction hides its own fetch; a short
+one cannot. So a tight loop of 2-byte instructions is bus-bound while a stretch of 6-byte
+ones is execution-bound, and shortening code helps far more in the first case than the
+second. And an unrolled loop beats a tight one twice over — fewer taken branches means
+fewer queue flushes.
+
+### ⏱️ A STATE IS NOT A CLOCK TICK — it is TWO
+
+`1 state = 2 / f_FPH`, and on this part `f_FPH = fc`. So **one state is two periods of the
+6.144 MHz oscillator**, ≈ 325 ns. Confirmed twice, independently:
+
+- the 900/L1 CPU manual states the relation directly (this section's source);
+- the TMP95C061B datasheet prices a state at **80 ns at 25 MHz** (micro-DMA transfer-mode
+  table) while its §4.3 gives `tosc` = **40 ns** at that same clock. 80 = 2 x 40.
+
+⚠️ **This is the single easiest way to be wrong by a factor of two.** Every figure in this
+section is in states. To turn one into time, or into a budget against the 102485-cycle
+frame, **double it first**. Register-register `LD` = 2 states = **4 oscillator periods** —
+the baseline everything else is compared against.
+
+📄 **Where the numbers actually live.** Appendix B, "900/L1 Instruction Lists (1/10)"
+through (10/10), of the 900/L1 CPU manual — `Instruction / Codes / Function / Flags /
+Length (byte) / State`, in Toshiba's `byte. word. long` notation. In this project:
+`NgpCraft_toolchain/misc/Toshiba-TLCS-900-L-Resources-master/BMSKTOPAS91FY42 CD/Data
+sheets/900L1 Core (e_900l1_chap3_cpu) Datasheet.pdf`, pages 159-168.
+
+⚠️ **Use the PDF, not the .txt.** The text extraction of the catalogue drops Table 5.2's
+state columns entirely — a table that looks complete but has silently lost the column you
+came for.
 
 > ⚠️ **Always say which CPU variant a cycle figure comes from.** Toshiba shipped five
 > TLCS-900 cores (900, 900/L, **900/H**, 900/L1, 900/H2) and they are not interchangeable.

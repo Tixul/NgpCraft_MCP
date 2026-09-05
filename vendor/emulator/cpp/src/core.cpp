@@ -494,6 +494,17 @@ static bool deliver_irq(ngpc::Machine& m) {
         }
     }
 
+    /* Le bus a servi le transfert : cette duree existe pour la machine entiere, pas
+     * seulement pour le CPU. On l'avance comme l'entree en interruption juste apres. */
+    if (m.dma_cost_cycles) {
+        const uint32_t c = m.dma_cost_cycles;
+        m.dma_cost_cycles = 0;
+        advance_raster(m, uint16_t(c));
+        m.adc_tick(c); m.rtc_step(c); m.timer_tick(c);
+        m.serial_tick(c); z80_tick(m, c); m.apu.tick(c);
+        m.total_cycles += c;
+    }
+
     unsigned best_index = 0;
     uint8_t  best_level = 0;
     bool     found = false;
@@ -573,6 +584,11 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
     ngpc_summary_t s;
     std::memset(&s, 0, sizeof(s));
     s.stop_status = NGPC_COUNT_REACHED;
+
+    /* "Something crossed the cable during THIS call" -- so the question is asked
+     * fresh each time. Cleared even when nobody armed the break, otherwise the
+     * first armed call would answer for traffic that happened before it. */
+    m->serial_event = false;
 
     ngpc_record_t scratch;
     for (uint32_t i = 0; i < max_instrs; ++i) {
@@ -661,7 +677,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 continue;                              // resume inside the boot handler
             }
 
-            bool woke = false, wd_stop = false;
+            bool woke = false, wd_stop = false, ser_stop = false;
             for (unsigned line = 0; line <= kScanlinesPerFrame; ++line) {
                 advance_raster(*m, kCyclesPerScanline);
                 m->adc_tick(kCyclesPerScanline);
@@ -678,11 +694,30 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                     && note_watchdog(*m, s, pc_before)) { wd_stop = true; break; }
                 if (m->irq_pending && deliver_irq(*m)) {
                     ++s.irq_deliveries;
+                    /* Les memes gardes que l'autre point de livraison : le trafic de
+                     * l'entree est deja dans les 18 etats documentes, et le laisser
+                     * s'accumuler le ferait payer par la premiere instruction du
+                     * gestionnaire. ⛔ Ce site-la n'en avait AUCUNE -- deux chemins qui
+                     * livrent la meme interruption doivent la livrer pareil. */
+                    m->access_wait = 0;
+                    m->data_wait_cycles = 0;
+                    m->biu_debt = 0;
                     woke = true;
                     break;
                 }
+                /* A byte can finish shifting out while the CPU is parked on a
+                 * HALT, and its own INTTX0 may be masked -- so waiting for the
+                 * wake-up would hold the relay for the rest of the frame. Tested
+                 * after delivery: when both happen the interrupt wins and the
+                 * end-of-iteration test below picks the event up instead. */
+                if (m->serial_break_on_event && m->serial_event) { ser_stop = true; break; }
             }
             if (wd_stop) break;
+            if (ser_stop) {
+                s.stop_status = NGPC_SERIAL_EVENT;
+                s.stop_pc     = pc_before;   /* still parked ON the halt */
+                break;
+            }
             if (!woke) {
                 s.stop_status = NGPC_HALTED;
                 s.stop_pc     = pc_before;
@@ -705,12 +740,180 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         ++s.executed;
         if (want_record) ++s.emitted;
 
-        /* THE CART FLASH IS SLOW: fold in the wait-states this instruction paid reading
-         * the cart bus (fetch + data), accumulated in read8(). This is what makes cart
-         * code run at silicon speed instead of ~3.4x too fast (Machine::cart_wait,
-         * measured by cpu_calib_v1.ngc). Default cart_wait=0 leaves access_wait at 0. */
-        rec->cycles = uint16_t(rec->cycles + m->access_wait);
+        /* WHERE AN INSTRUCTION'S COST IS FINALLY SETTLED: its own cycles, scaled, plus
+         * whatever the bus made it wait -- `access_wait`, accumulated in read8().
+         *
+         * ⚡ AND THE BUS DOES NOT SIMPLY ADD. "The instruction execution unit and the bus
+         * interface unit of this CPU operate independently" (TMP95C061B 3.3.1 notes), so
+         * a fetch OVERLAPS execution: the CPU stalls only when the 4-byte instruction
+         * queue has run dry. That is the `fetch_pipelined` branch, and it is what lets a
+         * short-instruction loop and a BIOS-call loop agree at the same time -- adding
+         * the two costs could never satisfy both. `biu_slack` is how far ahead the bus
+         * may run, i.e. one queue: two 16-bit words.
+         *
+         * ⚠️ `base_scale` is here because Toshiba's per-instruction figures are STATES
+         * and a state is two of these cycles. See PERF_TIMING_POLICY.md §9ter for the
+         * whole model and the provenance of every piece.
+         *
+         * The else branch is the pre-2026-08-21 behaviour, kept because
+         * `NGPCRAFT_TIMING=legacy` and `cart_wait=0` (a fresh Machine) both need it. */
+        /* Le PC n'est pas tombe en sequence : le transfert de controle a ete PRIS. */
+        const bool branch_taken =
+            m->cpu.pc != ((pc_before + rec->raw_len) & ngpc::kAddrMask);
+        if (m->access_wait_q4) {
+            /* Quarts -> cycles entiers, la retenue passant a l'instruction suivante :
+             * c'est ce report qui rend un cout moyen fractionnaire possible sur une boucle. */
+            const uint32_t total = m->access_wait_q4 + m->fetch_wait_carry;
+            m->access_wait += total / 4u;
+            m->fetch_wait_carry = total % 4u;
+            m->access_wait_q4 = 0;
+        }
+        if (m->fetch_pipelined && m->queue_bytes && m->fetch_wait_byte_q16) {
+            /* ===== LA FILE, EN OCTETS. Voir `queue_bytes` dans machine.hpp. =====
+             * Trois pas, et aucun parametre libre : ce qui manque cale le processeur,
+             * l'instruction consomme ses octets, puis le bus recharge pendant qu'elle
+             * s'execute -- sans jamais depasser 4 octets ni un octet par 4 cycles. */
+            const int32_t base = int32_t(rec->cycles) *
+                (m->cycles_already_measured ? 1 : int32_t(m->base_scale));
+            /* Le prix de l'octet est celui de la REGION d'ou l'instruction a ete lue
+             * (cartouche ou BIOS) -- meme file, meme bus, tarif propre a chacun. */
+            const int32_t bc16 = m->fetch_bc16 ? m->fetch_bc16
+                                               : int32_t(m->fetch_wait_byte_q16);
+            const int32_t cap16 = int32_t(m->queue_bytes) * 16;
+
+            int32_t stall = 0;
+            m->dbg_q_in = m->q_sixteenths;
+            m->dbg_q_bytes = m->fetch_bytes;
+            const int32_t need16 = int32_t(m->fetch_bytes) * 16 - m->q_sixteenths;
+            if (need16 > 0) {
+                stall = (need16 * bc16 + 128) / 256;   /* octets manquants x cout */
+                m->q_sixteenths = 0;
+            } else {
+                m->q_sixteenths = -need16;
+            }
+            /* Le bus recharge pendant l'execution : e / cout_octet octets. */
+            if (bc16 > 0) m->q_sixteenths += (base * 256) / bc16;
+            if (m->q_sixteenths > cap16) m->q_sixteenths = cap16;
+            /* Un transfert bloc tient le bus tout du long : rien n'a ete prefetche
+             * derriere lui, il laisse la file VIDE (mesure : Bomberman, 4120 cy). */
+            if (m->block_drains_queue && m->block_transfer_ran) m->q_sixteenths = 0;
+            /* Un transfert de controle pris jette ce que la file contenait. */
+            if (m->flush_queue_on_branch && branch_taken) m->q_sixteenths = 0;
+
+            m->dbg_stall = uint32_t(stall);
+            m->dbg_aw = m->access_wait;
+            m->fetch_bytes = 0;
+            m->fetch_bc16 = 0;
+            rec->cycles = uint16_t(base + stall + m->access_wait);
+        } else if (m->fetch_pipelined) {
+            /* The BIU works through `access_wait` while the CPU works through the
+             * instruction's own cycles; only the shortfall stalls the CPU. */
+            const int32_t base = int32_t(rec->cycles) *
+                (m->cycles_already_measured ? 1 : int32_t(m->base_scale));
+            m->dbg_debt_in = m->biu_debt; m->dbg_aw = m->access_wait;
+            m->biu_debt += int32_t(m->access_wait) - base;
+            int32_t stall = 0;
+            if (m->biu_debt > 0) { stall = m->biu_debt; m->biu_debt = 0; }
+            m->dbg_stall = uint32_t(stall);
+            const int32_t slack =
+                (m->biu_slack_follows_region && pc_before >= 0xFF0000u)
+                    ? int32_t(2u * m->bios_wait) : m->biu_slack;
+            if (m->biu_debt < -slack) m->biu_debt = -slack;
+            /* ⛔⛔ ET LE VIDAGE DE FILE SE FAIT **APRES** CETTE COMPTABILITE, PAS AVANT.
+             *
+             * Il etait applique avant : il jetait donc l'avance que la branche AVAIT en
+             * entrant, jamais celle qu'elle CREE en s'executant. Or c'est la seconde qui
+             * est fausse -- un `ret` du stub BIOS, qui ne fetche pas un octet de la
+             * cartouche, se terminait avec 16 cycles d'avance que le gestionnaire en
+             * cartouche depensait ensuite : ses deux premieres charges coutaient 10 et 14
+             * cycles au lieu de 20. C'est exactement pourquoi le corpus etait « insensible
+             * a ce reglage » -- le bouton ne pouvait rien changer.
+             *
+             * Mesure : une charge dans un ISR coute 20,29 cy sur console (v18 page 1) ;
+             * nous en donnions 18,68. Le PC n'est pas tombe en sequence, donc la file
+             * contient les mauvais octets et l'avance de l'unite de bus est perdue.
+             *
+             * ⚖️ MAIS PAS TOUTE. `branch_flush_keep` est le credit qui SURVIT a la
+             * redirection, en cycles ; 0 = tout est jete. La file fait 4 octets, soit DEUX
+             * mots : la redirection ne peut pas invalider les deux de la meme facon, le
+             * mot deja engage sur le bus se termine. Le nombre vient de la ROM v13. */
+            if (m->flush_queue_on_branch && branch_taken) {
+                const int32_t keep = int32_t(m->branch_flush_keep);
+                if (m->biu_debt < -keep) m->biu_debt = -keep;
+            }
+            /* ⚡ ET UN CHANGEMENT DE REGION JETTE TOUT, branche ou pas de bouton.
+             * Voir `flush_on_region_change` : l'avance batie en lisant une region ne se
+             * depense pas dans une autre -- le bus n'a jamais touche ces octets-la. */
+            if (m->flush_on_region_change && branch_taken) {
+                const bool src_cart = (pc_before >= 0x200000u && pc_before <= 0x3FFFFFu) ||
+                                      (pc_before >= 0x800000u && pc_before <= 0x9FFFFFu);
+                const uint32_t npc = m->cpu.pc & ngpc::kAddrMask;
+                const bool dst_cart = (npc >= 0x200000u && npc <= 0x3FFFFFu) ||
+                                      (npc >= 0x800000u && npc <= 0x9FFFFFu);
+                if (src_cart != dst_cart && m->biu_debt < 0) m->biu_debt = 0;
+            }
+            /* A block transfer owned the bus for its whole run: nothing was prefetched
+             * behind it, so it leaves the queue EMPTY rather than a queue ahead. */
+            if (m->block_drains_queue && m->block_transfer_ran) m->biu_debt = 0;
+            rec->cycles = uint16_t(base + stall);
+        } else {
+            rec->cycles = uint16_t(
+                rec->cycles * (m->cycles_already_measured ? 1u : m->base_scale)
+                + m->access_wait);
+        }
+        /* Surcharge inconditionnelle d'un transfert de controle PRIS -- l'hypothese
+         * concurrente du credit de file : le surcout mesure ne dependrait pas de
+         * l'avance accumulee, il serait paye a chaque branche prise. Les deux
+         * reproduisent la ROM v13 ; seul le reste du corpus les separe. Defaut 0. */
+        /* ⛔ SEULEMENT SUR DU CODE CARTOUCHE. Cette surcharge represente le cout de
+         * RECHARGEMENT de la file sur le bus 8 bits de la cartouche -- elle a ete
+         * mesuree la (v14 rotation C). Le BIOS et la RAM ne sont pas sur ce bus et leur
+         * fetch est facture zero ici : leur faire payer un rechargement qu'ils ne
+         * subissent pas surfacture tout le code du BIOS, et donc chaque interruption,
+         * qui passe par son aiguillage.
+         * Mesure : ROM v18, cout FIXE d'une IRQ -- silicium 111,1 cy, nous 135,6 avant
+         * cette condition. */
+        /* ⛔ SAUF SUR UN `reti` QUAND L'INTERRUPTION EST TRANSPARENTE. Cette surcharge
+         * represente le RECHARGEMENT de la file sur le bus 8 bits de la cartouche. Or si
+         * l'interruption rend au flot interrompu l'etat de bus qu'il avait
+         * (`irq_transparent_queue`), le `reti` ne recharge rien : la file est rendue, pas
+         * refaite. La facturer ici contredirait la transparence qu'on vient d'adopter --
+         * et c'est exactement les 4 cy qui separaient notre chemin (114) des 110 de
+         * l'annexe B, pour 111,5 mesures au silicium. */
+        const bool reti_here = (rec->raw_len == 1 && rec->raw[0] == 0x07);
+        if (m->branch_taken_extra && branch_taken &&
+            !(m->irq_transparent_queue && reti_here && m->irq_save_depth) &&
+            ((pc_before >= 0x200000u && pc_before <= 0x3FFFFFu) ||
+             (pc_before >= 0x800000u && pc_before <= 0x9FFFFFu)))
+            rec->cycles = uint16_t(rec->cycles + m->branch_taken_extra);
+
+        /* Le temps d'acces aux donnees s'ajoute SANS passer par le recouvrement du
+         * prefetch : voir `data_wait_cycles` dans machine.hpp. */
+        if (m->data_wait_cycles) {
+            /* ⛔ EN CARTOUCHE SEULEMENT quand `data_wait_cart_only` est arme : voir le
+             * champ dans machine.hpp -- deux mesures silicium separent les deux cas par
+             * la region du CODE, pas par celle des donnees. */
+            if (!m->data_wait_cart_only ||
+                ((pc_before >= 0x200000u && pc_before <= 0x3FFFFFu) ||
+                 (pc_before >= 0x800000u && pc_before <= 0x9FFFFFu)))
+                rec->cycles = uint16_t(rec->cycles + m->data_wait_cycles);
+            m->data_wait_cycles = 0;
+        }
+
+        /* ⚡ LE `reti` REND AU FLOT INTERROMPU L'ETAT DE BUS QU'IL AVAIT. Voir
+         * `irq_transparent_queue` : sans ca, les cycles de l'ISR lui rechargent sa file
+         * et l'interruption le rend MOINS CHER, ce que le silicium refute (ROM v19). */
+        if (m->irq_transparent_queue && m->irq_save_depth && reti_here) {
+            --m->irq_save_depth;
+            m->q_sixteenths = m->irq_q_save[m->irq_save_depth];
+            m->biu_debt = m->irq_debt_save[m->irq_save_depth];
+        }
+
+        m->cycles_already_measured = false;
+        m->block_transfer_ran = false;
         m->access_wait = 0;
+        m->fetch_bytes = 0;
+        m->fetch_bc16 = 0;
         m->fetch_window = 0xFFFFFFFFu;   // next step re-arms it before its own fetch
 
         s.total_cycles += rec->cycles;
@@ -731,23 +934,92 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         /* ...and so does interrupt delivery, BETWEEN instructions. */
         if (m->irq_pending && deliver_irq(*m)) {
             ++s.irq_deliveries;
-            s.total_cycles += kIrqDeliveryCycles;
-            m->total_cycles += kIrqDeliveryCycles;
-            /* The 13 cycles of an interrupt entry are cycles LIKE ANY OTHERS:
+            /* ⚠️ SCALED LIKE EVERY OTHER COST. kIrqDeliveryCycles is 18 STATES
+             * (datasheet 3.3.1, confirmed by Appendix B table (11)), so if the
+             * instruction table is being read as states it must be too -- leaving it
+             * unscaled would make an interrupt entry half price relative to the code
+             * around it. Worth ~18 cycles on every received byte, which is squarely
+             * inside the receive path's remaining shortfall. */
+            const uint32_t irq_cost = m->base_scale *
+                (m->irq_entry_cycles ? m->irq_entry_cycles : uint32_t(kIrqDeliveryCycles));
+            /* ⚡ UNE INTERRUPTION VIDE LA FILE D'INSTRUCTIONS. Le PC part au vecteur :
+             * les quatre octets deja lus ne servent plus, et l'avance que l'unite de bus
+             * avait prise est perdue. La garder decale le timing APRES chaque ISR, et un
+             * split raster ne vit que de ca -- il ne demande pas « plus vite », il demande
+             * de tomber au bon endroit. */
+            {
+                const int32_t keep = int32_t(m->irq_flush_keep);
+                if (m->biu_debt < -keep) m->biu_debt = -keep;
+            }
+            /* ⛔ ET LA MEME CHOSE POUR LE MODELE EN OCTETS. Le commentaire ci-dessus dit
+             * « une interruption vide la file » ; il ne le faisait que pour le credit en
+             * cycles. Un modele qui contredit le mecanisme que son propre commentaire
+             * decrit est faux, quel que soit ce que ca donne sur le corpus. */
+            if (m->irq_transparent_queue && m->irq_save_depth < 8) {
+                m->irq_q_save[m->irq_save_depth] = m->q_sixteenths;
+                m->irq_debt_save[m->irq_save_depth] = m->biu_debt;
+                ++m->irq_save_depth;
+            }
+            m->q_sixteenths = m->irq_queue_keep_q16;
+            m->fetch_bytes = 0;
+            m->fetch_bc16 = 0;
+            /* ⛔ ET LES EMPILEMENTS DE L'ENTREE NE SE FACTURENT PAS DEUX FOIS. Les quatre
+             * valeurs de Toshiba pour l'acceptation d'une interruption -- 28 / 24 / 22 /
+             * 18 etats -- sont indexees sur LA LARGEUR DE BUS DE LA ZONE DE PILE. Elles
+             * contiennent donc deja le prix des ecritures de PC et SR. `deliver_irq` passe
+             * par `store`, qui accumule `data_access_cycles` ; laisser cette accumulation
+             * la ferait payer une seconde fois, sur le dos de l'instruction suivante.
+             * Mesure : la ROM v8 (WORK1) est passee de -1,8 % a -6,4 % le jour ou le cout
+             * d'acces a ete arme, alors que l'entree elle-meme est deja au MINIMUM des
+             * quatre valeurs documentees et ne peut pas descendre. */
+            m->data_wait_cycles = 0;
+            /* ⛔⛔ ET `access_wait` -- C'ETAIT LE BUG, ET IL ETAIT VISIBLE A L'INSTRUCTION.
+             * `access_wait` est remis a zero a la FIN d'un pas d'instruction ; la
+             * livraison d'interruption se fait APRES. Or `deliver_irq` LIT LE VECTEUR,
+             * quatre octets en BIOS, soit deux mots a `bios_wait` = **16 cycles** qui
+             * s'accumulaient alors dans un `access_wait` que plus personne ne remettait a
+             * zero -- et qui retombaient sur la PREMIERE instruction du gestionnaire.
+             *
+             * ⚡ MESURE : les deux `push` du stub d'aiguillage du BIOS,
+             *     FF22A5  push (0x6FD6)   cy=40   access_wait=32   stall=16
+             *     FF22A9  push (0x6FD4)   cy=24   access_wait=16   stall=0
+             * instructions IDENTIQUES a l'adresse pres, memes acces, et deux charges
+             * `bios_wait` chacune (compteur `ngpc_dbg_bios_charges`). Les 16 de plus de
+             * la premiere ne venaient donc pas d'elle : ils venaient de l'entree.
+             *
+             * Et comme les empilements ci-dessous, ce trafic est deja dans les 18 etats
+             * documentes de l'acceptation : le facturer, c'est le compter deux fois. */
+            m->access_wait = 0;
+            s.total_cycles += irq_cost;
+            m->total_cycles += irq_cost;
+            /* The cycles of an interrupt entry are cycles LIKE ANY OTHERS:
              * every peripheral clock runs through them. Only the raster used
              * to -- so each delivery slid the timers' (and the APU's, and the
-             * Z80's) clock 13 cycles against the raster. At 10-15 deliveries a
+             * Z80's) clock that far against the raster. At 10-15 deliveries a
              * frame that swept a whole 515-cycle line every few frames, and
              * Metal Slug's raster split beat up and down one line with it. */
-            advance_raster(*m, kIrqDeliveryCycles);
-            m->adc_tick(kIrqDeliveryCycles);
-            m->rtc_step(kIrqDeliveryCycles);
-            m->timer_tick(kIrqDeliveryCycles);
-            m->serial_tick(kIrqDeliveryCycles);
-            z80_tick(*m, kIrqDeliveryCycles);
-            m->apu.tick(kIrqDeliveryCycles);
-            if (m->watchdog_tick(kIrqDeliveryCycles)
+            advance_raster(*m, irq_cost);
+            m->adc_tick(irq_cost);
+            m->rtc_step(irq_cost);
+            m->timer_tick(irq_cost);
+            m->serial_tick(irq_cost);
+            z80_tick(*m, irq_cost);
+            m->apu.tick(irq_cost);
+            if (m->watchdog_tick(irq_cost)
                 && note_watchdog(*m, s, pc_before)) break;
+        }
+
+        /* ⚡ THE CABLE MOVED -- hand back so the host can relay it NOW.
+         *
+         * Tested here, at the very end of the iteration, so the instruction is
+         * fully retired first: its cycles are counted, its peripherals ticked,
+         * its interrupt delivered. The machine is left on an instruction
+         * boundary and the next ngpc_run resumes as if nothing had happened --
+         * this is a RENDEZVOUS, not a trap. */
+        if (m->serial_break_on_event && m->serial_event) {
+            s.stop_status = NGPC_SERIAL_EVENT;
+            s.stop_pc     = m->cpu.pc;
+            break;
         }
     }
 
@@ -823,6 +1095,280 @@ NGPC_API int ngpc_run_frames(ngpc_t* h, uint32_t frames, uint32_t max_instrs,
     total.frame_count = m->frame_count;
     if (out_summary) *out_summary = total;
     return 0;
+}
+
+/* ============================ THE CABLED PAIR =============================
+ *
+ * ⚡ BOTH CONSOLES AND THE CABLE, INSIDE THE CORE. Until now the core owned the
+ * serial hardware but not the cable: the host ran console A for a slice, crossed
+ * the FFI boundary to relay bytes, ran console B for a slice, crossed back. That
+ * slice was counted in INSTRUCTIONS -- an approximation of cable time by something
+ * that is not cable time -- and the study of how the Game Boy scene solved this
+ * exact problem (LINK_NETPLAY_STUDY.md §4, L3) found the same answer everywhere:
+ * everyone who shipped a working link put BOTH consoles and the cable in the core,
+ * paced by the hardware's own serial clock. Card Fighters' Clash's versus handshake
+ * and The Last Blade's threshold are not two bugs; they are two symptoms of pacing
+ * a cable with an instruction count.
+ *
+ * ⛔ WHY AN EVENT ALONE IS NOT ENOUGH, measured 2026-08-14. `ngpc_set_serial_break`
+ * hands back at the exact cycle the cable moves, which sounds like the whole answer
+ * -- and as the ONLY rule it is worse than the slice it replaces: it fires on what
+ * a console SENDS, so a console that is quietly computing says nothing and runs to
+ * the end of its frame while its peer has not run at all. Median step measured at
+ * one whole frame, which is exactly the scheduling that loses the VS handshake.
+ *
+ * ⚡ SO THE RULE HERE IS BOTH, AND THE SECOND HALF IS A CLOCK, NOT A COUNT: always
+ * advance whichever console is BEHIND IN CYCLES, in steps bounded by a fraction of
+ * the cable's own byte time, and relay whenever either console reports the cable
+ * moved. The two consoles can therefore never be more than one quantum of emulated
+ * time apart -- which is the property "run a slice each" never had, and the reason
+ * one console could answer a byte a whole frame late in one direction.
+ *
+ * Determinism: the lag test breaks ties towards A, the quantum is derived from the
+ * machine's own registers, and nothing here reads a wall clock. Two runs of the
+ * same pair from the same state produce the same bytes in the same order. */
+
+/* How finely the pair is interleaved, as a divisor of one byte's time on the wire.
+ * The cable's own clock is the unit that matters, so this is expressed against it
+ * rather than picked: at the byte time every cartridge actually programs (3200
+ * cycles) it gives 400 CYCLES, where the host-side slice it replaces was 400
+ * INSTRUCTIONS -- roughly ten times coarser, and in the wrong unit. */
+constexpr int32_t kCableQuantumDivisor = 8;
+constexpr uint32_t kCableQuantumFloor = 64;      /* cycles; a sane floor if a game
+                                                  * programs an absurd baud rate  */
+/* Average cycles per instruction used to turn a cycle budget into an instruction
+ * budget. Same reasoning as ngpc_run_frames: divide by a FAT instruction so the
+ * chunk cannot sail past its target. */
+constexpr uint32_t kCyclesPerFatInstruction = 40;
+
+namespace {
+
+/* One relay, both directions, with the hardware handshake cross-wired.
+ *
+ * Each console's CTS0 pin is the OTHER console's RTS line (datasheet 3.11: RTS is
+ * any GPIO wired to the peer's CTS0). A console ready to receive (RTS low) pulls its
+ * peer's CTS0 low, letting the peer's CTSE-gated transmitter START a byte.
+ *
+ * ⚠️ BYTES ARE THEN PUSHED UNCONDITIONALLY, NOT GATED ON THE RECEIVER'S RTS — and
+ * that is a decision, not an oversight. Two relays exist in this project and they
+ * disagree: the shell's local two-player path pushes unconditionally, on the grounds
+ * that `serial_tick` is the authoritative gate (it only PRESENTS a queued byte to the
+ * CPU once that console's RTS is low, so delivering early merely queues it, exactly
+ * like a real cable) and that gating here could strand a handshake byte and read to
+ * the game as "no cable". `InProcessLink._relay`, which mirror netplay uses, gates.
+ * Both have been validated on Card Fighters' Clash — on different core versions,
+ * which is why project memory records the divergence as UNSETTLED and says to measure
+ * before touching it.
+ *
+ * This function replaces the SHELL's local path first, so it copies the shell's rule.
+ * Changing mirror netplay to come through here means settling that question with a
+ * measurement, not inheriting an answer by accident. */
+void relay_pair(Machine& a, Machine& b) {
+    ++a.serial_relay_count;
+    ++b.serial_relay_count;
+    const bool a_ready = (a.mem[0x0000B2] & 0x01) == 0;
+    const bool b_ready = (b.mem[0x0000B2] & 0x01) == 0;
+    a.serial_cts_high = !b_ready;  a.serial_cts_seen = true;
+    b.serial_cts_high = !a_ready;  b.serial_cts_seen = true;
+
+    /* The byte stays in the SENDER's queue while the receiver says "not ready", and
+     * pays a fresh byte time when it is finally released -- an RTS edge already marks
+     * the cable as moved, so the release is picked up at once. Off by default. */
+    const bool gate = a.relay_gates_on_rts || b.relay_gates_on_rts;
+    if (!a.serial_tx.empty() && (!gate || b_ready)) {
+        if (gate) b.serial_rx_cycles = b.serial_byte_cycles();
+        b.serial_rx_queued_count += uint32_t(a.serial_tx.size());
+        b.serial_rx.insert(b.serial_rx.end(), a.serial_tx.begin(), a.serial_tx.end());
+        a.serial_tx.clear();
+    }
+    if (!b.serial_tx.empty() && (!gate || a_ready)) {
+        if (gate) a.serial_rx_cycles = a.serial_byte_cycles();
+        a.serial_rx_queued_count += uint32_t(b.serial_tx.size());
+        a.serial_rx.insert(a.serial_rx.end(), b.serial_tx.begin(), b.serial_tx.end());
+        b.serial_tx.clear();
+    }
+}
+
+/* The interleaving quantum in cycles, taken from the cable rather than chosen. Both
+ * consoles are asked and the SMALLER wins: a pair is only as coarse as its faster
+ * side can afford, and two consoles with different baud rates are a case the host
+ * bridge could not express at all. */
+uint32_t cable_quantum_cycles(const Machine& a, const Machine& b) {
+    const int32_t ba = a.serial_byte_cycles();
+    const int32_t bb = b.serial_byte_cycles();
+    int32_t byte_cycles = (ba < bb ? ba : bb);
+    if (byte_cycles <= 0) byte_cycles = 3200;          /* the standard configuration */
+    uint32_t q = uint32_t(byte_cycles / kCableQuantumDivisor);
+    if (q < kCableQuantumFloor) q = kCableQuantumFloor;
+    return q;
+}
+
+} // namespace
+
+/* Advance two cabled consoles by `frames` frames each, relaying between them here.
+ *
+ * The two summaries are per console. A console that stops (a trap, a breakpoint, a
+ * terminal halt) stops the pair: leaving its peer running against a console that is
+ * no longer executing is how one screen ends up a second ahead of the other.
+ *
+ * The host must still enable the serial hardware on both machines first -- the cable
+ * is plugged in BEFORE either console boots, which is what a game checking for a peer
+ * during its own start-up requires. ABI 18. */
+NGPC_API int ngpc_run_linked(ngpc_t* ha, ngpc_t* hb, uint32_t frames,
+                             uint32_t max_instrs,
+                             ngpc_summary_t* out_a, ngpc_summary_t* out_b) {
+    if (!ha || !hb || ha == hb) return -1;
+    Machine* a = reinterpret_cast<Machine*>(ha);
+    Machine* b = reinterpret_cast<Machine*>(hb);
+
+    const uint32_t target_a = a->frame_count + frames;
+    const uint32_t target_b = b->frame_count + frames;
+
+    ngpc_summary_t sa, sb;
+    std::memset(&sa, 0, sizeof(sa));
+    std::memset(&sb, 0, sizeof(sb));
+    sa.stop_status = sb.stop_status = NGPC_COUNT_REACHED;
+
+    /* The rendezvous is armed for the duration and restored afterwards: it is a host
+     * policy everywhere else, and a linked run must not silently redefine it. */
+    const bool saved_break_a = a->serial_break_on_event;
+    const bool saved_break_b = b->serial_break_on_event;
+    a->serial_break_on_event = true;
+    b->serial_break_on_event = true;
+
+    uint32_t budget = max_instrs;
+    /* ⛔ THE HANG THIS PREVENTS. `budget` only falls as instructions retire, and a step
+     * can legitimately return NGPC_SERIAL_EVENT having retired NONE: a console parked on
+     * a HALT idles forward a scanline at a time, and the peer's byte arriving during that
+     * idle IS an event. Treating the event as "carry on" -- which it is -- while the
+     * budget does not move is an infinite loop with no exit, and the two-player window
+     * would simply freeze. So rounds that retire nothing are counted, and enough of them
+     * in a row ends the call even though nothing has failed. The bound is generous: a
+     * real HALT is resolved by its interrupt within a line or two, so this cannot cut a
+     * healthy pair short -- it exists to make the pathological case terminate. */
+    unsigned idle_rounds = 0;
+    constexpr unsigned kMaxIdleRounds = 512;
+    /* ⛔ THE LAG IS MEASURED WITHIN THIS CALL, NOT SINCE POWER-ON. Comparing the two
+     * machines' lifetime cycle counts looks equivalent and is not: the two consoles can
+     * drift apart OUTSIDE this function -- the shell runs one alone whenever its peer is
+     * paused, rewinding, or already holds frames in its queue, and a restored save state
+     * moves one of them wholesale. With a lifetime comparison, the first steps of the
+     * next call then belong entirely to whichever console is "behind", so its peer stands
+     * still for that long: the whole-frame latency the interleaving exists to remove,
+     * reappearing only sometimes, depending on how the frame pacer batched its work.
+     *
+     * MEASURED as the user reported it: the old scheduling played Card Fighters' Clash
+     * fine while this one failed DIFFERENTLY EACH TRY -- white screen, frozen screen, a
+     * character select that never ends. A deterministic core failing differently each
+     * run means the decision depends on something outside it, and this was it.
+     *
+     * Counting from zero here makes each call self-contained: whatever happened before,
+     * the two consoles share this frame evenly. */
+    uint64_t used_a = 0, used_b = 0;
+    a->serial_pair_max_gap = b->serial_pair_max_gap = 0;
+    /* ⛔ A CONSOLE THAT STOPS MUST NOT TAKE ITS PEER DOWN MID-FRAME. Ending the whole
+     * call on the first stop looks tidy and is wrong twice over: with a breakpoint on
+     * player 1 -- an ordinary thing to do, the two-player debugger exists -- player 2
+     * never ran at all (MEASURED: executed = 0), so the shell recorded a frame for it
+     * that did not happen, and on screen player 2 simply froze. The arrangement this
+     * replaces let the other console finish its frame, and so does this: a stopped
+     * console stops being a CANDIDATE, its peer runs on to its own frame boundary, and
+     * the call ends when both are done or stopped. */
+    bool stop_a = false, stop_b = false;
+    while (budget > 0 && idle_rounds < kMaxIdleRounds &&
+           ((a->frame_count < target_a && !stop_a) ||
+            (b->frame_count < target_b && !stop_b))) {
+        relay_pair(*a, *b);
+
+        /* Whichever console is behind in EMULATED TIME runs next -- ties to A, so the
+         * order is fixed and two runs of the same pair agree byte for byte. A console
+         * that has finished its frames, or that stopped, is no longer a candidate; its
+         * peer then runs on alone, which is the only way both can land on a boundary. */
+        const bool a_out = stop_a || a->frame_count >= target_a;
+        const bool b_out = stop_b || b->frame_count >= target_b;
+        Machine* lag;
+        ngpc_summary_t* lag_sum;
+        ngpc_t* lag_handle;
+        bool* lag_stop;
+        if (a_out) { lag = b; lag_sum = &sb; lag_handle = hb; lag_stop = &stop_b; }
+        else if (b_out) { lag = a; lag_sum = &sa; lag_handle = ha; lag_stop = &stop_a; }
+        else if (used_a <= used_b) {
+            lag = a; lag_sum = &sa; lag_handle = ha; lag_stop = &stop_a;
+        } else {
+            lag = b; lag_sum = &sb; lag_handle = hb; lag_stop = &stop_b;
+        }
+
+        /* Never overshoot the peer by more than a quantum, and never overshoot the
+         * frame boundary either -- the same cycles-left arithmetic run_frames uses. */
+        const uint32_t quantum = cable_quantum_cycles(*a, *b);
+        const uint32_t cycles_per_frame = kCyclesPerScanline * kScanlinesPerFrame;
+        const uint32_t cycles_done =
+            lag->scanline * kCyclesPerScanline + lag->cycle_residue;
+        const uint32_t cycles_left =
+            cycles_done < cycles_per_frame ? cycles_per_frame - cycles_done : 1;
+        const uint32_t cycles_step = cycles_left < quantum ? cycles_left : quantum;
+
+        uint32_t chunk = cycles_step / kCyclesPerFatInstruction;
+        if (chunk == 0) chunk = 1;
+        if (chunk > budget) chunk = budget;
+
+        ngpc_summary_t s;
+        ngpc_run(lag_handle, chunk, nullptr, 0, &s);
+
+        lag_sum->executed       += s.executed;
+        lag_sum->total_cycles   += s.total_cycles;
+        (lag == a ? used_a : used_b) += s.total_cycles;
+        const uint64_t gap = used_a > used_b ? used_a - used_b : used_b - used_a;
+        if (gap > a->serial_pair_max_gap)
+            a->serial_pair_max_gap = b->serial_pair_max_gap = gap;
+        lag_sum->irq_deliveries += s.irq_deliveries;
+        budget -= s.executed;
+
+        /* NGPC_SERIAL_EVENT is the rendezvous, not a fault: the cable moved, so the
+         * loop simply relays it on the next turn. Anything else ends the pair. */
+        if (s.stop_status != NGPC_COUNT_REACHED && s.stop_status != NGPC_SERIAL_EVENT) {
+            lag_sum->stop_status = s.stop_status;
+            lag_sum->stop_pc     = s.stop_pc;
+            lag_sum->stop_opcode = s.stop_opcode;
+            *lag_stop = true;
+        }
+        if (s.executed == 0) {
+            /* A rendezvous with nothing retired is fine once -- see kMaxIdleRounds. A
+             * stop with nothing retired and no event is a console that will not move. */
+            if (s.stop_status != NGPC_SERIAL_EVENT) break;
+            ++idle_rounds;
+        } else {
+            idle_rounds = 0;
+        }
+    }
+    /* One last relay so a byte produced by the final step is not left in a FIFO
+     * until the next call -- the frame the host is about to present would be one
+     * relay behind the state it reports. */
+    relay_pair(*a, *b);
+
+    a->serial_break_on_event = saved_break_a;
+    b->serial_break_on_event = saved_break_b;
+
+    sa.scanline = a->scanline; sa.frame_count = a->frame_count;
+    sb.scanline = b->scanline; sb.frame_count = b->frame_count;
+    if (out_a) *out_a = sa;
+    if (out_b) *out_b = sb;
+    return 0;
+}
+
+/* How many times the core relayed this console's cable since the link came up.
+ * Zero unless ngpc_run_linked is driving the pair -- a host relaying for itself
+ * counts its own pumps. See Machine::serial_relay_count. ABI v18. */
+/* The widest cycle gap that opened between the two consoles during the last linked
+ * call -- the honest measure of whether they were interleaved. See the header. */
+NGPC_API uint64_t ngpc_link_pair_max_gap(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->serial_pair_max_gap;
+}
+
+NGPC_API uint32_t ngpc_link_relay_count(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->serial_relay_count;
 }
 
 NGPC_API void ngpc_set_write_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
@@ -1066,6 +1612,527 @@ NGPC_API void ngpc_set_timer_base(ngpc_t* h, uint32_t cycles_per_phi_t1) {
 
 /* Wait-states per byte fetched from cartridge flash. 0 = free (the old, ~3.4x-too-fast
  * behaviour). Calibrated by hw_calibration/cpu_calib_v1.ngc. See Machine::cart_wait. */
+/* ONE call that arms the whole silicon timing model, so no caller has to remember
+ * eight settings and no caller can arm half of them.
+ *
+ * The model, and where each piece comes from:
+ *   base x2        Toshiba's instruction costs are STATES; a state is two periods of
+ *                  fc (900/L1 manual; TMP95C061B prices a state at 80 ns at 25 MHz
+ *                  while 4.3 gives tosc = 40 ns). DOCUMENTED.
+ *   fetch per word the external bus is 16 bits. DOCUMENTED.
+ *   pipelined      "the instruction execution unit and the bus interface unit of this
+ *                  CPU operate independently" (3.3.1 notes). DOCUMENTED.
+ *   slack 2 x word the instruction queue is 4 bytes = 2 words (900/L1 Table 1, the
+ *                  feature list, and the LDC note -- three places). DERIVED.
+ *   irq x scale    kIrqDeliveryCycles is 18 STATES, so it scales like everything else.
+ *   BIOS bus       the BIOS is on the same 16-bit bus; billing the cart and letting
+ *                  the BIOS fetch free was an asymmetry nothing justified.
+ *   two-stage TX   SC0BUF and the shift register are separate, so INTTX0 fires when
+ *                  the BUFFER frees -- at the START of a byte (3.11). DOCUMENTED.
+ *   rx single      the receiver charged the byte time twice. A defect, now released.
+ *
+ * ⚠️ `word_wait` and `bios_wait` are the only CALIBRATED numbers. Against the silicon
+ * campaign (10 / 8): a received byte costs 96.0 us against 96.2 measured, the four CPU
+ * regimes land within 6%, throughput -4% and the round trip -8%. See OPEN_ITEMS.md. */
+/* 33 quarts = 8,25 cycles par mot de 16 bits. Voir le bloc au point d'usage. */
+static constexpr uint32_t kSiliconFetchWaitQ4 = 33;
+
+NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bios) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->base_scale         = 2;
+    m->cart_wait          = word_wait;   /* la voie entiere ; fetch_wait_q4 la remplace */
+    m->cart_data_wait     = 0;
+    m->bios_wait          = bios;
+    /* ⚡ AND DATA READS FROM THE BIOS COST THE SAME AS FETCHES FROM IT -- the same
+     * number, not a new one. It is one chip on one bus; a read is a read.
+     *
+     * It matters because a BIOS service is reached by an indirect `call xix` whose
+     * vector is pulled out of the table at 0xFFFE00 -- four bytes, two words, on every
+     * single call. Billing that at zero made BIOS-CALL code cheap while BIOS-INTERRUPT
+     * code was right, which is precisely the shape of the gap it closes: the probe's
+     * polling loop went from +7% to +3% against silicon while the cart-only loops moved
+     * by two counts in six thousand (they never read BIOS data) and the cost of a
+     * received byte stayed inside 1%.
+     *
+     * ⚠️ `cart_data_wait` stays 0 for a different and MEASURED reason -- cpu_calib_v2
+     * showed a cart data read costs the same as a RAM read. That was about the CART. It
+     * never said anything about this chip. */
+    m->bios_data_wait     = bios;
+    /* ⚡ EN QUARTS DE CYCLE, PARCE QUE L'ENTIER NE SUFFIT PAS. Contre les boucles du
+     * test 6 -- code cartouche pur, aucun appel COM, donc comparables -- l'optimum tombe
+     * entre 9 et 10 : a 10 on est 4 % trop LENT, a 9 on est 7 % trop RAPIDE. A 9,75 :
+     * REG -2 %, ROM -1 %, RAM 0 %.
+     *
+     * Ces 4 % n'etaient pas cosmetiques : un HUD en split raster n'a qu'une ligne de
+     * marge, et un CPU legerement lent le rate quand la scene se charge -- le HUD de
+     * Cool Boarders clignotait « parfois plus, parfois moins selon les circonstances »,
+     * ce qui est la forme d'une marge trop juste, pas d'un defaut franc. */
+    /* ⛔ REMIS A 0 (donc `cart_wait` entier), ET C'EST UNE MESURE QUI L'A DECIDE.
+     *
+     * 9,75 rapproche les boucles cartouche du silicium (REG -4 % -> -2 %, RAM -3 % -> 0),
+     * et j'en attendais aussi plus de MARGE pour les splits raster. C'est l'inverse : sur
+     * le savestate de Cool Boarders ou le perso heurte un mur en continu, le HUD saute
+     * d'une trame **13 fois sur 900** a 9,75 et **0 fois** a 10. Le detecteur est
+     * `scratchpad/cb5.py` : il compte, ligne par ligne, les trames qui different de leurs
+     * deux voisines -- et les 13 tombent toutes sur la ligne 8, la frontiere du split.
+     *
+     * ⇒ Un split raster ne demande pas « plus vite », il demande de tomber au bon endroit.
+     * Deux pour cent de precision sur un banc ne valent pas un HUD qui clignote. */
+    /* ⚖️ LE QUART DE CYCLE EST MESURE, PAS DEVINE (ROM a_irq_calib_v8, silicium,
+     * 2026-08-23). L'attente entiere ne peut pas encadrer le silicium : mot=9 donne
+     * 238 lots, mot=8 en donne 269, et la console en fait **261**. Les trois grandeurs
+     * de la ROM concordent sur ~8,3 (8,26 / 8,42 / 8,34), et 8,25 les reproduit a moins
+     * de 2 % : 262/222/251 contre 261/218/249 mesures.
+     *
+     * ⛔ Un quart avait deja ete essaye le 22/08 (9,75) et RETIRE, parce qu'il aggravait
+     * le HUD de Cool Boarders. C'etait un reglage a l'oreille sur un jeu ; celui-ci vient
+     * d'un tir silicium avec RASV=198 et des chiffres stables. La difference n'est pas la
+     * valeur, c'est d'ou elle vient. */
+    m->fetch_wait_q4      = kSiliconFetchWaitQ4;
+    /* ⚖️ ARME AU NOMINAL, ET LE SILICIUM L'A CONFIRME (ROM a_dma_calib_v9, tir du
+     * 24/08 : DMAC descendu de 9120, soit 152 transferts par trame, RASV=198).
+     *
+     *   transfert d'octet -- silicium **12,9 cycles**, nous **13,0** au nominal ✅
+     *   mode compteur     -- silicium **5,2**, nous 10,4 : le x2 etait de trop, retire.
+     *
+     * Il etait reste a 0 le 23/08 faute de mesure, et c'etait la bonne decision : a
+     * l'aveugle il ralentissait Fatal Fury de 4,3 % alors que des jeux etaient deja
+     * signales trop lents. Une journee d'attente contre un chiffre invente. */
+    m->micro_dma_states   = 8;
+    m->access_wait_q4     = 0;
+    m->fetch_wait_carry   = 0;
+    m->fetch_wait_per_word = true;
+    /* ⚡ FETCH FACTURE PAR OCTET, ET C'EST LA FORME QUI COMPTE AUTANT QUE LA VALEUR.
+     * Le bus cartouche est 8 bits : le prix d'un fetch suit les OCTETS. Facturer par
+     * MOT rendait le cout d'une instruction dependant de sa PARITE -- 5 octets payaient
+     * 3 charges en partant d'une adresse paire, 2 en partant d'une impaire -- et c'est
+     * ce qui rendait le modele sensible a l'adresse la ou le silicium ne l'est pas
+     * (ROM v12 : 682/682/683/682 sur console, 715/733/732/732 chez nous).
+     * Valeur mesuree DIRECTEMENT par la ROM v14 page 1 : 4,03 cy/octet sur une droite
+     * qui ferme a 0,35 %. 64 seiziemes = 4,00, ce que la structure predit aussi
+     * (2 cycles de bus x 2 etats x 2 cycles = 8,00 cy/mot). */
+    m->fetch_wait_byte_q16 = 64;
+    /* Surcharge d'une branche PRISE, en cycles. Mesuree sur la rotation C de la v14
+     * page 0 -- branche prise file VIDE, donc sans part conditionnelle : silicium
+     * 16,3 cy/branche contre 11,3 chez nous. Le corpus des 26 cases confirme
+     * l'optimum a 4 (ecart moyen 1,30 %, contre 2,01 % a 5 et 2,74 % a 6).
+     * ⛔ Le fetch par octet SEUL degrade le corpus (7,13 %) : les 8,25 cy/mot d'avant
+     * sur-facturaient le bus pour compenser cette branche non facturee. Les deux
+     * corrections vont ENSEMBLE ou pas du tout. */
+    m->branch_taken_extra = 4;
+    /* Cout FIXE d'un acces memoire de donnee. Mesure par la ROM v15 (pages 1 et 2) :
+     * ~4,05 cy par ACCES, identique en lecture et en ecriture, et INDEPENDANT de la
+     * largeur -- une lecture d'un octet et une de deux coutent le meme prix sur console
+     * (215 contre 216 comptes). ⛔ Une premiere version facturait par OCTET, calee sur la
+     * seule largeur que la v14 avait mesuree : la v15 l'a refutee en une ligne. C'etait
+     * la derniere case du corpus qui restait a plus de 6 % (`MEM`). */
+    m->data_access_cycles = 4;
+    /* ⚡ ET CE COUT NE SE PAIE QUE DANS DU CODE CARTOUCHE (ROM v19, tir silicium).
+     *
+     * Deux mesures se contredisaient sous une regle uniforme : la boucle `MEM` du corpus
+     * EXIGE ces 4 cy (silicium 65,3 cy/tour ; nous 62 sans, 66 avec) et le chemin d'une
+     * interruption les REFUSE (silicium 111,5 ; annexe B 110 ; nous 130 avec, 114 sans).
+     * Les deux ecrivent en RAM : ce n'est donc pas la region des DONNEES qui les separe,
+     * c'est celle du CODE -- `MEM` est en cartouche, le stub d'interruption est en BIOS.
+     *
+     * ⚖️ Et c'est un MECANISME : si ce cout est une contention -- l'acces de donnee vole
+     * un cycle de bus au prefetch -- il ne mord que la ou le fetch est cher, le bus
+     * 8 bits de la cartouche. Meme regle, meme raison que `branch_taken_extra`.
+     * Corpus : 0,40 % -> 0,32 % ; chemin d'IRQ 130 -> 114 pour 111,5 mesures. */
+    m->data_wait_cart_only = true;
+    /* ⚡ ET UNE INTERRUPTION EST TRANSPARENTE POUR L'ETAT DE BUS DU FLOT INTERROMPU.
+     *
+     * ⛔ Sans ca, les cycles de l'ISR RECHARGENT la file du code interrompu : une
+     * interruption le rendait MOINS CHER (-0,574 cy/instruction), soit ~17 cy de
+     * ristourne par interruption -- qui compensaient exactement la sur-facturation
+     * ci-dessus. Deux erreurs de signes opposes : c'est pour ca qu'aucun balayage a un
+     * bouton n'a jamais converge en deux campagnes.
+     *
+     * ⚡ LE SILICIUM LE TRANCHE (ROM v19) : le cout d'une interruption est PLAT selon que
+     * la boucle interrompue soit limitee par le bus ou par l'execution -- 112,6 / 112,0 /
+     * 110,7 / 110,5, contraste **+1,5**, quand nos modeles predisaient +18,0 et +11,6.
+     * Arme, notre contraste tombe a **-1,2**. */
+    m->irq_transparent_queue = true;
+    /* ⚡ ET UN TRANSFERT DE CONTROLE PRIS QUI CHANGE DE REGION JETTE L'AVANCE.
+     *
+     * Le `ret` du stub BIOS finissait avec 16 cycles d'avance -- batie en lisant des
+     * octets de BIOS -- que les deux premieres charges du gestionnaire en CARTOUCHE
+     * depensaient : 10 et 14 cycles au lieu de 20. Le bus n'a jamais touche ces
+     * octets-la ; il ne connaissait meme pas l'adresse du gestionnaire.
+     *
+     * ⚖️ ET PAS `flush_queue_on_branch` TOUT COURT : une branche qui reste dans la meme
+     * region garde legitimement une part de son avance (v14, `branch_flush_keep` ~13-14),
+     * et vider a chaque branche casse le corpus (0,31 % -> 2,85 %). Conditionne au
+     * CHANGEMENT de region, le corpus ne bouge pas d'un centieme (0,31 % / 1,89 %)
+     * pendant qu'une charge dans un ISR passe de 18,00 a 19,25 cy mesures, pour 20,29
+     * sur console (v18 page 1), et la pente derivee de 18,68 a 19,62. */
+    m->flush_on_region_change = true;
+    /* ⚡ L'ÉTRANGLEMENT VRAM DU K2GE, ENFIN CHIFFRÉ (ROM v3, tir silicium).
+     *
+     * Il etait livre a 0 depuis 2026-07 avec la mention « effet confirme, cout non
+     * epingle -- on ne livre pas un chiffre invente ». Le tir existait pourtant :
+     * VWR **452** contre MEM **471**. A 0 nous rendions VWR = **503**, soit +11 % -- et
+     * pire, une ecriture VRAM y coutait MOINS qu'une ecriture RAM (elle est exclue de
+     * `charge_data_access`). A 9 cycles par octet en affichage actif : VWR = **452**,
+     * au compte pres, MEM inchange a 471. Balayage monotone, valeur unique.
+     *
+     * ⛔ NE SE PAIE PAS PENDANT UN TRANSFERT BLOC -- voir `in_block_copy`. `ldirw_cost`
+     * = 18 a ete mesure contre le copieur HiColor de Bomberman, qui ecrit justement en
+     * VRAM, avec une fenetre d'UN cycle : ce cout contient deja l'etranglement. Sans
+     * cette garde, `test_bomberman_hicolor_phase` tombe -- le copieur derive de sa
+     * tranche de 4120 cycles et corrompt une ligne par bande. */
+    /* ⚡ ET IL SE PAIE PAR ACCES, PAS PAR OCTET (ROM v20 page 3, tir silicium) : une
+     * ecriture MOT en VRAM coute **2,95 cy** de plus qu'en RAM, et une ecriture OCTET
+     * **2,95** aussi -- rapport **1,00**. Meme refutation que `data_wait_q16` par la v15.
+     * ⚖️ La v3 ne pouvait pas trancher : elle n'ecrit que des OCTETS, ou les deux formes
+     * coincident. C'est la double difference de la v20 (les memes ecritures refaites en
+     * RAM) qui separe l'etranglement du cout propre de l'instruction.
+     * Valeur : 10 equilibre les DEUX tirs (v3 VWR -0,9 %, v20 V8B +1,3 %) la ou 9 collait
+     * a la v3 (0,0 %) mais laissait la v20 a +3,9 %. */
+    m->vram_wait          = 10;
+    /* La file d'instructions, MODELISEE EN OCTETS -- 4, la taille documentee. Elle
+     * remplace le credit d'avance en cycles (`biu_slack`), qui etait UN scalaire pour
+     * trois regimes et que trois mesures tiraient dans trois directions. Le modele en
+     * octets n'a aucun parametre libre et rend 26,6 cy/division sur le montage v16
+     * page 0, contre 26,5 mesures sur console (le credit en cycles rendait 16,0). */
+    /* ⚡ LA FILE, MODELISEE EN OCTETS -- 4, la taille documentee. Elle remplace le
+     * credit d'avance en CYCLES (`biu_slack`), qui etait UN scalaire pour trois regimes
+     * et que trois mesures tiraient dans trois directions incompatibles.
+     *
+     * Le modele n'a AUCUN parametre libre : la file fait 4 octets, le bus en livre un
+     * tous les 4 cycles, et c'est tout. Sur le montage v16 page 0 il rend 26,6
+     * cy/division contre **26,5 mesures** ; le credit en cycles rendait 16,0.
+     *
+     * ⛔ IL NE S'ARME PAS SEUL. Arme au-dessus des couts MOT de `mul`/`div` herites du
+     * fetch a 10 cy/mot, il laissait MUL a -9 %, DIV a -6 % et cassait l'ancrage
+     * Bomberman -- ce qui ressemblait a une refutation du modele alors que c'etaient les
+     * deux constantes qui etaient fausses. La ROM v17 les a mesurees (47 et 15).
+     *
+     * ⛔ ET MEME AVEC ELLES, IL RESTE DESARME (0). Avec le triplet complet le corpus
+     * tombe a 1,5 % et MUL/DIV rentrent (+2 %), mais TOUTES les cases restent a -1 a
+     * -2,3 % : la machine entiere est ~1,5 % trop lente, et ca suffit a decaler la
+     * phase du copieur de Bomberman (dont la marge est d'UNE ligne) et a casser le HUD
+     * de Cool Boarders. Il manque encore une piece que le modele ne facture pas.
+     * ⇒ Ne PAS armer avant que ce biais uniforme soit explique -- pas compense, explique.
+     *   `ngpc_set_queue_bytes(4)` l'arme pour la mesure. */
+    m->queue_bytes        = 0;
+    m->fetch_pipelined    = true;
+    m->biu_debt           = 0;
+    /* ⚠️ LA MARGE SUIT LE COUT REEL DU MOT, PAS LE PARAMETRE ENTIER. La file fait
+     * 4 octets = 2 mots ; sa valeur en cycles est donc 2 x le cout d'un mot, et depuis
+     * le recalage silicium ce cout est `fetch_wait_q4 / 4` (8,25), pas `word_wait` (10).
+     * Garder l'entier laissait la file croire qu'elle pouvait prendre 20 cycles d'avance
+     * la ou elle n'en a que 16 -- une incoherence introduite par le recalage lui-meme. */
+    m->biu_slack          = int32_t((2u * kSiliconFetchWaitQ4) / 4u);
+    /* ⛔ CES DEUX-LA NE SONT PAS DOUBLES, ET LES DOUBLER ETAIT UNE VRAIE FAUTE.
+     *
+     * Le reste du modele double les chiffres de Toshiba parce que ce sont des ETATS.
+     * Ceux-ci n'en sont pas : ils ont ete MESURES en cycles d'emulateur, contre du
+     * materiel. 14 vient de Cool Boarders ramene a ses 30 fps reels ; 18 vient du
+     * copieur en boucle ouverte de l'ecran-titre de Bomberman, qui doit depenser
+     * exactement 8 lignes par bloc -- a 17 comme a 19 l'image se dechire. Une fenetre
+     * d'UN cycle.
+     *
+     * ⚡ Les avoir doubles facturait chaque copie de bloc au double, et c'est
+     * precisement ce qui fait dechirer un HUD en split raster : le HUD de Cool Boarders
+     * et le fond de KOF R-2 glitchaient en jeu, observes manette en main. Aucun banc ne
+     * l'a vu -- le corpus ne regarde que des ecrans d'intro. */
+    m->ldir_cost          = 14;
+    /* ⚠️ 18, ET LE SILICIUM DIT 14 -- CONFLIT OUVERT, PAS UN OUBLI (ROM v20 page 0).
+     * Un `ldirw` RAM->RAM coute **14,16 cy/iteration** sur console, exactement comme un
+     * `ldirb` (14,12) et exactement l'annexe B (3), `7n+1` etats. Mais le copieur
+     * HiColor de Bomberman -- qui ecrit en **VRAM** -- exige 18 : a 14 il tourne 21 %
+     * trop vite (6476 cycles pour deux blocs contre 8240 mesures sur console).
+     * ⛔ Et l'hypothese evidente est REFUTEE : « 18 = 14 + l'etranglement VRAM » ne tient
+     * pas. Arme (`block_pays_vram`), le throttle ne change **rien** au copieur -- il
+     * passe par `access_wait`, donc il est integralement absorbe par le recouvrement,
+     * le cout de base d'un bloc etant enorme. Et meme non absorbe il vaut 2,9, pas 4.
+     * ⇒ La difference RAM/VRAM sur un transfert bloc est REELLE et n'est pas encore
+     * expliquee. On garde 18 : il tient l'ancrage jouable, et 14 casse une image. */
+    /* ⚡ 14, ET NON 18 (ROM v21, tir silicium). Le meme `ldirw` coute **14,04**
+     * cy/iteration en RAM -> RAM -- l'annexe B (3) au centieme -- et **18,16** en
+     * ROM -> RAM. Ce n'est donc pas l'instruction qui vaut 18 : c'est 14 plus le prix de
+     * lire sa SOURCE sur le bus 8 bits de la cartouche. Voir
+     * `block_cart_src_per_byte`. La destination, elle, ne coute rien (RAM -> VRAM :
+     * 14,12). Notre 18 uniforme etait 29 % trop cher sur toute copie RAM -> RAM ou
+     * RAM -> VRAM -- la plupart de celles que font les jeux. */
+    m->ldirw_cost         = 14;
+    m->block_cart_src_per_byte = 2;   /* +4 par iteration MOT : v21, +4,12 mesures */
+    /* ⚡ ET LA FILE D'INSTRUCTIONS NE PREND AUCUNE AVANCE PENDANT UNE COPIE DE BLOC.
+     *
+     * Une copie repetee tient le bus pendant toute sa duree -- lecture et ecriture a
+     * chaque iteration -- donc l'unite de bus n'a pas un seul creneau pour precharger
+     * derriere elle. Sans ceci elle sortait du bloc avec une file PLEINE, et les
+     * instructions suivantes voyaient leur fetch offert (`biu_slack`, 16 cycles) autant
+     * de fois qu'il y avait de blocs.
+     *
+     * ⚖️ MESURE, sur l'instrument le plus fin que ce projet possede : le copieur raster
+     * en BOUCLE OUVERTE de BOMBERMAN (Thor, 2004). Il se synchronise UNE fois sur la
+     * ligne 0 puis enchaine 19 blocs de 224 mots sans jamais repoller, donc chaque bloc
+     * doit couter exactement une tranche de 8 lignes -- 8 x 515 = 4120 cycles :
+     *
+     *   sans ceci   4086 cycles/bloc (0,9917x) -- 34 cycles TROP RAPIDE par bloc
+     *   avec        4134 cycles/bloc (1,0034x) -- le plus proche jamais mesure
+     *   (l'ancien modele, `legacy`, donnait 4158 : 1,0092x)
+     *
+     * ⛔ ET CES 34 CYCLES SE VOIENT, parce qu'ils ne s'annulent pas : ils s'ACCUMULENT.
+     * L'ecriture part 34 cycles plus tot a chaque bloc et la marge de depart n'est que
+     * de 73 cycles, donc des le 4e bloc l'ecriture repasse dans la DERNIERE ligne de la
+     * bande precedente -- celle qui affiche encore la banque qu'on ecrase. Resultat :
+     * la ligne 8k+7 corrompue sur 15 bandes, et rien ailleurs. Une derive lente ne
+     * donne pas un defaut flou, elle donne un defaut NET a partir d'un seuil.
+     *
+     * ⚠️ Le sens de l'erreur compte : etre un peu LENT est sans effet (l'ecriture reste
+     * derriere le faisceau, le jeu a de la marge en fin de bloc), etre un peu RAPIDE est
+     * fatal. C'est pour ca que `legacy` sortait juste malgre +0,92 %.
+     *
+     * ⚖️ ET L'ORACLE QUI EXISTAIT DEJA A ETE INTERROGE AVANT DE SHIPPER : les ONZE ROM
+     * de `hw_calibration/` rendent un framebuffer IDENTIQUE AU BIT avec et sans -- aucun
+     * chiffre silicium ne bouge. Corpus 83 jeux : 80 identiques au bit, 3 deplaces d'UNE
+     * trame d'animation (regardes a l'ecran, rien de degrade), 0 erreur. */
+    m->block_drains_queue = true;
+    m->tx_irq_on_buffer_free = true;
+    m->rx_single_charge   = true;
+
+    /* ⛔ AND EVERY EXPERIMENTAL KNOB IS CLEARED, not left as it was found.
+     *
+     * "One call arms the model" is a lie if a knob somebody set earlier survives it: the
+     * caller would get the model PLUS a refuted hypothesis, and no measurement would say
+     * so. This function must fully DEFINE the machine's timing, not merely add to it --
+     * which is the same discipline that the eight-setters-in-three-places bugs cost a
+     * day to learn. Anything added below must be cleared here too. */
+    m->flush_queue_on_branch = false;
+    m->data_wait_cycles = 0;
+    m->q_sixteenths = 0;
+    m->fetch_bytes = 0;
+    m->fetch_bc16 = 0;
+    m->biu_slack_follows_region = false;
+    m->relay_gates_on_rts    = false;
+    m->rx_blocked_by_tx      = false;
+    m->rx_double_buffered    = false;
+    m->serial_byte_extra_pct = 0;
+    m->irq_entry_cycles      = 0;     /* 0 = the documented kIrqDeliveryCycles */
+    /* ⛔ NOT ARMED, and the reason is discipline rather than doubt.
+     *
+     * The behaviour is almost certainly right: TxD is a pin, nothing on the chip knows
+     * what is plugged into it, and without this an unplugged console runs its BIOS-call
+     * loop 15% FASTER (1250 -> 1436) purely because the transmitter stops existing.
+     *
+     * But its only NUMERIC justification was the probe's LOOP figure from the 2026-08-19
+     * shoot -- a reference later disqualified because no ROM identity was recorded and
+     * the ROM had changed since. So the benefit is unproven against any shoot that can
+     * defend itself, while the cost is measured: with it armed, a serialised state no
+     * longer replays identically (libretro smoke, "non-deterministic state after
+     * replay"), because an unplugged console can hold a byte mid-transmit and not every
+     * piece of that survives the round trip.
+     *
+     * ⇒ Unproven benefit does not buy a proven regression. Re-arm it when a shoot with
+     * a recorded md5 measures test 6, and finish tracing the state it needs. */
+    m->uart_runs_unplugged = false;
+}
+
+NGPC_API void ngpc_set_byte_extra(ngpc_t* h, uint32_t pct) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->serial_byte_extra_pct = pct;
+}
+
+NGPC_API void ngpc_set_uart_unplugged(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->uart_runs_unplugged = on != 0;
+}
+
+NGPC_API void ngpc_set_micro_dma_states(ngpc_t* h, uint32_t eighths) {
+    if (h) reinterpret_cast<Machine*>(h)->micro_dma_states = eighths;
+}
+
+NGPC_API void ngpc_set_fetch_wait_q4(ngpc_t* h, uint32_t quarters) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->fetch_wait_q4 = quarters;
+    m->access_wait_q4 = 0;
+    m->fetch_wait_carry = 0;
+}
+
+NGPC_API void ngpc_set_bios_data_wait(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->bios_data_wait = cycles;
+}
+
+NGPC_API void ngpc_set_slack_by_region(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->biu_slack_follows_region = on != 0;
+}
+
+NGPC_API void ngpc_set_block_drains_queue(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->block_drains_queue = on != 0;
+}
+
+NGPC_API void ngpc_set_branch_flush(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->flush_queue_on_branch = on != 0;
+}
+
+NGPC_API void ngpc_set_branch_flush_keep(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->branch_flush_keep = cycles;
+}
+
+NGPC_API void ngpc_set_branch_taken_extra(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->branch_taken_extra = cycles;
+}
+
+NGPC_API void ngpc_set_fetch_wait_byte_q16(ngpc_t* h, uint32_t sixteenths) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->fetch_wait_byte_q16 = sixteenths;
+}
+
+NGPC_API void ngpc_set_data_access_cycles(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->data_access_cycles = cycles;
+}
+
+NGPC_API void ngpc_dbg_biu(ngpc_t* h, int32_t* debt_in, uint32_t* stall, uint32_t* aw) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    if (debt_in) *debt_in = m->dbg_debt_in;
+    if (stall)   *stall   = m->dbg_stall;
+    if (aw)      *aw      = m->dbg_aw;
+}
+
+NGPC_API void ngpc_dbg_queue(ngpc_t* h, int32_t* q_in, uint32_t* bytes,
+                             uint32_t* stall, uint32_t* aw) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    if (q_in)  *q_in  = m->dbg_q_in;
+    if (bytes) *bytes = m->dbg_q_bytes;
+    if (stall) *stall = m->dbg_stall;
+    if (aw)    *aw    = m->dbg_aw;
+}
+
+NGPC_API uint32_t ngpc_dbg_bios_charges(ngpc_t* h) {
+    if (!h) return 0;
+    auto* m = reinterpret_cast<Machine*>(h);
+    const uint32_t v = m->dbg_bios_charges;
+    m->dbg_bios_charges = 0;
+    return v;
+}
+
+NGPC_API void ngpc_set_irq_flush_keep(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->irq_flush_keep = cycles;
+}
+
+NGPC_API void ngpc_set_biu_slack(ngpc_t* h, int32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->biu_slack = cycles;
+}
+
+NGPC_API void ngpc_set_flush_on_region_change(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->flush_on_region_change = (on != 0);
+}
+
+NGPC_API void ngpc_set_irq_transparent_queue(ngpc_t* h, int on) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->irq_transparent_queue = (on != 0);
+    m->irq_save_depth = 0;
+}
+
+NGPC_API void ngpc_set_block_pays_vram(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->block_pays_vram = (on != 0);
+}
+
+NGPC_API void ngpc_set_data_wait_cart_only(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->data_wait_cart_only = (on != 0);
+}
+
+NGPC_API void ngpc_set_irq_queue_keep_q16(ngpc_t* h, int32_t q16) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->irq_queue_keep_q16 = q16;
+}
+
+NGPC_API void ngpc_set_queue_bytes(ngpc_t* h, uint32_t bytes) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->queue_bytes = bytes;
+    m->q_sixteenths = 0;
+    m->fetch_bytes = 0;
+    m->fetch_bc16 = 0;
+}
+
+NGPC_API void ngpc_set_muldiv_word(ngpc_t* h, uint32_t mul_states, uint32_t div_cycles) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->mul_word_states = mul_states;
+    m->div_word_cycles = div_cycles;
+}
+
+NGPC_API void ngpc_set_muldiv_byte(ngpc_t* h, uint32_t mul_states, uint32_t div_cycles) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->mul_byte_states = mul_states;
+    m->div_byte_cycles = div_cycles;
+}
+
+NGPC_API void ngpc_set_rx_double(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->rx_double_buffered = on != 0;
+}
+
+NGPC_API void ngpc_set_tx_irq_early(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->tx_irq_on_buffer_free = on != 0;
+}
+
+NGPC_API void ngpc_set_fetch_pipelined(ngpc_t* h, int on, int slack) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->fetch_pipelined = on != 0;
+    m->biu_debt = 0;
+    m->biu_slack = slack;
+}
+
+NGPC_API void ngpc_set_half_duplex(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->rx_blocked_by_tx = on != 0;
+}
+
+NGPC_API void ngpc_set_relay_gate(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->relay_gates_on_rts = on != 0;
+}
+
+NGPC_API void ngpc_set_rx_single(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->rx_single_charge = on != 0;
+}
+
+NGPC_API void ngpc_set_fetch_word(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->fetch_wait_per_word = on != 0;
+}
+
+NGPC_API void ngpc_set_base_scale(ngpc_t* h, uint32_t k) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->base_scale = k ? k : 1;
+}
+
+NGPC_API void ngpc_set_irq_entry(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->irq_entry_cycles = cycles;
+}
+
+NGPC_API void ngpc_set_bios_wait(ngpc_t* h, uint32_t cycles_per_byte) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->bios_wait = cycles_per_byte;
+}
+
 NGPC_API void ngpc_set_cart_wait(ngpc_t* h, uint32_t cycles_per_byte) {
     if (!h) return;
     reinterpret_cast<Machine*>(h)->cart_wait = cycles_per_byte;
@@ -1089,6 +2156,14 @@ NGPC_API void ngpc_set_vram_wait(ngpc_t* h, uint32_t cycles_per_byte) {
 NGPC_API void ngpc_set_ldir_cost(ngpc_t* h, uint32_t cycles_per_byte) {
     if (!h) return;
     reinterpret_cast<Machine*>(h)->ldir_cost = uint16_t(cycles_per_byte ? cycles_per_byte : 7);
+}
+
+/* Cost per ITERATION of the WORD block copies (LDIRW/LDDRW). 0 = follow ldir_cost, which
+ * is what every existing caller gets, so nothing moves until someone asks for it.
+ * Measured at 18 on Bomberman's open-loop HiColor copier -- see Machine::ldirw_cost. */
+NGPC_API void ngpc_set_ldirw_cost(ngpc_t* h, uint32_t cycles_per_iteration) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->ldirw_cost = uint16_t(cycles_per_iteration);
 }
 
 /* Present the cart as a flash chip of `bytes` capacity (a standard 4/8/16 Mbit part),
@@ -1143,6 +2218,7 @@ NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
     m.serial_rx_queued_count = m.serial_rx_read_count = 0;
     m.serial_irq_tx_count = m.serial_irq_rx_count = 0;
     m.serial_cts_hold_ticks = m.serial_rts_hold_ticks = 0;
+    m.serial_relay_count = 0;
     if (!on) {
         m.serial_tx.clear();
         m.serial_rx.clear();
@@ -1152,6 +2228,17 @@ NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
         m.serial_tx_cycles = 0;
         m.serial_rx_cycles = 0;
     }
+}
+
+/* Ask ngpc_run to hand back the moment the cable moves. See the header for why
+ * this replaces the host's instruction-quota poll rather than tuning it. */
+NGPC_API void ngpc_set_serial_break(ngpc_t* h, int on) {
+    if (!h) return;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    m.serial_break_on_event = (on != 0);
+    /* Arming is not a report about the past: drop anything already noticed so
+     * the first run afterwards answers only for its own traffic. */
+    m.serial_event = false;
 }
 
 /* Drain up to `max` bytes this machine has transmitted; returns the count. */
@@ -1188,7 +2275,9 @@ NGPC_API int ngpc_serial_rts(ngpc_t* h) {
  * machines calls this each pump with the peer's RTS state. See Machine::serial_tick. */
 NGPC_API void ngpc_serial_set_cts(ngpc_t* h, int high) {
     if (!h) return;
-    reinterpret_cast<Machine*>(h)->serial_cts_high = (high != 0);
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->serial_cts_high = (high != 0);
+    m->serial_cts_seen = true;
 }
 
 /* Read-only snapshot of the whole channel for the debugger's Link tab. Every
@@ -1380,9 +2469,31 @@ NGPC_API void ngpc_get_aux_state(ngpc_t* h, ngpc_aux_state_t* out) {
     out->scanline           = m->scanline;
     out->frame_count        = m->frame_count;
     out->cycle_residue      = m->cycle_residue;
+    out->biu_debt           = uint32_t(m->biu_debt);
 }
 
 NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
+    /* ⛔ A RESTORED STATE RESUMES WITH AN EMPTY INSTRUCTION QUEUE, and the two serial
+     * buffer stages empty with it.
+     *
+     * These are timing state that no public struct carries, so leaving them alone made
+     * a replay diverge from the run it replayed -- caught by the libretro smoke test as
+     * "non-deterministic state after replay". Clearing them is not a fudge: a snapshot
+     * is exactly the kind of boundary at which a pipeline may be considered flushed,
+     * and the error it can introduce is bounded by the queue -- four bytes, i.e. two
+     * word fetches. Reproducibility is worth more than those.
+     *
+     * ⚠️ ANYTHING ELSE ADDED TO Machine THAT INFLUENCES TIMING BELONGS HERE TOO, or in
+     * a serialised struct. There is no third option that stays deterministic. */
+    /* ⛔ ON N'EFFACE PLUS `biu_debt` ICI -- il est desormais DANS le blob (voir
+     * ngpc_core.h). L'effacer faisait diverger le rejeu de ce qu'il rejoue. Les deux
+     * accumulateurs de quart de cycle, eux, sont sans etat depuis le motif tire de
+     * l'adresse ; on les remet a zero par prudence, ils valent deja 0. */
+    if (h) {
+        auto* mm = reinterpret_cast<Machine*>(h);
+        mm->access_wait_q4 = 0;
+        mm->fetch_wait_carry = 0;
+    }
     if (!h || !in) return -1;
     /* A blob from another build is REFUSED, not half-applied: a savestate written by
      * an older core carries a different layout, and reading one field of it as
@@ -1452,6 +2563,91 @@ NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
     m->scanline           = in->scanline;
     m->frame_count        = in->frame_count;
     m->cycle_residue      = in->cycle_residue;
+    m->biu_debt           = int32_t(in->biu_debt);
+    return 0;
+}
+
+/* --- the link cable as saveable state (see ngpc_core.h for WHY) ------------- */
+
+NGPC_API void ngpc_get_link_state(ngpc_t* h, ngpc_link_state_t* out) {
+    if (!h || !out) return;
+    const Machine* m = reinterpret_cast<Machine*>(h);
+
+    std::memset(out, 0, sizeof(*out));
+    out->version = NGPC_LINK_STATE_VERSION;
+    out->size    = uint32_t(sizeof(ngpc_link_state_t));
+
+    out->link_enabled = m->serial_link_enabled ? 1 : 0;
+    out->tx_busy      = m->serial_tx_busy ? 1 : 0;
+    out->tx_shifting  = m->serial_tx_shifting ? 1 : 0;
+    out->tx_byte      = m->serial_tx_byte;
+    out->cts_high     = m->serial_cts_high ? 1 : 0;
+    out->rx_pending   = m->serial_rx_pending ? 1 : 0;
+    out->rx_byte      = m->serial_rx_byte;
+    out->tx_cycles    = m->serial_tx_cycles;
+    out->rx_cycles    = m->serial_rx_cycles;
+    out->tx_buf_full    = m->serial_tx_buf_full ? 1 : 0;
+    out->tx_buf_byte    = m->serial_tx_buf_byte;
+    out->rx_shift_full  = m->serial_rx_shift_full ? 1 : 0;
+    out->rx_shift_byte  = m->serial_rx_shift_byte;
+    out->rx_had_pending = m->serial_rx_had_pending ? 1 : 0;
+
+    /* Clamp rather than truncate in silence: a snapshot that quietly dropped cable
+     * bytes would be the very bug this block closes, wearing a green hat. */
+    const size_t tx_n = m->serial_tx.size();
+    const size_t rx_n = m->serial_rx.size();
+    if (tx_n > NGPC_LINK_FIFO_MAX || rx_n > NGPC_LINK_FIFO_MAX) out->overflow = 1;
+    out->tx_len = uint32_t(tx_n < NGPC_LINK_FIFO_MAX ? tx_n : NGPC_LINK_FIFO_MAX);
+    out->rx_len = uint32_t(rx_n < NGPC_LINK_FIFO_MAX ? rx_n : NGPC_LINK_FIFO_MAX);
+    for (uint32_t i = 0; i < out->tx_len; ++i) out->tx_fifo[i] = m->serial_tx[i];
+    for (uint32_t i = 0; i < out->rx_len; ++i) out->rx_fifo[i] = m->serial_rx[i];
+
+    out->tx_count        = m->serial_tx_count;
+    out->wire_count      = m->serial_wire_count;
+    out->rx_queued_count = m->serial_rx_queued_count;
+    out->rx_read_count   = m->serial_rx_read_count;
+    out->irq_tx_count    = m->serial_irq_tx_count;
+    out->irq_rx_count    = m->serial_irq_rx_count;
+    out->cts_hold_ticks  = m->serial_cts_hold_ticks;
+    out->rts_hold_ticks  = m->serial_rts_hold_ticks;
+}
+
+NGPC_API int ngpc_set_link_state(ngpc_t* h, const ngpc_link_state_t* in) {
+    if (!h || !in) return -1;
+    /* Same contract as the aux block: a blob from another build is refused whole. */
+    if (in->version != NGPC_LINK_STATE_VERSION || in->size != sizeof(ngpc_link_state_t))
+        return -1;
+    if (in->tx_len > NGPC_LINK_FIFO_MAX || in->rx_len > NGPC_LINK_FIFO_MAX)
+        return -1;
+
+    Machine* m = reinterpret_cast<Machine*>(h);
+
+    m->serial_link_enabled = in->link_enabled != 0;
+    m->serial_tx_busy      = in->tx_busy != 0;
+    m->serial_tx_shifting  = in->tx_shifting != 0;
+    m->serial_tx_byte      = in->tx_byte;
+    m->serial_cts_high     = in->cts_high != 0;
+    m->serial_rx_pending   = in->rx_pending != 0;
+    m->serial_tx_buf_full    = in->tx_buf_full != 0;
+    m->serial_tx_buf_byte    = in->tx_buf_byte;
+    m->serial_rx_shift_full  = in->rx_shift_full != 0;
+    m->serial_rx_shift_byte  = in->rx_shift_byte;
+    m->serial_rx_had_pending = in->rx_had_pending != 0;
+    m->serial_rx_byte      = in->rx_byte;
+    m->serial_tx_cycles    = in->tx_cycles;
+    m->serial_rx_cycles    = in->rx_cycles;
+
+    m->serial_tx.assign(in->tx_fifo, in->tx_fifo + in->tx_len);
+    m->serial_rx.assign(in->rx_fifo, in->rx_fifo + in->rx_len);
+
+    m->serial_tx_count        = in->tx_count;
+    m->serial_wire_count      = in->wire_count;
+    m->serial_rx_queued_count = in->rx_queued_count;
+    m->serial_rx_read_count   = in->rx_read_count;
+    m->serial_irq_tx_count    = in->irq_tx_count;
+    m->serial_irq_rx_count    = in->irq_rx_count;
+    m->serial_cts_hold_ticks  = in->cts_hold_ticks;
+    m->serial_rts_hold_ticks  = in->rts_hold_ticks;
     return 0;
 }
 

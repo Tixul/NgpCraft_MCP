@@ -60,7 +60,16 @@ Complete hardware register documentation for the Neo Geo Pocket Color: memory ma
 0x52  SC0MOD   UART mode, clock source, CTSE (bit6), RXE (bit5)
 0x53  BR0CR    baud rate generator -- 0x05 gives 19 200 bps (derivation in Link-Cable)
 0xB2  bit0     RTS, a GPIO OUTPUT ("I am ready to receive")
-0xB1  bit2     cable-detect INPUT (0 = peer connected)
+0xB1  bit2     LINK DETECT INPUT = the PEER'S RTS (0 = peer has opened its port)
+               ⚡ measured on two consoles: a console powered on but sitting in the
+               BIOS reads 1 (no peer). It is not "a cable is plugged in".
+0xB1  bit0/1   read 1 while a cartridge runs (B1 = 0x03 linked, 0x07 unlinked)
+0xB3           read-only input bits; PER-CONSOLE constant, 0x04 on one machine and
+               0x07 on another, identical with and without a cable
+0xB6           reads 0x05      0xBC reads 0xFE at reset (Z80 mailbox afterwards)
+0x51  SC0CR    bit7 is a LATCH: 0x00 until any byte has ever crossed, 0x80 for ever
+               after -- it survives unplugging the cable
+0x53  BR0CR    reads back with bit6 (BR0ADDE) SET whatever you write: 0x05 -> 0x45
 ```
 
 Full treatment, including the baud arithmetic and the CTS/RTS rules: [Link Cable](../05_Systems/Link-Cable.md).

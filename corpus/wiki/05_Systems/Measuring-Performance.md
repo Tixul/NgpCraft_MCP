@@ -354,6 +354,48 @@ showed 27 vs 24, which reads as noise.
 
 ---
 
+## 8. Measuring the CONSOLE against an emulator — a frame-counting recipe ⭐
+
+You do not need a logic analyser, and you cannot use a stopwatch: the 8-bit timer
+up-counters on this CPU are **not readable**, so a start/stop chronometer on an event
+needs an ISR that perturbs what it measures. Count **frames** instead.
+
+One frame is 16.67 ms (515 cycles × 199 lines × 60 Hz). Run a fixed workload for a fixed
+number of frames and count how many times it completes; the same ROM in an emulator gives
+the comparison. Bake the emulator's own figure into the ROM next to the live one and a
+photograph of the screen becomes the whole report.
+
+### What this turned up on real consoles (2026-08-19)
+
+Four workloads, 30 frames each, two consoles — the counts agreed to within one:
+
+| workload | what it isolates | emulator vs silicon |
+|---|---|---|
+| unrolled register ops, no memory | the raw core | **+9 %** |
+| 16 reads from a `const` array in **cartridge** | cart data access | **+7 %** |
+| 16 reads/writes in **work RAM** | RAM access | **+7 %** |
+| the real BIOS-call turnaround (`COMGETDATA` ×4) | the BIOS COM path | **+23 to +30 %** |
+
+Two results worth carrying:
+
+- ✅ **A cartridge data read costs the SAME as a RAM read.** The ROM/RAM ratio is
+  **1.034 on silicon and 1.034 in the emulator** — identical. Instruction *fetch* from
+  cartridge is wait-stated; a data read is not, and that is now measured rather than
+  assumed.
+- ⚠️ **Long instructions are where fetch wait dominates.** Tracing the BIOS-call loop
+  showed **81 % of its time in cartridge code**, not in the BIOS, and for the 4-to-6-byte
+  instructions that call machinery uses, **fetch wait is up to 69 % of the instruction's
+  cost**. Short 1-2 byte loops barely feel it. That is why the same machine looks 7 %
+  fast on a simple loop and 30 % fast on a call-heavy one — and why a single global
+  "wait states" number cannot describe both.
+
+⚠️ **Trap for anyone building such a bench:** a headless harness must switch the cartridge
+wait states ON explicitly. Left at their back-compat default of zero, cartridge code runs
+about **three times too fast** and every figure the bench produces is measured against a
+machine nobody actually runs.
+
+---
+
 ## 7. Checklist
 
 Before trusting a performance number:

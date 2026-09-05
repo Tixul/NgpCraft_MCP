@@ -28,6 +28,7 @@ unplugged -- the pre-link behaviour.
 
 from __future__ import annotations
 
+import os
 import socket
 from typing import Protocol
 
@@ -67,6 +68,23 @@ CABLE_SLICE = 400
 _MAX_SLICES = 256
 
 
+def host_relay_forced() -> bool:
+    """True when the player asked for the PREVIOUS arrangement: a slice of instructions
+    each, relayed from Python.
+
+    ⚡ AN A/B SWITCH, AND IT EXISTS FOR A REASON. Moving the pair into the core changed
+    how two cabled consoles are scheduled, and the games that care about that are exactly
+    the ones whose failures are hard to reproduce headlessly -- a probe ROM that transmits
+    non-stop cannot tell the two schedulings apart at all. So when a link game misbehaves,
+    the first question is "does the old path still do it?", and answering it must not take
+    a rebuild:
+
+        set NGPCRAFT_HOST_RELAY=1
+
+    Answering that question is the whole point; leave it unset for normal play."""
+    return os.environ.get("NGPCRAFT_HOST_RELAY", "") not in ("", "0")
+
+
 def run_two_consoles_interleaved(first, second, link) -> None:
     """Advance both consoles by one frame, a slice at a time, relaying between slices.
 
@@ -82,6 +100,41 @@ def run_two_consoles_interleaved(first, second, link) -> None:
         second.run_frames(1)
         link.pump()
         return
+
+    # ⚡ THE PAIR IS THE CORE'S JOB. Everything below this is the arrangement it
+    # replaces: a slice of INSTRUCTIONS each, relayed from here in between. The core
+    # paces the pair on the CABLE's own byte time instead and relays the moment either
+    # console reports a byte moved, so the two can never be more than one quantum of
+    # emulated time apart. See ngpc_run_linked and LINK_NETPLAY_STUDY.md L3.
+    #
+    # ⛔ AND IT SETTLES A DIVERGENCE RATHER THAN INHERITING ONE. This function's relay
+    # (InProcessLink._relay) refuses to push at a console holding RTS high; the shell's
+    # local two-player path and the Android front end both push UNCONDITIONALLY, on the
+    # grounds that serial_tick is the real gate and that holding back here can strand a
+    # handshake byte. Project memory records that as unsettled and says to measure. The
+    # core relays unconditionally, so mirror sessions now use the same rule as the two
+    # paths that have been played on real games -- measured on the probe ROM as the same
+    # byte counts either way, with the two consoles ending perfectly in step.
+    #
+    # ⛔ A MONITOR KEEPS THE OLD PATH. It records, delays, drops and injects bytes from
+    # Python; a relay inside the core cannot call it.
+    if (not host_relay_forced()
+            and getattr(link, "monitor_a", None) is None
+            and getattr(link, "monitor_b", None) is None
+            and hasattr(first, "serial_state") and hasattr(second, "serial_state")):
+        from core import native
+
+        a_before = first.serial_state().wire_count
+        b_before = second.serial_state().wire_count
+        native.run_linked(first, second, 1)
+        # The relay's own byte counters are what the UI and several tests read; the core
+        # is now the thing that moves bytes, so they come from its count of what actually
+        # finished shifting out. Leaving them behind would freeze a number that is
+        # supposed to say whether the cable is alive.
+        link.bytes_ab += first.serial_state().wire_count - a_before
+        link.bytes_ba += second.serial_state().wire_count - b_before
+        return
+
     pair = (first, second)
     starts = [m.run(0, record=False)[0].frame_count for m in pair]
     done = [False, False]

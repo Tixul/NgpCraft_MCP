@@ -102,6 +102,9 @@ bool eval_cc(const ngpc_cpu_t& c, unsigned cc) {
  * byte of the range is unwritable the whole write is dropped and memory is left
  * untouched. */
 void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_t size) {
+    /* Meme cout qu'une lecture : la ROM v15 les a mesurees separement et elles tombent
+     * a moins d'un demi-compte l'une de l'autre sur les quatre paires. */
+    m.charge_data_access(addr);
     bool writable = true;
     for (uint8_t i = 0; i < size; ++i)
         if (!region_writable(region_of(addr + i))) { writable = false; break; }
@@ -148,7 +151,18 @@ void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_
              * free, so a game that writes VRAM in vblank pays nothing. Confirmed by
              * cpu_calib_v3 on silicon (VWR < MEM). Guarded on active display so vblank
              * writes are never charged. */
-            if (m.vram_wait && a >= 0x8000 && a <= 0xBFFF && !m.in_vblank())
+            /* ⛔ PAR ACCES, PAS PAR OCTET -- et c'est le SILICIUM qui l'a tranche
+             * (ROM v20 page 3, double difference contre les memes ecritures en RAM) :
+             * une ecriture MOT coute exactement autant qu'une ecriture OCTET,
+             * **2,95 cy** contre **2,95**, rapport 1,00. La v3 dit 2,74 sur le meme
+             * effet, mesuree autrement. Deux tirs independants, la meme reponse.
+             * ⚖️ C'est la MEME refutation que `data_wait_q16` par la v15 : une forme
+             * « par octet » qui collait a une mesure et rendait tout le reste faux.
+             * ⚠️ Notre `vram_wait = 9` par octet « collait » a la v3 uniquement parce
+             * que la charge passe par `access_wait`, donc se fait absorber par le
+             * recouvrement -- un ajustement A TRAVERS une couche absorbante. */
+            if (m.vram_wait && i == 0 && (!m.in_block_copy || m.block_pays_vram)
+                && a >= 0x8000 && a <= 0xBFFF && !m.in_vblank())
                 m.access_wait += m.vram_wait;
             m.note_write(a, bytes[i]);      // the write log; disarmed, this is 2 compares
             /* The RTC's registers are not plain I/O bytes: a write sets the clock --
@@ -212,33 +226,34 @@ uint8_t step(Machine& m, ngpc_record_t* rec) {
             return NGPC_OK;
         }
 
-        /* ld R8, #imm8  — 2 bytes, 3 cycles */
+        /* ld R8, #imm8  — 2 bytes, 2 states. Appendix B "LD R,# = 20+zz+R : #",
+         * 2.3.5 -- this family charged 3/4/6, one too many on ALL THREE sizes. */
         case 0x20: case 0x21: case 0x22: case 0x23:
         case 0x24: case 0x25: case 0x26: case 0x27: {
             const unsigned r = op & 0x07;
             set_r8(c, r, m.read8(pc + 1));
-            finish(rec, m, pc, 2, 3, 1u << (r >> 1));
+            finish(rec, m, pc, 2, 2, 1u << (r >> 1));
             c.pc = (pc + 2) & kAddrMask;
             return NGPC_OK;
         }
 
-        /* ld R16, #imm16 — 3 bytes, 4 cycles */
+        /* ld R16, #imm16 — 3 bytes, 3 states (Appendix B). */
         case 0x30: case 0x31: case 0x32: case 0x33:
         case 0x34: case 0x35: case 0x36: case 0x37: {
             const unsigned r = op & 0x07;
             set_r16(c, r, fetch16(m, pc + 1));
-            finish(rec, m, pc, 3, 4, 1u << r);
+            finish(rec, m, pc, 3, 3, 1u << r);
             c.pc = (pc + 3) & kAddrMask;
             return NGPC_OK;
         }
 
-        /* ld R32, #imm32 — 5 bytes, 6 cycles */
+        /* ld R32, #imm32 — 5 bytes, 5 states (Appendix B). */
         case 0x40: case 0x41: case 0x42: case 0x43:
         case 0x44: case 0x45: case 0x46: case 0x47: {
             const unsigned r = op & 0x07;
             set_r32(c, r, fetch32(m, pc + 1));
             c.pc = (pc + 5) & kAddrMask;
-            finish(rec, m, pc, 5, 6, 1u << r);
+            finish(rec, m, pc, 5, 5, 1u << r);
             return NGPC_OK;
         }
 
@@ -575,7 +590,12 @@ uint8_t step(Machine& m, ngpc_record_t* rec) {
             return NGPC_OK;
         }
         case 0x1D: {
-            const uint32_t target = fetch32(m, pc + 1) & 0x00FFFFFFu;
+            /* THREE bytes, not four. fetch32 here read one byte PAST the
+             * instruction: harmless to the value (it was masked off) but a real
+             * extra cart access, billed at cart_wait like any other fetch. */
+            const uint32_t target = uint32_t(m.read8(pc + 1))
+                                  | (uint32_t(m.read8(pc + 2)) << 8)
+                                  | (uint32_t(m.read8(pc + 3)) << 16);
             const uint32_t ret_addr = (pc + 4) & kAddrMask;
             c.pc = target;
             push32(m, rec, ret_addr);

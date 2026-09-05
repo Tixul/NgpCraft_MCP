@@ -58,14 +58,23 @@ SAVESTATE_BACKWARD_COMPAT_VERSIONS = (
 # app, which meant the one artefact a player can produce at the exact moment a bug
 # happens was useless to every analysis tool. Now it is the same door.
 #
-# TWO GENERATIONS. `NGPCST02` inserts the sound/timer block (`native.AuxState`) between
-# the CPU struct and the image, because a snapshot without it lost the music on every
-# load -- see cpp/include/ngpc_core.h. This module models the MAIN CPU and memory, so it
-# skips that block; it still has to KNOW it is there, or it would read the image one
-# struct too early and hand every tool a shifted memory map.
+# THREE GENERATIONS. `NGPCST02` inserts the sound/timer block (`native.AuxState`)
+# between the CPU struct and the image, because a snapshot without it lost the music on
+# every load. `NGPCST03` inserts the link cable (`native.LinkState`) after that, because
+# a snapshot without it restored the wrong cable -- measured, see
+# cpp/include/ngpc_core.h and LINK_NETPLAY_STUDY.md. This module models the MAIN CPU and
+# memory, so it skips both blocks; it still has to KNOW they are there, or it would read
+# the image one struct too early and hand every tool a shifted memory map.
 SHELL_SAVESTATE_MAGIC = b"NGPCST01"
 SHELL_SAVESTATE_MAGIC_V2 = b"NGPCST02"
-SHELL_SAVESTATE_MAGICS = (SHELL_SAVESTATE_MAGIC, SHELL_SAVESTATE_MAGIC_V2)
+SHELL_SAVESTATE_MAGIC_V3 = b"NGPCST03"
+# ⚡ `NGPCST04` met l'horloge calendaire EN TETE. Elle est de l'etat machine, pas de la
+# memoire : sans elle, restaurer un etat laissait le compteur interne de la pendule
+# continuer d'ou il en etait et reecrire ses registres au tick suivant -- un rejeu
+# divergeait d'un octet a 0x000096. Voir tests/test_link_savestate_roundtrip.py.
+SHELL_SAVESTATE_MAGIC_V4 = b"NGPCST04"
+SHELL_SAVESTATE_MAGICS = (SHELL_SAVESTATE_MAGIC, SHELL_SAVESTATE_MAGIC_V2,
+                          SHELL_SAVESTATE_MAGIC_V3, SHELL_SAVESTATE_MAGIC_V4)
 SHELL_SAVESTATE_MEM_LEN = 0x00C000
 
 
@@ -367,13 +376,15 @@ def load_shell_savestate(
     *,
     expected_rom_path: Path | None = None,
 ) -> SavestateDocument:
-    """Read a save state written by the player's emulator (`NGPCST01` / `NGPCST02`).
+    """Read a save state written by the player's emulator (`NGPCST01` / `NGPCST02` /
+    `NGPCST03`).
 
     Layout: magic, the native `CpuState` struct, the sound/timer block (`AuxState`,
-    v2 only), then `SHELL_SAVESTATE_MEM_LEN` bytes of the working image starting at
-    address 0. The structs are read through `core.native`'s ctypes mirrors, which are
-    pure declarations -- **importing them does not need the compiled core**, so this
-    works in a Python-only checkout.
+    v2 and v3), the link-cable block (`LinkState`, v3 only), then
+    `SHELL_SAVESTATE_MEM_LEN` bytes of the working image starting at address 0. The
+    structs are read through `core.native`'s ctypes mirrors, which are pure
+    declarations -- **importing them does not need the compiled core**, so this works
+    in a Python-only checkout.
 
     The sound block is SKIPPED, not parsed: this module's document models the main CPU
     and memory. It is stepped over so the image is still found where it starts.
@@ -384,25 +395,33 @@ def load_shell_savestate(
     reported as empty rather than invented -- a caller that needs certainty must ask
     the person which game it came from.
     """
-    from core.native import AuxState, CpuState   # ctypes declarations only; no DLL needed
+    from core.native import AuxState, CpuState, LinkState, RtcState  # ctypes declarations only; no DLL needed
 
     blob = path.read_bytes()
     magic = blob[: len(SHELL_SAVESTATE_MAGIC)]
     if magic not in SHELL_SAVESTATE_MAGICS:
         raise ValueError(f"{path} carries no known save-state magic: {magic!r}")
     cpu_size = ctypes.sizeof(CpuState)
-    aux_size = ctypes.sizeof(AuxState) if magic == SHELL_SAVESTATE_MAGIC_V2 else 0
-    header = len(magic) + cpu_size + aux_size
+    aux_size = ctypes.sizeof(AuxState) if magic in (
+        SHELL_SAVESTATE_MAGIC_V2, SHELL_SAVESTATE_MAGIC_V3,
+        SHELL_SAVESTATE_MAGIC_V4) else 0
+    link_size = ctypes.sizeof(LinkState) if magic in (
+        SHELL_SAVESTATE_MAGIC_V3, SHELL_SAVESTATE_MAGIC_V4) else 0
+    # L'horloge est en TETE du corps, avant le CPU (v4 seulement) : elle est SAUTEE ici,
+    # comme le bloc son, pour que l'image soit trouvee la ou elle commence.
+    rtc_size = ctypes.sizeof(RtcState) if magic == SHELL_SAVESTATE_MAGIC_V4 else 0
+    header = len(magic) + rtc_size + cpu_size + aux_size + link_size
     expected = header + SHELL_SAVESTATE_MEM_LEN
     if len(blob) != expected:
         raise ValueError(
             f"{path} is not a usable {magic.decode()} save state: "
             f"expected {expected} bytes ({cpu_size}-byte CPU struct + "
-            f"{aux_size} of sound/timer state + "
+            f"{aux_size} of sound/timer state + {link_size} of link-cable state + "
             f"{SHELL_SAVESTATE_MEM_LEN} of memory), got {len(blob)}"
         )
+    # v4 : l'horloge precede le CPU dans le corps.
 
-    cpu_at = len(magic)
+    cpu_at = len(magic) + rtc_size
     raw_cpu = CpuState.from_buffer_copy(blob[cpu_at : cpu_at + cpu_size])
     memory = blob[header:]
 

@@ -52,23 +52,46 @@ from __future__ import annotations
 
 import json
 import struct
+import time
 import zlib
 from collections import deque
 from typing import Protocol
 
 from core.link import run_two_consoles_interleaved
 
-PROTOCOL_VERSION = 1
+# 2 : le message d'empreinte porte desormais l'horodatage et l'echo (mesure de
+# l'aller-retour). Sa taille change, donc un pair d'avant ne peut pas le lire -- et la
+# version le lui dit proprement au lieu de le laisser desynchroniser sa lecture.
+PROTOCOL_VERSION = 2
 
 # Wire: [type:1][frame:4 LE][payload]. Fixed headers, so a partial read never has to
 # be guessed at -- the reader keeps whatever it cannot complete yet.
 _T_HELLO = 1        # payload = 2-byte length + JSON: what session this is
 _T_INPUT = 2        # payload = 1 byte: the pad for that frame
-_T_CHECK = 3        # payload = 4 bytes: a checksum of both consoles at that frame
+_T_CHECK = 3        # payload = 12 bytes: empreinte + horodatage + echo (voir plus bas)
+# ⚡ L'ALLER-RETOUR SE MESURE ICI, ET IL N'ETAIT MESURE NULLE PART.
+#
+# Avant ceci, `DEFAULT_DELAY = 3` s'appliquait quelle que soit la ligne et le delai se
+# TAPAIT A LA MAIN par les deux joueurs (« ping en ms / 17, plus un »). Sans mesure, on ne
+# peut pas distinguer « le link est instable » de « la ligne de ce joueur est mauvaise »,
+# donc **aucun rapport de bug n'est interpretable** -- c'est le §2.2 de LINK_NETPLAY_STUDY,
+# et c'est le prerequis de tout diagnostic.
+#
+# Le porteur est le message d'empreinte, qui part deja periodiquement : on lui ajoute
+# l'horodatage de l'emetteur et l'ECHO du dernier horodatage recu. Quand l'echo revient,
+# la difference est l'aller-retour complet. Aucun message nouveau, aucun trafic en plus
+# que 8 octets par empreinte.
+_CHECK_BODY = struct.Struct("<III")     # empreinte, horodatage emetteur, echo
 # The cartridge trade that runs BEFORE the session (see CartExchange). Its records
 # reuse this header with the LENGTH in the second field rather than a frame number.
 _T_CART = 4         # payload = none; the field is the peer's compressed image length
 _T_CHUNK = 5        # payload = that many bytes of it
+# ⛔ WHY A SIDE SAYS GOODBYE INSTEAD OF JUST HANGING UP. Refusing used to mean closing
+# the socket, and a TCP socket closed with unread data in its receive buffer sends a
+# RESET -- so the player whose settings were fine got `[WinError 10054]` and no idea
+# why, while the actual reason (a different core, a different BIOS) was on the OTHER
+# screen. One record, sent before the hang-up, carries it across.
+_T_BYE = 6          # payload = 2-byte length + reason text
 _HDR = struct.Struct("<BI")
 
 # How far ahead inputs are scheduled when nothing better is known. Three frames covers
@@ -82,6 +105,55 @@ class Pipe(Protocol):
 
     def send(self, data: bytes) -> None: ...
     def recv(self) -> bytes: ...
+
+
+def _flush(pipe) -> None:
+    """Push whatever a pipe is still holding back, without giving it new data.
+
+    ⛔ THE DEADLOCK THIS ENDS. A pipe over a real socket cannot hand everything to the
+    kernel on the spot -- when the send buffer is full it KEEPS the rest and waits to be
+    called again. Both users of this module used to call `send` only when they had
+    something new to say, so the moment the last record was queued the leftover stopped
+    moving: the cartridge trade sat at "100 % sent" with megabytes never posted, and the
+    peer waited for a tail that was two feet away on this PC. Flushing is now a thing
+    they do every pump, whether or not they have anything to add.
+
+    Optional on the transport: the lobby relay drains itself on its own thread, and the
+    test pipe has no buffer at all.
+    """
+    f = getattr(pipe, "flush", None)
+    if callable(f):
+        f()
+
+
+def _pending(pipe) -> int:
+    """How many bytes the transport is still holding for us (0 if it never holds any)."""
+    return int(getattr(pipe, "pending", 0) or 0)
+
+
+# The socket errors a player can actually hit, said in words rather than in numbers.
+# `[WinError 10054] Une connexion existante a dû être fermée par l'hôte distant` is a
+# true statement about a socket and tells the player nothing about what to do; worse,
+# it is what a refusal on the OTHER PC looks like from here, so it reads like a network
+# fault when it is a settings mismatch.
+_ERRNO_WORDS = {
+    "10054": "peer_closed",     # WSAECONNRESET  / ECONNRESET
+    "10053": "peer_closed",     # WSAECONNABORTED
+    "10060": "no_answer",       # WSAETIMEDOUT
+    "10061": "refused",         # WSAECONNREFUSED
+    "104": "peer_closed",       # ECONNRESET, POSIX
+    "110": "no_answer",         # ETIMEDOUT
+    "111": "refused",           # ECONNREFUSED
+}
+
+
+def plain_network_error(why: str) -> str:
+    """Keep the raw text, but lead with something a player can act on."""
+    text = str(why or "peer closed")
+    for code, word in _ERRNO_WORDS.items():
+        if code in text:
+            return f"{word} ({text})"
+    return text
 
 
 class ListPipe:
@@ -130,10 +202,20 @@ class SocketPipe:
         self._out = bytearray()
         self.lost: str | None = None
 
-    def send(self, data: bytes) -> None:
-        if self.lost is not None:
+    @property
+    def pending(self) -> int:
+        """Bytes accepted from the caller that the kernel has not taken yet."""
+        return len(self._out)
+
+    def flush(self) -> None:
+        """Try again with what the kernel refused last time.
+
+        ⚡ This is the whole reason the buffer is safe to have. Without a way to retry
+        that does not require new data, "the rest waits for the next call" is a promise
+        nobody keeps once the caller has said everything it had to say -- see _flush().
+        """
+        if self.lost is not None or not self._out:
             return
-        self._out += data
         try:
             sent = self.sock.send(self._out)
             del self._out[:sent]
@@ -141,6 +223,12 @@ class SocketPipe:
             pass                                    # buffer full: keep it, try again
         except OSError as e:
             self._lose(str(e))
+
+    def send(self, data: bytes) -> None:
+        if self.lost is not None:
+            return
+        self._out += data
+        self.flush()
 
     def recv(self) -> bytes:
         if self.lost is not None:
@@ -161,7 +249,7 @@ class SocketPipe:
 
     def _lose(self, why: str) -> None:
         if self.lost is None:
-            self.lost = why or "peer closed"
+            self.lost = plain_network_error(why)
         try:
             self.sock.close()
         except OSError:
@@ -187,7 +275,8 @@ class Handshake:
     """
 
     def __init__(self, *, rom_hash: str, bios_hash: str, core_version: str,
-                 delay: int = DEFAULT_DELAY, host: bool = False) -> None:
+                 delay: int = DEFAULT_DELAY, host: bool = False,
+                 console: dict | None = None, timing: str | None = None) -> None:
         # Our own cartridge fingerprint: announced, never compared for equality. The
         # receiving side checks the image it was SENT against it, which catches a
         # truncated or corrupted transfer -- the failure that would otherwise show up
@@ -195,13 +284,47 @@ class Handshake:
         self.rom_hash = rom_hash
         self.bios_hash = bios_hash
         self.core_version = core_version
+        # ⛔ LE MODELE DE TEMPS, ET IL EST COMPARE -- pas seulement annonce.
+        #
+        # `core_version` hache la DLL, mais le commutateur `--timing` est en PYTHON :
+        # deux joueurs sur le MEME build, l'un lance en `--timing legacy`, s'annoncent
+        # exactement la meme chose et simulent deux machines de vitesses differentes.
+        # C'est le desync qui ne se voit pas au branchement et tue le match en derive,
+        # celui-la meme que `lang` et `mono` ont deja coute une fois.
+        #
+        # ⚡ Et contrairement a `lang`/`mono`, ce n'est PAS un reglage par joueur : on ne
+        # peut pas construire la console du pair a partir de la sienne, il faut refuser.
+        if timing is None:
+            # Import tardif : `core.native` charge la DLL, et ce module s'importe aussi
+            # la ou elle n'est pas necessaire.
+            from core.native import active_timing_model
+            timing = active_timing_model()
+        self.timing = timing
+        # ⚡ SETTINGS THAT SHAPE THE SENDER'S OWN CONSOLE -- announced, like the
+        # cartridge, and for the same reason.
+        #
+        # ⛔ THE DESYNC THIS ENDS. The mirror of the other player's console was built
+        # from OUR settings. Two PCs with the same cartridge, the same BIOS and the
+        # same build could still be simulating two different machines: the cartridge
+        # language byte (0x6F87) is a per-player setting, and a bilingual cartridge
+        # branches on it. Nothing in the fingerprint saw that, so it did not refuse --
+        # it drifted, and the checksum killed the match a second in, saying only
+        # "desync". Announce it and build the peer's console from THEIRS, exactly as
+        # with the traded cartridge: two players with different settings can now play.
+        self.console = dict(console or {})
+        self.peer_console: dict = {}
         self.delay = int(delay)
         self.host = bool(host)
+        # Set when a session has been built on this handshake: from that moment the
+        # delay is baked into simulated frames and can no longer be reconciled, only
+        # refused. See check().
+        self.locked = False
 
     def payload(self) -> bytes:
         return json.dumps({
             "v": PROTOCOL_VERSION, "rom": self.rom_hash, "bios": self.bios_hash,
-            "core": self.core_version, "delay": self.delay,
+            "core": self.core_version, "delay": self.delay, "cons": self.console,
+            "timing": self.timing,
         }, sort_keys=True).encode("utf-8")
 
     def check(self, raw: bytes) -> str | None:
@@ -213,16 +336,45 @@ class Handshake:
         if int(them.get("v", -1)) != PROTOCOL_VERSION:
             return "protocol_version"
         self.peer_rom_hash = them.get("rom")     # what their image must hash to
+        cons = them.get("cons")
+        if isinstance(cons, dict):
+            self.peer_console = dict(cons)       # how to build THEIR console here
         if them.get("bios") != self.bios_hash:
             return "bios"
         if them.get("core") != self.core_version:
             return "core_version"
+        # ⓘ Absent = un build d'avant le 23/08/2026, dont le defaut ETAIT l'ancien
+        # modele. Le defaut de lecture dit donc la verite sur ce que ce pair simule,
+        # et aucune version de protocole n'a besoin de bouger pour le refuser.
+        if str(them.get("timing", "legacy")) != self.timing:
+            return "timing_model"
         # Both sides schedule their own input the SAME number of frames ahead, so a
         # different delay means the two PCs play different input streams from frame
-        # zero. Adopting the host's would be nicer, but the opening frames are already
-        # pre-filled by then -- refusing is the version that cannot be subtly wrong.
-        if int(them.get("delay", -1)) != self.delay:
+        # zero.
+        #
+        # ⚡ AND THE JOINER ADOPTS THE HOST'S, rather than the session being refused.
+        # Direct-IP hosting asks BOTH players for a number, and two people typing the
+        # same one is not something to build a mode on: any difference killed the
+        # session, and -- because a refusal is a hang-up, and a hang-up with unread
+        # data is a TCP reset -- the other player saw only `[WinError 10054]`. The
+        # lobby already had the joiner follow the host; this puts it where BOTH
+        # transports get it.
+        #
+        # ⛔ ONLY WHILE NOTHING HAS BEEN SIMULATED. Once a session exists the delay is
+        # baked into frames already played, and the earlier reasoning holds exactly:
+        # refusing is the version that cannot be subtly wrong. The session sends its
+        # own hello with whatever it settled on, so a joiner that failed to adopt is
+        # caught there, loudly, instead of drifting.
+        peer_delay = int(them.get("delay", -1))
+        if peer_delay < 0:
             return "input_delay"
+        if peer_delay != self.delay:
+            if self.locked:
+                return "input_delay"
+            if not self.host:
+                self.delay = peer_delay
+            # (the host keeps its own: the joiner adopts it, and the session-level
+            # hello is where that gets checked rather than assumed)
         return None
 
 
@@ -247,6 +399,13 @@ class CartExchange:
     # 32 KiB keeps a 4 MiB cartridge to ~128 sends without making one pump write
     # megabytes into a socket that has to stay responsive.
     CHUNK = 32 * 1024
+    # ...and no more than this many bytes may be waiting on the transport before the
+    # next chunk is cut. The shell pumps eight times per 16 ms tick, which offers 16 MB
+    # a second to a network that is not going to take it: without a ceiling the surplus
+    # piles up in the pipe's own buffer, the progress bar reads "sent" for bytes that
+    # have not left the PC, and a 4 MiB cartridge is held in memory three times over.
+    # Backpressure instead: ask the transport how far behind it is.
+    IN_FLIGHT = 256 * 1024
 
     def __init__(self, pipe: Pipe, image: bytes, handshake: "Handshake", *,
                  chunk: int = CHUNK) -> None:
@@ -271,13 +430,26 @@ class CartExchange:
 
     @property
     def done(self) -> bool:
+        # ⛔ "posted", not "queued". `_sent` only says which bytes were handed to the
+        # transport; a socket keeps back what the kernel would not take. Finishing on
+        # `_sent` alone declared the trade complete with megabytes still sitting in this
+        # PC's own buffer -- and since the session that follows only writes to the wire
+        # when it schedules a new input, and a session waiting for the peer never
+        # schedules one, those bytes never moved again. Both players then waited for
+        # each other for ever: one at "trading 100 %", the other frozen mid-percentage.
         return (self.greeted and self.peer_image is not None
-                and self._sent >= len(self._out))
+                and self._sent >= len(self._out) and _pending(self.pipe) == 0)
 
     @property
     def progress(self) -> tuple[float, float]:
-        """(sent, received) as fractions, for something honest to put on screen."""
-        up = self._sent / len(self._out) if self._out else 1.0
+        """(sent, received) as fractions, for something honest to put on screen.
+
+        "Sent" counts what the transport has actually posted, not what it was handed:
+        a bar that sits at 100 % while the peer crawls is the symptom of the bug above,
+        and it is worth not being able to draw it.
+        """
+        posted = max(0, self._sent - _pending(self.pipe))
+        up = posted / len(self._out) if self._out else 1.0
         down = (len(self._in) / self._want) if self._want else 0.0
         return (min(1.0, up), min(1.0, down))
 
@@ -288,7 +460,10 @@ class CartExchange:
         if lost:
             self.failed = str(lost)
             return
-        if self._sent < len(self._out):
+        # Retry whatever the transport still owes BEFORE cutting a new chunk: this is
+        # the only thing that moves the tail once the last chunk has been queued.
+        _flush(self.pipe)
+        if self._sent < len(self._out) and _pending(self.pipe) < self.IN_FLIGHT:
             piece = self._out[self._sent:self._sent + self._chunk]
             self.pipe.send(_HDR.pack(_T_CHUNK, len(piece)) + piece)
             self._sent += len(piece)
@@ -305,11 +480,20 @@ class CartExchange:
                 del self._rx[:_HDR.size + 2 + ln]
                 why = self.hs.check(body)
                 if why:
-                    self.failed = why
+                    self._refuse(why)
                     return
                 self.expect_hash = self.hs.peer_rom_hash
                 self.greeted = True
                 continue
+            if kind == _T_BYE:
+                if len(self._rx) < _HDR.size + 2:
+                    return
+                (ln,) = struct.unpack_from("<H", self._rx, _HDR.size)
+                if len(self._rx) < _HDR.size + 2 + ln:
+                    return
+                why = bytes(self._rx[_HDR.size + 2:_HDR.size + 2 + ln])
+                self.failed = "peer_refused: " + why.decode("utf-8", "replace")
+                return
             if kind == _T_CART:
                 del self._rx[:_HDR.size]
                 self._want = int(n)
@@ -327,17 +511,32 @@ class CartExchange:
             self.leftover += bytes(self._rx)
             self._rx.clear()
 
+    def _refuse(self, why: str) -> None:
+        """Say no, and make sure the OTHER player is told which no it was.
+
+        Without this the refusal is a silent hang-up: the peer's socket is reset and
+        all it can report is the reset. The reason lives on this screen, and the
+        player looking for it is at the other one.
+        """
+        self.failed = why
+        try:
+            msg = why.encode("utf-8")[:512]
+            self.pipe.send(_HDR.pack(_T_BYE, 0) + struct.pack("<H", len(msg)) + msg)
+            _flush(self.pipe)
+        except Exception:  # noqa: BLE001 -- refusing already; the wire may be gone
+            pass
+
     def _finish(self) -> None:
         try:
             image = zlib.decompress(bytes(self._in))
         except zlib.error as e:
-            self.failed = f"corrupt_transfer: {e}"
+            self._refuse(f"corrupt_transfer: {e}")
             return
         if self.expect_hash is not None and _image_hash(image) != self.expect_hash:
             # The peer told us what their cartridge hashes to in the hello. A transfer
             # that arrives different is a desync twenty seconds into the match; this
             # turns it into a refusal now.
-            self.failed = "cartridge_transfer_mismatch"
+            self._refuse("cartridge_transfer_mismatch")
             return
         self.peer_image = image
 
@@ -365,6 +564,10 @@ class MirrorSession:
         self.pipe = pipe
         self.hs = handshake
         self.delay = max(0, int(handshake.delay))
+        # From here the delay is baked into frames: the trade could still reconcile two
+        # different numbers, a running session cannot. Anything that disagrees now is
+        # refused rather than adopted (Handshake.check).
+        handshake.locked = True
         self.frame = 0
         # Inputs are scheduled `delay` frames ahead, so the opening frames have no
         # input to wait for -- pre-filled, identically on both sides.
@@ -376,6 +579,14 @@ class MirrorSession:
         self._rx = bytearray(prime)
         self._checks: dict[int, int] = {}       # frame -> the peer's checksum
         self._mine: dict[int, int] = {}         # frame -> ours, until the peer's lands
+        # Mesure de l'aller-retour (§2.2 de LINK_NETPLAY_STUDY). `rtt_ms` est la
+        # derniere valeur, `rtt_avg_ms` la moyenne de la session, `rtt_max_ms` le pire --
+        # c'est le pire qui explique un a-coup, pas la moyenne.
+        self.rtt_ms: int | None = None
+        self.rtt_avg_ms = 0.0
+        self.rtt_max_ms = 0
+        self._rtt_n = 0
+        self._peer_ts = 0
         self.desync_at: int | None = None
         self.rejected: str | None = None        # why the handshake failed, if it did
         self.greeted = False
@@ -392,15 +603,34 @@ class MirrorSession:
         self.pipe.send(data)
         self.bytes_out += len(data)
 
+    def _reject(self, why: str) -> None:
+        """Refuse the session, and tell the peer which refusal it was -- otherwise all
+        it gets is the TCP reset that follows the hang-up (see CartExchange._refuse)."""
+        if self.rejected is not None:
+            return
+        self.rejected = why
+        try:
+            msg = why.encode("utf-8")[:512]
+            self._send(_T_BYE, 0, struct.pack("<H", len(msg)) + msg)
+            _flush(self.pipe)
+        except Exception:  # noqa: BLE001 -- refusing already; the wire may be gone
+            pass
+
     def _drain(self) -> None:
+        # ⚡ Push before pulling, every frame, even when we have nothing new to say.
+        # A session only writes when it schedules an input, and a session that is
+        # WAITING for the peer schedules none -- so a byte the kernel would not take
+        # would stay here exactly when the peer is waiting for it. Two stalled sides
+        # that both stop flushing never restart each other.
+        _flush(self.pipe)
         chunk = self.pipe.recv()
         if chunk:
             self._rx += chunk
             self.bytes_in += len(chunk)
         while len(self._rx) >= _HDR.size:
             kind, frame = _HDR.unpack_from(self._rx, 0)
-            need = {_T_INPUT: 1, _T_CHECK: 4}.get(kind)
-            if kind == _T_HELLO:
+            need = {_T_INPUT: 1, _T_CHECK: _CHECK_BODY.size}.get(kind)
+            if kind in (_T_HELLO, _T_BYE):
                 if len(self._rx) < _HDR.size + 2:
                     return
                 (n,) = struct.unpack_from("<H", self._rx, _HDR.size)
@@ -418,12 +648,28 @@ class MirrorSession:
             if kind == _T_INPUT:
                 self.peer_inputs[frame] = body[0]
             elif kind == _T_CHECK:
-                self._checks[frame] = struct.unpack("<I", body)[0]
+                somme, leur_ts, echo = _CHECK_BODY.unpack(body)
+                self._checks[frame] = somme
+                self._peer_ts = leur_ts          # a renvoyer dans notre prochain envoi
+                if echo:
+                    # L'echo est NOTRE horodatage revenu : la difference est l'aller
+                    # ET le retour, sans horloge commune a supposer entre les deux PC.
+                    aller_retour = (self._now_ms() - echo) & 0xFFFFFFFF
+                    if aller_retour < 60000:      # au-dela, c'est un compteur qui a boucle
+                        self.rtt_ms = aller_retour
+                        n = self._rtt_n = self._rtt_n + 1
+                        self.rtt_avg_ms = (self.rtt_avg_ms * (n - 1) + aller_retour) / n
+                        self.rtt_max_ms = max(self.rtt_max_ms, aller_retour)
+            elif kind == _T_BYE:
+                # The peer refused, and said so instead of just dropping the socket.
+                self.rejected = self.rejected or (
+                    "peer_refused: " + body[2:].decode("utf-8", "replace"))
+                return
             else:
                 self.greeted = True
                 why = self.hs.check(body[2:])
                 if why:
-                    self.rejected = why
+                    self._reject(why)
 
     # --- state ---------------------------------------------------------------
     def checksum(self) -> int:
@@ -437,6 +683,12 @@ class MirrorSession:
         return zlib.crc32(p2.read(0x4000, 0x2C00), crc) & 0xFFFFFFFF
 
     # --- the frame ------------------------------------------------------------
+    @staticmethod
+    def _now_ms() -> int:
+        """Une horloge MONOTONE, jamais l'heure du mur : un ajustement NTP en pleine
+        partie ferait sauter l'aller-retour mesure, ou le rendrait negatif."""
+        return int(time.monotonic() * 1000) & 0xFFFFFFFF
+
     def step(self, pad: int) -> str:
         """Advance one frame if the peer's input for it has arrived.
 
@@ -493,7 +745,9 @@ class MirrorSession:
             # and kept until the peer's copy for that same frame turns up -- it will
             # arrive a round trip later, not now.
             self._mine[self.frame] = self.checksum()
-            self._send(_T_CHECK, self.frame, struct.pack("<I", self._mine[self.frame]))
+            self._send(_T_CHECK, self.frame,
+                       _CHECK_BODY.pack(self._mine[self.frame], self._now_ms(),
+                                        self._peer_ts))
         for f in sorted(set(self._mine) & set(self._checks)):
             if self._mine.pop(f) != self._checks.pop(f) and self.desync_at is None:
                 self.desync_at = f
