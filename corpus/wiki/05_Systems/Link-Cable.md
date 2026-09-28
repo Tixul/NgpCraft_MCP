@@ -428,6 +428,41 @@ while each believing it was right.
 
 ---
 
+### 8.5 State exchange instead of lockstep — a two-player racing game
+
+Input lockstep (§8.3) keeps two consoles computing the same game. A racing game can do
+something cheaper: **each console runs ITS race** — its physics, road and obstacles — and the
+wire carries only what the other needs to DRAW. A lost exchange desynchronises nothing: the
+next one replaces it.
+
+* **Make content deterministic, then there is nothing to send.** Obstacles seeded by the
+  track number are identical on both sides.
+* **Send positions in a shared unit.** The packet (12 bytes: phase, chosen track, car body for
+  the colour, GO / FINISHED / CRASH flags, position, lateral pixel, speed, finish time, race
+  number) carries the rival-model position, which both consoles compute with the same
+  formula — not the track-profile position, which does not compare.
+* **The AI rival is unplugged** and the remote car takes its place (colour, contacts, 1ST/2ND
+  on the HUD); everything else is the same code.
+* **Who is player 1:** the first one on the link screen (the session layer's search-time rule,
+  §8.2). No question asked.
+
+Three traps, all measured on two emulated consoles:
+
+1. ⛔ **The session timeout counts EXCHANGES, not frames.** Menus exchange every frame, the
+   race once per loop turn (three frames): the layer's 240-exchange timeout became **twelve
+   seconds** in a race — one console stopped, the other kept driving 710 frames. The race
+   counts its own: 60 turns without a packet (~3 s), then close the link and show LINK LOST.
+2. ⛔ **Player 1 started seven frames early** because it launched its lights when SENDING the
+   GO. Two turns of waiting reversed the lead; **one turn gave identical times** on both sides.
+3. ⛔ **Blocking screens must pump the cable.** Win/lose and summary screens that loop on
+   their own for 150–420 frames made the peer declare the link lost while you looked at a
+   still image.
+
+Also: B at the garage sent player 2 back to the lobby, then straight back to the garage the
+next frame (player 1 always has a track selected) — remember the REFUSED race number and wait
+for a new one. No pause and no records in a two-player race. ⚠️ Not verified on two real
+consoles: watch the per-line MicroDMA running while the BIOS UART interrupts at 19 200 bps.
+
 ## 9. Gotchas & field notes
 
 - **`COMSENDSTATUS` can return garbage under compiler optimisation.** Building a link

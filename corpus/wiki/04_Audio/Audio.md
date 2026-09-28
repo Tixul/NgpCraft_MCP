@@ -530,6 +530,35 @@ Converting from PC-speaker pitches (`f = 1193182 / divisor`), the divisor maps a
 
 ---
 
+### 6.7 A racing game's sound: the engine, the mix, and the measurement
+
+Measured on a finished racer by reading what the chip receives while driving eight scripted
+phases (idle, accelerate, full revs, brake, relaunch, slide, off-road, crash):
+
+* **An engine is two channels BEATING.** One channel on one divider is a clean square —
+  nothing like a motor. Two channels a hair apart beat against each other, and that beat is
+  what the ear hears as combustion. A mix that gives the second channel to the race music
+  leaves the engine as one plain note **exactly while driving**. Decide which one the race
+  keeps; an alternative is periodic noise tuned under the engine on the noise channel (already
+  busy 33–68 % of the time with tyres and off-road).
+* **Check the pitch range really reached.** Code aiming at 160 → 520 Hz produced 98 → 213 Hz
+  (1.1 octaves instead of 2): the revs never reached the top of their range or the update did
+  not cover it. Rising pitch IS the feeling of speed — instrument the revs and the divider.
+* **Engine level:** attenuation 6–11 (−12 to −22 dB) while commercial music sits at a median
+  of 4 — the main sound of a racing game played quieter than a fighting game's accompaniment.
+* **A crash needs a signature**: an attack at attenuation 0–2 for 3–4 frames detaches it from
+  the noise bed.
+* **The transport caps commands per frame** (5 in the template driver) and **drops** the
+  excess rather than queuing it — watch it when engine, tyres and music play together.
+* **Random music per level:** use a PRNG of its own (seeded with the VBlank counter at the
+  start), never the gameplay PRNG — drawing a song must not change the race. "Restart"
+  redraws and replays the intro; "continue" keeps the song and its position.
+* **Keep the music across screens** that share it and serve the driver during loads
+  ([Game Loop](../05_Systems/Game-Loop.md) §5.5).
+* An exporter that writes an empty cell after a note as a "release" command **cuts held
+  notes** at the end of each row, and one that resets every loop point to 0 replays the intro:
+  validate the exported stream (pitches AND attack intervals) against the source.
+
 ## 7. Path B — Direct PSG Pattern
 
 For simple sequences (sound effects or music) without a full Z80 driver.
@@ -874,6 +903,174 @@ custom VBlank ISR have their own counter that is not synchronized with the BIOS 
 
 ---
 
+## 10. What Commercial Games Actually Do (Measured)
+
+Every figure below was measured by capturing **every write reaching the T6W28**, with
+cycle timestamps, across **20 commercial NGPC titles** (10 seconds of music each), then
+reconstructing the chip registers from that byte stream. They describe what shipping
+games do, not what the hardware merely allows.
+
+### 10.1 The sound driver does not run on VBlank
+
+| | measured |
+|---|---|
+| Time between two refreshes of the same register | **4.01 – 4.55 ms** (median 4.07) |
+| Refresh rate | **~245 Hz** |
+| Refreshes per video frame | **~4.1** |
+
+All 20 titles configure the same Z80 interrupt: `TRUN = 0x88`, `TREG3 = 0x62`, i.e.
+98 × 1.302 µs ≈ **7 837 IRQ/s**.
+
+The interrupt itself plays no music. In the official SNK driver its handler only does:
+
+```asm
+0038: DI / EX AF,AF' / INC A / OUT (0xFF),A / EX AF,AF' / EI / RETI
+```
+
+It increments a counter. (This also explains the `OUT (0xFF)` writes most commercial ROMs
+emit — they are ticks, not sound, and must not be fed to the chip.) The **main loop**
+reads that counter, works out how many interrupts have elapsed, and advances the music by
+that delta. A sequencer step falls when an accumulator overflows:
+
+```
+sum( elapsed_IRQ × 4 × speed ) >= 1250      →  step rate = 25.08 × speed  Hz
+```
+
+So **245 Hz is not a hardware constant — it is the song's tempo**, an integer. Seventeen
+of the twenty titles use speed 10 (250.8 Hz); three use speed 9 (225.7 Hz).
+
+Practical consequence: a driver ticking once per frame (60 Hz) cannot reproduce this
+material. Re-sampling captured music down to 60 Hz drops **16 – 21 % of its notes**
+outright, and the note-event rate falls by more than half — short notes vanish when the
+sampling instant misses them, and the remaining ones stretch.
+
+### 10.2 The two write ports are not symmetric
+
+| Z80 address | Carries |
+|---|---|
+| `0x4001` (left) | left attenuations **+ all three tone periods** |
+| `0x4000` (right) | right attenuations **+ noise control + the noise period** |
+
+Because pitch only ever travels through the left port, the left side always receives more
+bytes than the right — even in a perfectly mono mix. A left/right byte count that is
+exactly equal is therefore a signature of a driver that mirrors every write to both ports.
+
+### 10.3 The noise generator has its own period (unlike the SN76489)
+
+On a plain SN76489, noise mode 3 steals tone channel 2's period. On the T6W28, writing
+the channel-2 period register **through the right port** feeds a *separate* noise period.
+Channel 2 keeps its own pitch, written through the left port.
+
+**Ten of the twenty titles** use this to tune their drums — up to three distinct timbres
+on the single noise channel — while keeping a bass line on channel 2. Periods observed:
+1–7 for a hi-hat, 18–30 for a snare, 45–115 for a kick.
+
+The remaining titles use the fixed noise periods, `0x10` (the highest) being the common
+choice.
+
+### 10.4 Periodic noise: rare, and not used as percussion
+
+Two titles out of twenty disable the LFSR tap (periodic noise). One of them uses it
+*exclusively*, tuned across five periods, sounding **underneath a scale played on a tone
+channel** at full volume — the noise generator acting as a fourth melodic voice rather
+than as a drum. It is the least explored corner of the chip.
+
+### 10.5 Panning is an attenuation offset, nothing more
+
+The T6W28 has no pan register. Games place a voice by writing a **different attenuation to
+each port**; one step is 2 dB.
+
+- **12 of 20** titles pan at all.
+- The pattern is remarkably consistent: **channel 2 centred (17 of 20)**, channels 0 and 1
+  spread symmetrically by ±1 to ±4 steps (2 to 8 dB).
+- The offset is **constant for the whole piece** — a placement, not an automation. Both
+  sides follow the same envelope, shifted.
+
+A distinct second use: cutting one side entirely, so a voice plays in one ear only. Six
+titles do this for 13 % to 29 % of the time. The two techniques are independent — one
+title never pans yet cuts a side a quarter of the time.
+
+### 10.6 Envelopes are hand-drawn, and re-attack is the pulse
+
+The chip has one waveform and sixteen attenuation steps: **all timbre comes from the
+volume curve**, rewritten every driver tick.
+
+Average decay slope per title: **1.0 to 2.2 steps per tick** (2 to 4.4 dB every 4 ms).
+Four recurring shapes:
+
+| Shape | Profile (attenuation per tick) | Use |
+|---|---|---|
+| Plateau then fall | `1 1 1 1 1 1 1 2 3 4 5 6` | the default instrument |
+| Two-level attack | `0 0 0 1 6 6 7 7` | a plucked transient |
+| Stepped decay | `3 5 5 5 10` (20 ms) | staccato accompaniment |
+| Long plateau | `5 5 5 5 5 6 6 6 …` (360 ms) | held bass or pad |
+
+**Rhythm is not made by changing note — it is made by re-attacking the same one.** A held
+note is relaunched (attenuation dropped back) every 8 to 11 ticks, i.e. 35–45 ms. This
+costs no extra voice, and it is universal across the corpus.
+
+It also means an instrument whose level never falls cannot pulse at all: with no envelope,
+re-attacking a note is inaudible.
+
+### 10.7 Where the notes actually sit
+
+Registers used (10th to 90th percentile across all titles):
+
+| Channel | Median | Range in use |
+|---|---|---|
+| 0 | B4 | G3 → B5 |
+| 1 | G#4 | G#3 → C6 |
+| 2 (usually the bass) | E3 | A2 → G5 |
+
+Channel 2 carries the lowest voice in 15 of 20 titles.
+
+**The bass does not go low.** A2 (110 Hz) is the floor in practice, and there is a hard
+one just below: the tone divider is 10 bits, so anything under **~94 Hz (F#2)** saturates
+and every lower note sounds at the same pitch.
+
+Interval between two sounding voices, reduced to one octave (41 000 samples):
+
+| Interval | Share | Interval | Share |
+|---|---|---|---|
+| unison / octave | **19.0 %** | minor third | 9.8 % |
+| fourth | **13.6 %** | major third | 9.2 % |
+| fifth | **13.4 %** | tritone | 5.2 % |
+| major second | 10.6 % | minor second | 2.7 % |
+
+Nearly half the time two voices are an octave, a fourth or a fifth apart. Minor seconds
+and tritones are rare — and that is physics, not taste: two square waves a third apart
+beat audibly, while open intervals stay clean.
+
+### 10.8 Density and throughput
+
+| | min | median | max |
+|---|---|---|---|
+| Writes per second | 705 | 1 807 | 2 872 |
+| Writes per frame | 11.8 | 30.1 | 47.9 (peak 62) |
+| Note attacks per second | 6.8 | **20.4** | 54.0 |
+| Rhythmic grid | 29.5 ms | — | 257 ms per step |
+
+A piece that sits well under 7 attacks per second will sound emptier than any shipping
+NGPC soundtrack.
+
+### 10.9 Pitch effects, by how much they are actually used
+
+| Effect | Usage | Shape measured |
+|---|---|---|
+| **Vibrato** | most common | triangular, ±4 to ±6 divider units, cycle 12–16 ticks (**15–20 Hz**) |
+| Detune (±1 unit, no cycle) | common | thickens a held note; not a vibrato |
+| Slide | occasional | attack ornament, 6–30 % of the period |
+| Octave trill (period ÷2 alternating) | two titles | reads as vibrato on a counter, is not |
+| Arpeggio (3 pitches in 4 ticks) | rare | only where a piece has two real voices |
+| Delayed doubling (one voice replays another) | one title | ~5 ticks (22 ms) behind, on 41 % of the piece |
+
+Note the vibrato rate: **15–20 Hz**, well above the 5–7 Hz of an acoustic vibrato. It is a
+timbre choice, not an imitation. A depth expressed in *divider units* also modulates far
+harder in the treble than in the bass — the same depth that is inaudible at E2 is close to
+two semitones at C6.
+
+---
+
 ## Quick Reference
 
 | Item | Value | Notes |
@@ -886,9 +1083,12 @@ custom VBlank ISR have their own counter that is not synchronized with the BIOS 
 | Z80 NMI | write any byte → `0x00BA` | |
 | Z80 comm | `0x00BC` | bidirectional |
 | PSG port (Z80) | `0x4000` (R) / `0x4001` (L) | write both for mono |
+| Panning | attenuation offset, 2 dB/step | no pan register on the chip |
 | Direct PSG (CPU) | `0x00A0` / `0x00A1` | noise / tone |
 | Attenuation | 0 = loud, 15 = silent | 4-bit inverse |
+| Driver tick (commercial) | ~245 Hz, ~4.1 per frame | not VBlank; tempo = 25.08 x speed Hz |
 | Freq formula | `3072000 / (32 * n)` | n = 1..1023 |
+| Tone divider floor | ~94 Hz (F#2) | 10-bit divider saturates below |
 | NOTE_TABLE | 0..50 (A2..B6) | 51 entries |
 | BGM stream REST | `0xFF` | silence for 1 tick |
 | BGM stream END | `0x00` | required terminator |

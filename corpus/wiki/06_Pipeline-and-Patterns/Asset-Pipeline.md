@@ -282,6 +282,96 @@ OBJS  += $(OBJ_DIR)/optional/ngpc_dialog/ngpc_font.rel
 
 ---
 
+## 8. Converter Pitfalls Learned on a Finished Game
+
+Every generator of a complete game hit at least one of these. None fails loudly: each one
+produces a **plausible, wrong** image.
+
+### 8.1 The LEFT pixel is the HIGH bits
+
+A character row is a 16-bit word holding eight 2-bit pixels, and the leftmost pixel is in the
+**most significant** bits. Writing them the other way **mirrors every character** — invisible
+on symmetric art (a road board had the fault and nobody could see it), obvious the day a
+start light came out "as a butterfly", its two halves back to back. Test every new generator
+on an asymmetric glyph.
+
+### 8.2 Two objects that touch are one sprite
+
+A tool that cuts a ladder of sizes by **fully empty columns** merged two barriers drawn 1 px
+apart into one 46-px object — two barriers side by side on screen, reported as "stacked,
+messy". Nothing in the drawing says it is wrong. Insert the missing empty column in a prep
+step (keep the source sheet intact) and have the tool print the cuts it found. Also drop
+near-duplicate sizes (a 22-px step 8 % away from the 24-px one) — fewer characters.
+
+### 8.3 Prefix macros AND symbols
+
+A generator that takes `--name` must prefix **both** its `#define`s and its C symbols. Three
+times the same bug (cars, horizons, buttons): two generated files defining the same macro,
+the last one included silently winning.
+
+### 8.4 Palette-coherent conversion of a background
+
+A converter that picks each cell's palette independently, then reduces the tile count by
+**bit distance** between patterns, produces a checkerboard: two patterns close in bits can
+show very different colours depending on their palette, and big sky areas show every error.
+What fixed it:
+
+* fit the 8 palettes to the colours actually present;
+* assign palettes considering **neighbouring edges** and the differences present in the
+  source (a real mountain ridge is not a seam);
+* reduce to the tile budget by **displayed colour** distance, pattern frequency and internal
+  gradients — so building strokes are never reused in the sky;
+* no blur, no new dithering. Then targeted fixes: neighbouring palettes sharing the SAME sky
+  blue / forest green, a majority filter and removal of isolated specks on clouds.
+
+Measure the mean error at tile borders in near-uniform areas: it fell ~60 % across 16
+backgrounds. Keep the old converter reachable for comparison.
+
+### 8.5 A wrapping panorama: judge the seam by eye, shifted
+
+A 256-px panorama wraps when the player turns. The mean difference between column 255 and
+column 0 **overestimates** the damage on textured art and does not say *where* the gap falls:
+two versions of a snowy pass at 1.85 and 1.79 — one cut a cloud and a ridge cleanly, the other
+showed nothing. **What makes a seam visible is a CONTINUOUS STRUCTURE crossing it** (a ridge,
+a horizon line), not a mean gap. Method: render the board **shifted by 128** to put the seam
+mid-screen, and look, board by board, before rejecting or accepting it. A mirror blend over
+~24 columns repairs one that fails. And **a preview rebuilt from a scaled image must verify
+that each 4×4 block is uniform** before being trusted — a preview resized another way gives a
+plausible, wrong image.
+
+### 8.6 First row uniform; colour 0 is transparent
+
+* The first (top) row of a scenery board must be **one flat colour** if the engine may repeat
+  it (hills, §8.4 of [Pseudo-3D Road](../03_Graphics/Pseudo-3D-Road.md)).
+* Art ripped from a system where colour 0 is opaque (e.g. a black HUD panel) becomes a hole
+  here: remap it, or the road shows through.
+* If a plane uses index 0 as a visible colour (grass), that colour is the **backdrop
+  register** — one flat colour for the whole screen; measure it on the last visible row of the
+  art above it or you get a seam.
+
+### 8.7 Generated text and generated tables are never edited by hand
+
+When dialogue or data is generated from a source file, **regenerating must give the same `.c`
+byte for byte** — that is the proof the ROM shows the reviewed text. Hand edits in the
+generated file are lost at the next export or, worse, make the check fail forever. Same for
+asset headers: a tile count lives in the generated header, and the loader must be rebuilt
+when it changes ([Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.5b).
+
+### 8.8 One image, many states: palette writes instead of character loads
+
+If the frames of an animation have exactly the same shape and only change colour (a start
+light: 108 px of housing, 75 px of lamp), load ONE image and make each state a **palette
+write**: 4 characters instead of 20, and no VRAM upload per state. Let the generator find the
+changing pixels by comparing the frames rather than assuming them.
+
+### 8.9 The character budget can be clipped in silence
+
+With 512 characters shared by sprites and planes, an allocator that returns "base 512" when
+full instead of failing leaves **the last module served with no art at all** (here: road
+signs killed by a new HUD, while every automated drive stayed green — a bot does not look at
+signs). Add a check that names the starved module, and measure the peak **per selectable
+asset**: the peak depended on the chosen car (458 vs 461 vs 494 of 512).
+
 ## Quick Reference
 
 | Task | Command |

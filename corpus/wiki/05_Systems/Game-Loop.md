@@ -141,7 +141,7 @@ void __interrupt isr_vblank_minimal(void) {
 ```c
 void main(void) {
     ngpc_init();            /* installs VBL ISR, inits hardware */
-    ngpc_load_sysfont();    /* load ASCII glyphs to tile slots 32-127 */
+    ngpc_load_sysfont();    /* 256 font chars to tile slots 0..255 */
 
     /* ... load assets, init game state ... */
 
@@ -290,6 +290,30 @@ Measured **45 VBlanks** per zoom phase against an ideal 24; rebuilding only the 
 
 ---
 
+### 4.5 Physics per loop turn: a faster loop is a faster game
+
+If gameplay integrates once per loop turn (not per second), every performance gain makes the
+game faster in **real time**, not just smoother — cars, rival and scrolling alike (2.33 →
+2.00 VBlanks per turn = +16 %). That can be the right choice, but make it knowingly, and after
+any large speed-up re-tune every per-frame constant. Two clocks stay honest regardless:
+
+* **the race clock counts real VBlanks** (add one per VBlank produced, independent of the
+  loop), never loop turns;
+* the console produces **59.95** frames per second (cycles counted at 6.144 MHz): a clock
+  that assumes 60 drifts 0.05 s per minute — below a lap's resolution, but know it.
+
+Count loop turns by an unambiguous on-screen event with a known number of turns (a start
+light that holds 25 turns per colour) — dividing by 24 made every figure of one tool 4 % high.
+
+### 4.6 Frame pacing that tolerates an overrun
+
+Declaring "2 VBlanks per turn" is not holding it. A pacing function that drags its anchor to
+"now" when a turn costs more than a full slot makes the real cadence variable (3.27–3.33 on
+some tracks while 2 was declared) — and that shows as flicker on anything that depends on the
+frame (see [Pseudo-3D Road](../03_Graphics/Pseudo-3D-Road.md) §9). Declaring 3 instead of 2 did not change the
+measured cadence: **lower the cost of the turn, not the announced number.** Measure VBlanks
+per turn, turn by turn, on every scene ([Measuring Performance](Measuring-Performance.md) §4.7).
+
 ## 5. State Machine Pattern
 
 ### 5.1 Basic enum state machine
@@ -374,6 +398,64 @@ void bullets_update(void) {
 ```
 
 ---
+
+### 5.4 Screen transitions: what the black frames are made of
+
+Starting point on a finished game: **21 frames with the window closed** per screen change, a
+third of a second, where comparable games feel instant. Measured, then fixed one by one:
+
+| cause | gain |
+|---|---|
+| **an accessor per word**: each 16-bit word of page art fetched through a function walking an 8-way `if` chain — 1 600 calls, **12 000 comparisons to copy 3 200 bytes**. A ROM pointer table was not an option (see [Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.5d): **fill a struct in RAM from a branch once per load** | 5 frames |
+| **drawing arrived one loop turn late**: the entry function loaded, returned, and the page drew on the next turn, the push to the plane at the end of that one. Clear, load tiles and **write both maps inside the entry**, before returning | 2 frames |
+| **the same plane cleared three times** with three values; only the last one shows. One clear per plane | 2 frames |
+| **character RAM written byte by byte**: it is ordinary VRAM — write `u16` words, same bytes, half the loop turns. From the cartridge, **the price of a copy is the number of instructions executed per byte**, not the number of bytes | 2 frames |
+
+What remained (~12 frames, by bisection: page draw ~5, tile load ~3, clears and text layer
+~4) is a **design choice**: a comparable game has no curtain at all — it redraws window
+open, you briefly see the page assemble and never see black. A curtain exists because the
+rebuild is ugly to watch. Twelve frames of black or zero frames of black with the page
+assembling is an author's choice, not an optimisation. One frame of curtain is not
+negotiable: the window must open inside the blanking interval, or one frame shows its top
+half closed and its bottom half open.
+
+⚠️ Change palettes **after** closing the window — loading inks before the close flashes the
+old screen in the new colours.
+
+### 5.5 Keep the music alive during loads
+
+A load that blocks the loop also blocks whatever advances the music: the chip holds its last
+command, then the sequencer catches up missed frames — a held note and a hiccup. Measured on
+a menu chain: the music clock stalled up to 19 frames per transition.
+
+* Put **audio service points** inside long loops (row clears, tile loaders, map draws,
+  per-track computations), running only if a new VBlank has occurred since the last call.
+  Stalls fell to 1–3 frames; the cost was 3–6 more frames of black.
+* **Same song on the next screen → do not restart it.** A new song → start it at the END of
+  the entry function, after drawing, not immediately after `stop` (which left 10–13 frames of
+  silence proportional to the load).
+* Do not call the driver from the ISR without an audit; do not serve sound in the middle of a
+  flash program (the stub runs with interrupts masked for a reason).
+
+### 5.6 A full-screen pause that allocates no RAM
+
+A pause menu over a running race, with the race state intact and zero RAM added — by using
+VRAM that is not displayed:
+
+* the **380 visible cells of SCR1** saved into its off-screen rows (19..30);
+* the **64 sprite visibility attributes** saved into SCR1's right margin;
+* palette 15, the SCR1 offset and priority saved into the last cells;
+* **122 characters borrowed from #128** saved into the SCR2 map (2 KB — a compile-time assert
+  caps the pause tile set at 128 so the save fits);
+* on resume, characters, HUD cells and attributes are restored **to the byte**; the SCR2 map
+  is rebuilt from ROM (road and sky) without resetting the race engine or its scroll tables;
+  the clock and the pacing anchor are re-based after the load; the confirming press is
+  consumed before driving resumes.
+
+Suspend the road DMA and close the window during the copies; keep the music running
+(§5.5); do not write flash on each volume notch (mark dirty, save on the next menu return).
+Verify by comparing the 8 KB of characters, the visible HUD, sprites, their palette indices,
+SCR1 palette and SCR2 map byte for byte after several pause/resume cycles.
 
 ## 6. Pipeline A — Map Streaming + Main Loop
 
@@ -726,7 +808,7 @@ with stop/re-arm DMA conforming to the Pipeline C pattern.
 void ngpc_init(void);           /* Call first. Installs VBL ISR, inits viewport. */
 u8   ngpc_is_color(void);       /* 1 = NGPC Color, 0 = monochrome NGP */
 void ngpc_shutdown(void);       /* Power off (BIOS call) */
-void ngpc_load_sysfont(void);   /* Load BIOS font into tile RAM (slots 32-127) */
+void ngpc_load_sysfont(void);   /* Load BIOS font into tile RAM (slots 0..255) */
 void ngpc_memcpy(dst, src, n);  /* Byte copy */
 void ngpc_memset(dst, val, n);  /* Byte fill */
 

@@ -202,6 +202,41 @@ exist. Reading the bullet array directly showed the real difference (20 → 0).
 
 ---
 
+### 3.7 Bench traps met on a finished game
+
+- **The BIOS copies the joypad port into `0x6F82` once per VBlank, one frame late.** A value
+  is only seen if TWO VBlanks pass between writing the port and the game's read. Writing
+  `0x6F82` yourself makes it flicker; writing the port just before the read makes the bench
+  depend on the ROM's speed. Correct: decide the input at loop turn *t*, write only the port,
+  right after the VBlank that opens the turn — read at *t+1*.
+- **Benches can depend on LOST presses.** A menu walk had its "right" prefix only because
+  five A presses in a row were being lost on one page. Once presses stopped being lost (see
+  [Input](Input.md) §7.5) the walk broke. Every menu walk must follow the page it READS and
+  wait for the press to be consumed before sending the next.
+- **Write the choice, do not navigate to it.** On a fresh save only one track is unlocked:
+  N presses to the right all land on the first one, and a profiler measured the same track
+  ten times — which the ten identical cycle counts betrayed. Write the menu's selection
+  variable, then **check the result** (read the track length) before concluding.
+- **A probe build must be a CLEAN build.** When the probe is a `-D` compile flag and object
+  files share one directory, building the probe without `clean` links objects from the normal
+  build: a hybrid ROM that half-probes.
+- **A probe block has owners.** A 32-byte debug block with bytes beyond it "unused" is not
+  free — those addresses belong to nobody in particular. Values written there read back right
+  once in 150 frames. Allocate probe fields explicitly and list their readers.
+- **Date samples by the GAME's tick, not the emulator's frame.** With the loop running once
+  per three frames, a lateral position that stays frozen three frames then moves looks
+  exactly like an impact (three steering steps at once): 58 false "overshoots".
+- **Take thresholds from a measurement, never from a comment.** One comment's lateral budget
+  was wrong by a factor 1.7.
+- **An emulator that writes flash into the ROM file** makes benches read the player's save:
+  wipe the save block in memory at boot in every bench.
+- **Two computations of the same thing always drift apart.** Tools that keep their own copy
+  of a list (tracks, thumbnails) must REFUSE to run when the game has an entry they do not
+  know — a tool that silently measures 9 tracks out of 10 says "all green"; one that
+  computes quantiles over 9 while the ROM uses 10 accuses a healthy track. **A gate that
+  accuses an innocent costs more than a silent one.** And break every gate on purpose once:
+  a gate that has never failed has not been shown to work.
+
 ## 4. Techniques with measured outcomes
 
 Sizes are project-specific; the *sign* and the reasoning generalize.
@@ -276,6 +311,62 @@ shifts by 12 VBlanks and you cannot say why, the change is not ready.
 
 ---
 
+### 4.6 What an instruction costs when the code runs from the cartridge
+
+Code executes from the cartridge, with its wait states: **the price of an instruction follows
+the number of BYTES it makes the CPU fetch**, not its apparent complexity. Measured
+instruction by instruction in a race loop:
+
+| form | bytes | cycles |
+|---|---|---|
+| register-register (`ld wa,de`, `add hl,bc`) | 2 | 8 |
+| `ld wa,(xix)`, `dec 0x2,xix` | 2 | 8–10 |
+| `(xiz+d)`, `(xsp+d)`: a field reached through register + displacement | 3 | 14–16 |
+| `ld wa,imm16`, `cp wa,0x80` | 4 | 16 |
+| **register-indexed** `(xhl+bc)`, `(xiy+wa)` | **5** | **22** |
+| **absolute address** `ld a,(_sym)` (24-bit) | **5** | ~22 |
+| `mul xwa,de` | 2 | 25 |
+| call with stacked parameters | — | ~100 and up; **~300** with several |
+
+Observed average: **11–14 cycles per instruction.** Consequences:
+
+* you win by executing FEWER instructions, not cleverer ones;
+* **assembly only pays where the compiler emitted far too many instructions** — and where
+  everything fits in registers: a first assembly walk that re-read its parameter block every
+  slice saved 4 000 cycles out of 49 000; the rewrite that kept everything in registers saved
+  21 000;
+* **work done for nothing pays as much as assembly**: look first for UNEXPECTED CALLS in a
+  per-function profile (two accessors called thirty times per turn in a loop, three calls
+  per roadside post, a HUD label rewritten every turn, 72 tile writes to clear one text);
+* **a per-segment cache** beats a shorter computation: a value that depends only on the
+  current segment does not change while you stay in it;
+* **a multi-parameter call costs ~300 cycles before doing anything**: a sprite-put function
+  called ~20 times per turn became a macro inside the race loops.
+
+### 4.7 Look at the WORST turn, block by block, on every scene
+
+* **A mean of 2.00 VBlanks per turn can hide turns at 3** that the pacing catches up on the
+  next one — a stutter. Count VBlanks **turn by turn** (a jitter histogram), on every track,
+  for the whole race, not the first 600 frames.
+* **An optimisation that wins on average can lose where it matters.** Computing a band colour
+  once per slice instead of once per line "always wins" — measured, it was WORSE on flat road
+  (+1 700 cycles) and barely better on climbs. A "same corner as the previous slice" cache
+  (71–76 % repeats) won NOTHING: the memory compare and taken jump cost what the multiply
+  cost. Both removed.
+* **Profile the worst turn by basic block**: a band-fade loop, nine instructions per word and
+  only on climbs, weighed 6 400 cycles in the heaviest turn — invisible in the average.
+* **Put public twin labels on every function, basic block and static variable** (they emit no
+  byte) and refuse the profiling build if the ROM differs by one byte from the shipped one:
+  then every cycle is attributed by name on the real ROM.
+
+### 4.8 An averaged lap does not measure a rate
+
+The same bench driver covered 10 908 units in 6 000 frames before AND after a scroll-rate
+change: the closed loop compensates (it reaches corners earlier, leaves the road more, spends
+more time slow). What the player feels is the INSTANTANEOUS ratio at a READ speed — measure
+units per frame bucketed by speed, and separately frames per loop turn on the shipped ROM.
+Neither alone says what the eye sees.
+
 ## 5. Regression: prove behaviour did not change
 
 Speed work is only safe with an independent behaviour check. A scripted self-player that
@@ -298,6 +389,60 @@ projectile bugs** — frozen enemy shots cost nothing, so no milestone moves. Ch
 those areas need a probe that reads the objects themselves.
 
 ---
+
+### 5.1 The equivalence gate: prove an optimisation computes the same thing
+
+A faster ROM is not at the same place at the same frame, so **do not compare images: compare
+loop turn by loop turn.** A breakpoint on the prologue of the frame-pacing function stops the
+machine once per turn; dump all working RAM (stack excluded), the sprite table and its
+palettes, on the reference and on the candidate, with the same joypad turn by turn.
+
+* **What depends on time is not guessed, it is measured:** run the reference at TWO cartridge
+  speeds; every byte that differs between the two runs is excluded, **by name** (sound, clock,
+  VBlank counter, DMA pointers, HUD sprites — ~300 bytes; no road table or driving variable).
+  **Always read the exclusion list after freezing a reference**: one frozen on a fast ROM
+  excluded the lateral position and the shear tables as "time-dependent" because the bench
+  wrote the joypad at the wrong moment — a blind gate.
+* **Compare by symbol name** (`symbol+offset` from each ROM's map), so adding a variable does
+  not shift the comparison. Translate pointers — into ROM *and into RAM* (a pointer to one of
+  two buffers) — to symbols first.
+* **Aliases:** an array regrouped into a struct for assembly changes NAME, not content; map
+  old name → new location and say so on screen.
+* **Run it on every track**: a defect broken on purpose in the SLOPE path passes on flat
+  tracks. And it only covers the start of each race (400 turns): it is a regression gate for
+  the computation, not an acceptance test of the whole track.
+* It does not see VRAM: changes that write the planes are checked by looking.
+* **Break it on purpose** after any change of mechanism (a flipped bit in a table must be
+  caught at turn 0, under its OLD name).
+* Keep the readable C version of every assembly routine behind a switch: it is the reference
+  the gate compares against.
+
+A bench of an emulator core may ignore a breakpoint on the FIRST instruction of each call, or
+slice frames down to one instruction: turns then skip at random. Step with the lowest-level
+run call and test the PC against the breakpoint yourself.
+
+### 5.2 Stack depth in the heaviest scene, by witness
+
+Fill the free zone between the last variable and the stack top with a witness byte (`0xA5`),
+play the heaviest scene (race, several tracks, thousands of frames), and read how deep it was
+overwritten. On a finished racer: **~300 bytes deep**, where a note claimed "~64" — and a
+first optimisation that added 168 bytes of arrays had the stack overwrite the last variables
+(menu, cable, engine sound), which the equivalence gate saw as SOUND variables changing.
+**Every RAM byte you add comes out of that margin: measure it after each addition**, per
+scene (race, pause, menus, saving) — margins of 24–60 bytes were measured on different
+scenes of the same game.
+
+**Free RAM you already own:** a 512-byte save buffer that is kept in RAM is 512 bytes whatever
+it contains — a new *field* there costs no RAM, a new `static` does. Transient state (a HUD
+cache, a 12-car pack's state, a ghost reader) can live in the buffer's unused tail, guarded
+by compile-time asserts on offsets — see [Storage](Storage-and-Saves.md) §4.6.
+
+### 5.3 Prove a ROM is fresh by its BYTES
+
+A build that says nothing proves nothing (see [Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.5b —
+header changes are not tracked). Search the ROM for a string you just added (must be there)
+and one you just removed (must not be). A dead string still present = stale ROM, and every
+measurement taken on it goes in the bin.
 
 ## 6. Hardware traps the emulator cannot show
 
@@ -395,6 +540,32 @@ about **three times too fast** and every figure the bench produces is measured a
 machine nobody actually runs.
 
 ---
+
+### 8.1 A failure that only happens on the console — one binary, one-byte variants
+
+When a player reports "the console powers off / crashes at X" and no emulator reproduces it,
+the fastest way to a cause is a controlled set of builds, not more rewrites:
+
+1. **Freeze one binary** — the exact ROM that fails. Rebuilding changes addresses (a path
+   string embedded by an assert is enough), so derive every variant from that image.
+2. **Make variants that differ by one byte or one patch**, each testing ONE hypothesis:
+   the feature disabled (e.g. the save function returns immediately), candidate fix A, candidate
+   fix B. Put added code in free ROM space and jump to it, so nothing else moves.
+3. **Check the variants in the emulator first** for control and data flow only (the path runs,
+   the stack returns balanced, the data is written) — not as proof of the hardware behaviour.
+4. **Test each variant separately on the same cartridge and the same initial save state.**
+   Record cartridge model/capacity, the flashing tool and how it treats the save sectors, the
+   exact moment of failure, and whether it is a real power-off or a black/frozen screen.
+5. **Verify the outcome after a power cycle** (e.g. the new best score is still there).
+
+Before blaming padding: padding with `0xFF` leaves the prefix identical — compare two images
+byte by byte; two "A/B" ROMs that differ in thousands of bytes of code are not a padding test.
+
+What emulators typically do NOT reproduce, and therefore what to suspect first: interrupts
+during a flash busy window, watchdog timing, low-battery shutdown requests
+([Storage](Storage-and-Saves.md) §5.0d, §5.2b), narrow-divide overflow
+([Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.1f), and bits the emulator never sets (a joypad bit
+used as "power", [Input](Input.md) §4.3).
 
 ## 7. Checklist
 

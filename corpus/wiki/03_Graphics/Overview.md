@@ -102,7 +102,7 @@ Recommended approach. Requires helpers compiled with correct `NGP_FAR` signature
 #include "ngpc_gfx.h"
 #include "../GraphX/intro_image.h"
 
-#define INTRO_TILE_BASE 128u  /* avoid overwriting BIOS sysfont (tiles 32-127) */
+#define INTRO_TILE_BASE 128u  /* loaded AFTER the sysfont, which writes 0..255 */
 
 static void intro_init(void)
 {
@@ -231,8 +231,8 @@ When graphics are corrupted or not displayed:
 |------------|-------|-------|
 | Tilemap size | 32×32 tiles | SCR1 and SCR2 are both 32×32 |
 | Visible screen | 20×19 tiles (160×152 px) | |
-| Tile slots 0-31 | Reserved by hardware | |
-| Tile slots 32-127 | **Font zone** (BIOS sysfont OR custom font) | The sysfont loader and custom font exporters (default tile base 32) both load here |
+| Tile slots 0-31 | Control-code range of the BIOS font (blank) -- SYSFONTSET writes them | |
+| Tile slots 0-255 | **Font zone** -- `BIOS_SYSFONTSET` writes ALL of it (ASCII `0x20-0x7F`, katakana `0xA1-0xDF`) | Custom font exporters default to tile base 32, which lands inside it |
 | Tile slots 128-511 | Available for game assets | **All** tilemaps and sprites must use `tile_base >= 128` — including sprites whose `<name>_tile_base` is embedded in the generated metasprite source (re-export with `--tile-base 128+` if the generated value is < 128) |
 | Max unique tiles | 512 total | Character RAM = 8 KB (512 × 16 bytes) |
 | SCR palettes | 16 palettes × 4 colors | Separate sets for SCR and sprite planes |

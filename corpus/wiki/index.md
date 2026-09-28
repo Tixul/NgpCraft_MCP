@@ -41,6 +41,11 @@ the machine and the techniques, not any single game or project.
   reference, indices, validation notes.
 - **[Effects and Raster](03_Graphics/Effects-and-Raster.md)** — Raster/HBlank effects,
   palette FX, bitmap mode, text rendering, raster split performance.
+- **[Pseudo-3D Road](03_Graphics/Pseudo-3D-Road.md)** — Forward-view racer road: two shipped
+  engines measured, track format, and where the gameplay comes from; then, from a finished
+  game: corners that arrive (§7), the full hill recipe with its acceptance bench (§8), the
+  five causes of a flickering horizon (§9), objects on the road (§10), the driving model
+  (§11), ground and scenery art (§12), CPU cost (§13) and a symptom→cause table (§14).
 - **[DMA](03_Graphics/DMA.md)** — DMA usage, MicroDMA, raster DMA, performance,
   pitfalls, and the inline-ASM DMA sequences.
 - **[VRAM Queue](03_Graphics/VRAM-Queue.md)** — Queued VRAM updates and the `LDIRW`
@@ -95,4 +100,5 @@ the machine and the techniques, not any single game or project.
 | Add save support | [Storage and Saves](05_Systems/Storage-and-Saves.md) |
 | Link two consoles (multiplayer) | [Link Cable](05_Systems/Link-Cable.md) |
 | Do a raster / HUD split | [Effects and Raster](03_Graphics/Effects-and-Raster.md) |
+| Build a forward-view racer road | [Pseudo-3D Road](03_Graphics/Pseudo-3D-Road.md) |
 | Make an optimization that actually measures | [Measuring Performance](05_Systems/Measuring-Performance.md) · [TLCS-900/H Reference §37](02_CPU-and-Toolchain/TLCS900-Reference.md) |

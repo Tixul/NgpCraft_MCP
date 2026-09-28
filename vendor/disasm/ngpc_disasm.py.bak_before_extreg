@@ -98,56 +98,6 @@ def _rcode_r32_name(code):
     bank = code >> 4                       # absolute bank
     return f'{R32[(code & 0x0F) >> 2]}{bank}'
 
-
-# Byte names inside each 32-bit register, by byte position 0..3.
-_RCODE_BYTE = [['A', 'W', 'QA', 'QW'], ['C', 'B', 'QC', 'QB'],
-               ['E', 'D', 'QE', 'QD'], ['L', 'H', 'QL', 'QH'],
-               ['IXL', 'IXH', 'QIXL', 'QIXH'], ['IYL', 'IYH', 'QIYL', 'QIYH'],
-               ['IZL', 'IZH', 'QIZL', 'QIZH'], ['SPL', 'SPH', 'QSPL', 'QSPH']]
-
-
-def _rcode_name(code, sz):
-    """Name the register an EXTENDED REGISTER CODE designates at size sz.
-
-    This is the operand of the C7 / D7 / E7 escapes (byte / word / long):
-    `C7|D7|E7 <code> <op>`. Map checked against the official Toshiba
-    assembler (asm900):  ld RW3,1 -> C7 31 A9 ; ld IXL,1 -> C7 F0 A9 ;
-    ld QA,1 -> C7 E2 A9 ; ldw RWA3,1 -> D7 30 A9 ; push QIZ -> D7 FA 04.
-
-        0xE0..0xFF  current bank   group = (code>>2)&7 (XWA..XSP), pos = code&3
-        0xD0..0xDF  previous bank  group = (code>>2)&3 (XWA..XHL), pos = code&3
-        0x00..0xCF  absolute bank  bank = code>>4, group = (code&15)>>2, pos = code&3
-
-    A word must sit at byte position 0 (low half) or 2 (Q half), a long at 0.
-    Returns None for a code that names nothing at that size.
-    """
-    if code >= 0xE0:
-        grp, pos, pre, suf = (code >> 2) & 7, code & 3, '', ''
-    elif code >= 0xD0:
-        grp, pos, pre, suf = (code >> 2) & 3, code & 3, '', "'"
-    else:
-        grp, pos, pre, suf = (code & 0x0F) >> 2, code & 3, 'R', str(code >> 4)
-    if sz == 'b':
-        return f'{pre}{_RCODE_BYTE[grp][pos]}{suf}'
-    if sz == 'w':
-        if pos & 1:
-            return None
-        return f'{pre}{"Q" if pos == 2 else ""}{R16[grp]}{suf}'
-    if pos:
-        return None
-    return f'{R32[grp]}{suf}' if pre == '' else f'{R32[grp]}{suf}'
-
-
-def _mul_dest_reg(rr, sz):
-    """Destination of MUL/MULS/DIV/DIVS RR,x -- the 3-bit RR field is NOT an
-    index (Toshiba, <Divide> note 3). Word operation: a LONG register,
-    000..111 = XWA..XSP. Byte operation: a WORD register and only the ODD
-    codes exist: 001 = WA, 011 = BC, 101 = DE, 111 = HL. So `CE 53` is
-    `div BC,H` (what cc900 prints for a u16 % u8), not `div HL,H`."""
-    if sz == 'b':
-        return R16[rr >> 1] if (rr & 1) else None
-    return R32[rr]
-
 # Condition codes — cc index 0..15
 CC = ['F','LT','LE','ULE','OV','MI','Z','C',
       'T','GE','GT','UGT','NOV','PL','NZ','NC']
@@ -631,38 +581,11 @@ def _zz_regs(b):
 def _imm_for_size(sz):
     return {'b': 1, 'w': 2, 'l': 4}.get(sz, 1)
 
-def decode_zz_r(data, pos, cur_addr, base, reg_override=None, wide_override=None):
+def decode_zz_r(data, pos, cur_addr, base):
     if not _safe(data, pos, 2): return None
     b  = data[pos]
     c  = data[pos+1]
-    # ---- Extended-register escapes C7 / D7 / E7 (byte / word / long) ----
-    # `C7|D7|E7 <register code> <op>` is the SAME instruction set as the short
-    # C8+r / D8+r / E8+r register forms, with the register named by a full
-    # 8-bit code (upper halves, IX/IY/IZ/SP bytes, other banks). D7 is NOT a
-    # member of a "broken D0..D7 prefix": `D7 FA 04` is `push QIZ`, emitted by
-    # cc900 in ordinary prologues. Decode the tail with the short-form decoder.
-    if reg_override is None and b in (0xC7, 0xD7, 0xE7):
-        if not _safe(data, pos, 3): return None
-        code = data[pos+1]
-        esz = {0xC7: 'b', 0xD7: 'w', 0xE7: 'l'}[b]
-        name = _rcode_name(code, esz)
-        if name is None:
-            return (3, 'db', f'0x{b:02X}, 0x{code:02X}, 0x{data[pos+2]:02X}', [],
-                    f'register code 0x{code:02X} names no {esz} register')
-        wide = (_rcode_name(code & ~1, 'w') if esz == 'b'
-                else _rcode_name(code & ~3, 'l') if esz == 'w' else None)
-        short = {0xC7: 0xC8, 0xD7: 0xD8, 0xE7: 0xE8}[b]
-        synth = bytes([short]) + bytes(data[pos+2:pos+2+8])
-        r = decode_zz_r(synth, 0, (cur_addr + 1) & 0xFFFFFF, base,
-                        reg_override=name, wide_override=wide)
-        if r is None:
-            return (3, 'db', f'0x{b:02X}, 0x{code:02X}, 0x{data[pos+2]:02X}', [],
-                    f'ext-reg {name} op=0x{data[pos+2]:02X}')
-        n, mnem, ops, refs2, warn2 = r
-        return (n + 1, mnem, ops, refs2, warn2)
     sz, reg, broken = _zz_regs(b)
-    if reg_override is not None:
-        reg, broken = reg_override, False
 
     refs = []
     # Silicon warnings — differentiated per sub-op.
@@ -698,11 +621,7 @@ def decode_zz_r(data, pos, cur_addr, base, reg_override=None, wide_override=None
     }
 
     if broken:
-        if b == 0xCB and 0x40 <= c <= 0x5F:
-            # byte mul/muls/div/divs with C as source: HW-cleared (bug DB
-            # CB_FAMILY_BROKEN note) -- not part of the suspect ALU family
-            warn = None
-        elif b == 0xCB:
+        if b == 0xCB:
             if c in _CB_CONFIRMED_SUBOPS:
                 warn = (f'!BROKEN {_CB_CONFIRMED_SUBOPS[c]} '
                         f'(CB {c:02X}) confirmed silicon hang — use CF (L-source) instead')
@@ -810,11 +729,7 @@ def decode_zz_r(data, pos, cur_addr, base, reg_override=None, wide_override=None
     # Dest = wide register (one size up), from prefix r field
     if c in (0x08, 0x09, 0x0A, 0x0B):
         mnem = ('mul', 'muls', 'div', 'divs')[c - 0x08]
-        if wide_override is not None:
-            dr = wide_override
-        else:
-            dr = _mul_dest_reg(b & 7, sz)
-            if dr is None: return None
+        dr = R16[b & 7] if sz == 'b' else R32[b & 7]
         if sz == 'b':
             if not _safe(data, pos, 3): return None
             imm = data[pos + 2]
@@ -1009,11 +924,11 @@ def decode_zz_r(data, pos, cur_addr, base, reg_override=None, wide_override=None
 
     # ---- MUL/DIV (register form) — dest is one size wider than source ----
     # sz='b' → R16 dest, sz='w' → R32 dest (datasheet §5 MUL/DIV)
-    if 0x40 <= c <= 0x5F:
-        dr = _mul_dest_reg(c & 7, sz)
-        if dr is None: return None
-        mnem = ('mul', 'muls', 'div', 'divs')[(c - 0x40) >> 3]
-        return (2, mnem, f'{dr}, {reg}', refs, warn)
+    def wide_reg(idx): return R16[idx] if sz == 'b' else R32[idx]
+    if 0x40 <= c <= 0x47: return (2, 'mul',  f'{wide_reg(c & 7)}, {reg}', refs, warn)
+    if 0x48 <= c <= 0x4F: return (2, 'muls', f'{wide_reg(c & 7)}, {reg}', refs, warn)
+    if 0x50 <= c <= 0x57: return (2, 'div',  f'{wide_reg(c & 7)}, {reg}', refs, warn)
+    if 0x58 <= c <= 0x5F: return (2, 'divs', f'{wide_reg(c & 7)}, {reg}', refs, warn)
 
     return None  # unrecognized
 
@@ -1351,8 +1266,7 @@ def decode_zz_mem(data, pos, cur_addr, base):
         mul_ops = {0x40:'mul', 0x48:'muls', 0x50:'div', 0x58:'divs'}
         for base, mnem in mul_ops.items():
             if base <= op < base + 8:
-                dr = _mul_dest_reg(op & 7, 'b' if zz == 0 else 'w')
-                if dr is None: return None
+                dr = R16[op & 7] if zz == 0 else R32[op & 7]
                 return (n+1, mnem, f'{dr}, {mem_str}{ann}', refs, warn)
     # LDI/LDIR/LDD/LDDR/CPI/CPIR/CPD/CPDR — 0x10..0x17
     _block_ops = {0x10:'ldi', 0x11:'ldir', 0x12:'ldd', 0x13:'lddr',

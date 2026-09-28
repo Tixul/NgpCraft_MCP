@@ -246,8 +246,8 @@ __BaseXSP     medium -> top of stack (end of RAM)
 $MAXIMUM
 module crt0
 
-extern medium _WDMOD          ; 0x5c
-extern medium _WDCR           ; 0x5d
+extern medium _WDMOD          ; 0x6e on this CPU (IO900H.H)
+extern medium _WDCR           ; 0x6f
 extern large  __FAreaOrg
 extern medium __FAreaSize
 extern large  __FDataAddr
@@ -567,13 +567,12 @@ cal [cc,] addr  ->  calr (rel)       if in range
 
 ---
 
-## 20. NGPC I/O Registers — Key (IO900L.H)
+## 20. NGPC I/O Registers — Key (IO900H.H, the 900/H core header)
 
 ```
-0x5c  WDMOD    watchdog mode
-0x5d  WDCR     watchdog control
-0x6E  SYSCR0   system clock control 0
-0x6F  SYSCR1   system clock control 1  <- clear watchdog = write 0x4E
+0x6E  WDMOD    watchdog mode       (0x14, then 0xB1 into WDCR = disable)
+0x6F  WDCR     watchdog control    <- clear = write 0x4E, disable code = 0xB1
+(IO900.H / IO900L.H describe other chips: WDMOD at 0x5C there -- wrong for this machine)
 0x70  INTE0AD  interrupt enable 0 + A/D
 0x7b  IIMC     INT input mode control
 0x7c-0x7f  DMA0V..DMA3V  DMA vectors

@@ -69,6 +69,22 @@ Consequences that matter:
   (`B1=0x02` where silicon reads `0x07`; SNK Gals' Fighter reports a link error on
   exactly that).
 
+  ⛔ **AND SOMEBODY HAS TO SPEAK FOR THE PEER — the online transports did not.**
+  `serial_cts_seen` is only set by whoever crosses the two RTS lines, and all three
+  places that do it hold BOTH consoles in one process (`InProcessLink._relay`,
+  `PlayPage._pump_link`, `ngpc_run_linked`). `TcpLink` and `LobbyLink` have no pin to
+  read and set nothing, so from 2026-08-23 to 2026-09-02 **every online console read
+  `0xB1 = 0x06`, "no cable", for ever** — Card Fighters stuck on "EITHER PLAYER MUST
+  PUSH A", Puyo Pop / Magical Drop / Gals' Fighters "no second player", The Last Blade
+  "Link error". Measured with `tools/link_online_probe.py`: online `0x06`, local `0x02`,
+  same game, same 400 frames. The transports now call `core.link.declare_peer`, which
+  is where the reasoning for asserting it lives. Frozen by
+  `tests/test_link_online_detect.py`, contre-exemple included.
+
+  ⚠️ **`ngpc_serial_state.port_b1` must be changed WITH `read8`.** It was left on the
+  old model and reported "cable detected" on exactly the sessions that had none, so the
+  debugger's Link tab hid the fault it exists to show.
+
   🔑 Two behaviours come free with the right signal: a merely-powered peer no longer
   registers, and **unplugging mid-session becomes visible to the game**. That is how
   Match of the Millennium raises its own `LINK ERROR` on hardware — the wire itself

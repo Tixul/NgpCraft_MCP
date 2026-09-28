@@ -185,7 +185,8 @@ u8 fire_cooldown(void) { return FIRE_RATE_BY_LEVEL[g_level]; }
 
 ### 3.4 Fixed vs self-timed frame rate (60 vs 30 fps)
 
-Not every game runs at a fixed 60 fps. Some (Cool Boarders Pocket, Densha de Go)
+Not every game runs at a fixed 60 fps. Some shipped titles — a snowboarding game and a
+rail-vehicle simulation among them —
 **self-time**: the VBlank ISR does the full per-frame work only if the main loop
 already consumed the previous frame (a per-frame `vsync` byte, e.g. `0x4016`). If the
 per-frame work exceeds one VBlank period, the ISR skips every other VBlank and the game
@@ -229,6 +230,48 @@ pattern; whether it *sets* the frame rate depends on the per-frame load.
 > cart-flash FETCH wait-state and the silicon LDIR/MUL/DIV costs — the datasheet under-states them.**
 
 ---
+
+### 3.5 Placing events: impose the proportion, randomise only the phase
+
+On 8 to 16 events per level, **independent random draws are a design bug**. Measured over
+twelve seeds: the worst case put **sixteen obstacles of the same type in a row** (a whole
+track without a single barrier) and lanes at nine against three. An independent draw is
+allowed to do that — it is its definition — and on so few events that right is paid in
+levels nobody sees fail before playing them.
+
+* **Where:** a regular pitch (`length / (n+1)`) plus a bounded offset from a hash of the
+  index — regular THEN shifted. A free draw over the whole length clusters in pairs and
+  leaves a third of the track empty, which reads as a bug.
+* **What and which lane: ROTATE, do not draw.** One barrier in four exactly, lanes by steps
+  of two out of three; chance only picks the PHASE. **Use coprime periods** (4 and 3): with
+  equal periods the barrier always lands in the same lane on a given track, players learn to
+  hug one side and never see it again. Over 24 seeds: longest same-type run 3, lane
+  imbalance 1, barriers through all three lanes.
+* **No draw at run time**: seed from the level number. Same level, same obstacles, same
+  places — otherwise no time is comparable and no bench measures anything (and a two-player
+  link needs to send nothing about them).
+
+### 3.6 Difficulty classes computed from the level, as quantiles — and the rounding trap
+
+Read a level's class from its data (a score such as *corner load × duration*, computed with
+the same integer arithmetic in the game and in the offline tool), never write it next to the
+name. Classes as **quantiles of the level set** keep the distribution even as levels are
+added (adding one may move a neighbour one class — accept it).
+
+⛔ **A truncated quantile puts everyone in the last class.** `3 * 10 / 100` = 0, and the
+three thresholds with it: all tracks came out VERY HARD, with 16 obstacles each, including
+the gentle test track. Round: `(n * p + 50) / 100` — and compute it in 16 bits
+([Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.1b: `n * 30u + 50u` on a `u8` wrapped at 7 levels
+and deleted one class). **Put the class in a probe and compare it with the tool's** — two
+computations of the same thing always drift apart, and counting stars on a screenshot does
+not tell whether the computation or the drawing is wrong.
+
+### 3.7 Numbers that can reach ten
+
+`'0' + count` returns `':'` at ten. A "10/10" counter displayed ":/:" — on a screenshot that
+was taken and looked at, read as an ornament. **Compose every count that can reach ten digit
+by digit.** And count the CELLS of a line after adding a field: a new star overwrote the
+last letter of a 13-character name — a name missing a letter still reads as a name.
 
 ## 4. Control Mapping Patterns
 
@@ -419,6 +462,11 @@ from a 152-entry double-buffered table; a quadratic curve generator fills the ne
 This is what makes the rails fan out / converge. Full mechanism:
 [Effects and Raster](../03_Graphics/Effects-and-Raster.md) §8.1–8.3 and §8.6.
 
+> **Complete forward-view racer recipe**, from a finished game on this machine — corners that
+> arrive (per-scanline look-ahead), hills, the five causes of a flickering horizon, objects on
+> the road, the driving model, contact in world units, the CPU budget — is in
+> [Pseudo-3D Road](../03_Graphics/Pseudo-3D-Road.md) §7–§14.
+
 ### 5.6 Adventure / Overworld
 
 Screen transition: move off-screen edge → fade → load new screen.
@@ -486,6 +534,51 @@ difficulty before shipping.
 > to hold it, or you create a softlock).
 
 ---
+
+### 5.8 A ghost car in 8 bytes per track
+
+A time-attack "ghost" does not need a replay. Record the time at **15 checkpoints** plus the
+finish = 16 portions of distance. At a new best time, quantise each portion's duration into a
+**weight of 1..15** (carrying the rounding error from portion to portion), **two weights per
+byte: 8 bytes per track**, 128 bytes for 16 tracks — inside the existing save block. The
+reader normalises the sum of weights to the exact final time and interpolates the position
+between checkpoints: no floats, no second physics.
+
+The ghost follows a simple centre line (it does not replay the steering), reaches the line at
+the exact record time, disappears out of range like the normal rival, never collides, pushes
+or causes a defeat. Same silhouette as the rival with its own palette — it does not pretend
+to be the car used for the record. A slower time keeps the old reference; a best time without
+usable checkpoints clears it; aborted, linked or special races create none. Cost on a race
+loop: ~21 000 cycles per turn (≈0.2 frame). Limit: an acceleration or a stop inside one
+portion is smoothed away (max 0.35 s deviation from the real checkpoints on synthetic
+tests).
+
+### 5.9 Sharing a result: a QR code in 16 tiles
+
+A result can leave the console without link cable or network: encode it as a **QR code**
+drawn with **16 tiles**. Each module is 4×4 px, so an 8×8 tile holds 2×2 modules — 2⁴ = **16
+possible patterns**, built once into 16 character slots (256 bytes); the symbol is then a
+plain tilemap. Two opaque colours avoid any interaction with the plane behind.
+
+* **Version 2-M** (25×25 modules): 28 data + 16 Reed–Solomon bytes; with a 4-module quiet
+  zone (rounded to an even count: 4 top/left, 5 bottom/right) = 34×34 modules = 17×17 tiles =
+  136×136 px — room left for a line of text.
+* **Version 3-L** (29×29): 55 data bytes, enough for a full **HTTPS URL** in alphanumeric mode
+  (upper case only: `HTTPS://HOST/PATH/…` ≤ 70 characters) so a phone camera offers to open
+  it; 38×38 modules ×4 = 152×152 px, the whole screen height, 19×19 map cells.
+* Payload example: a text prefix, a player name (1–8 of A–Z/0–9) and 15 bytes Base32 (rules
+  revision, track, car, upgrades, flags, 24-bit VBlank ticks, contest id, session counter,
+  CRC-16/CCITT-FALSE over the ASCII prefix and the bytes). A CRC is not a signature: a server
+  must recompute rankings from time and categories and never trust a "personal best" flag.
+* **Fixed mask 0**: skips computing the eight penalty scores; readers decoded it, but it is not
+  the normative lowest-penalty mask — test on real LCDs before calling it robust.
+* Cost: encoder ~1.6 KB of ROM, 22 bytes of stack; **600 000 – 1 000 000 cycles** (~100–170 ms)
+  — several frames, computed once when the screen opens, never during a race.
+* Validate by calling the ROM's own encoder in an emulator on dozens of vectors and comparing
+  every module with a reference QR library, then decode the native 160×152 capture with two
+  independent decoders. Hide result sprites before showing the code (a clock left on top of
+  the symbol broke it).
+* Saturate the time counter instead of letting it wrap, and refuse to export a saturated time.
 
 ## 6. Entity Management Patterns
 

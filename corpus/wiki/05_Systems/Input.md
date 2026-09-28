@@ -184,7 +184,11 @@ void sleep_frames(u16 n)
 ### 4.3 OPTION / POWER Buttons
 
 - `PAD_OPTION` (`0x40`): Option button (left side). Useful for pause, settings menu.
-- `PAD_POWER` (`0x80`): Power button. Handled by the BIOS (shutdown). Do not intercept
+- `PAD_POWER` (`0x80`): ⛔ **misnamed — this is NOT the power switch.** The official
+  system-work description gives bit 7 of `0x6F82` as button D of an external controller
+  (bit 6 is OPTION, also button C of that controller). A fallback "bit 7 held 30 frames →
+  shut down" switched consoles off. The power switch is only readable as bit 7 of
+  `HW_USR_SHUTDOWN` (`0x6F85`) — see [Storage](Storage-and-Saves.md) §5.0d. Do not intercept
   without a specific reason. Check `HW_USR_SHUTDOWN` (`0x6F85`) if power management is needed.
 
 ---
@@ -275,6 +279,31 @@ Both are discrete hardware buttons located on the side of the unit.
 ensure the player can always find their way back into the game.
 
 ---
+
+### 7.5 Presses lost during a long page load — latch them in VBlank
+
+A menu page that loads for up to **23 frames without reading the pad** loses every press made
+in that time: 9 to 12 presses out of 21 lost on one page, even held three frames. Fix:
+
+1. the VBlank handler **latches** new presses (edge against what the VBlank itself saw last),
+   called LAST in the ISR, after the DMA re-arm;
+2. each time the loop reads the pad, it **takes** the latched presses AND **re-bases** the
+   VBlank's reference on what it has just seen — both with interrupts masked (`di` / `ei`).
+
+A press can then be delivered only once, whatever order the BIOS and your VBlank see
+`0x6F82` in. Measured: **63/63 delivered, 0 doubled**, and a page stays still for 200 frames.
+
+⚠️ This changes what automated menu walks see: a bench that "worked" because some presses
+were lost now overshoots. Every walk must wait for a press to be consumed before sending the
+next ([Measuring Performance](Measuring-Performance.md) §3.7).
+
+### 7.6 `0x6F82` is refreshed by the BIOS once per VBlank, one frame late
+
+The game never reads the hardware port; it reads the BIOS copy, updated at VBlank with the
+value the port had one frame before. For emulator benches this means an input written to the
+port is seen only if two VBlanks pass before the game's read (details in
+[Measuring Performance](Measuring-Performance.md) §3.7). Never write `0x6F82` directly from a
+bench — the BIOS overwrites it and the value flickers.
 
 ## 8. Input Module
 

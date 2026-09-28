@@ -17,8 +17,8 @@ Detection requires **no BIOS call** — it is a simple memory read at address `0
 written by the BIOS at startup.
 
 ```
-0x00 = LANG_ENGLISH   (English)
-0x01 = LANG_JAPANESE  (Japanese)
+0x00 = LANG_JAPANESE  (Japanese)
+0x01 = LANG_ENGLISH   (English)
 ```
 
 Read this register once during init and cache it in a static
@@ -48,8 +48,8 @@ Definition in `ngpc_hw.h`:
 
 ```c
 #define HW_LANGUAGE   (*(volatile u8 *)0x6F87)
-#define LANG_ENGLISH  0u    /* HW_LANGUAGE == 0 */
-#define LANG_JAPANESE 1u    /* HW_LANGUAGE == 1 */
+#define LANG_JAPANESE 0u    /* HW_LANGUAGE == 0 -- SysWork.txt order */
+#define LANG_ENGLISH  1u    /* HW_LANGUAGE == 1 */
 ```
 
 Direct read is possible but prefer the cached API:
@@ -112,13 +112,23 @@ Same rationale as `ngpc_is_color()`:
 ## 4. Sysfont and Language
 
 `ngpc_load_sysfont()` (BIOS call `BIOS_SYSFONTSET`) loads the system font
-into VRAM tile slots 32-127.
+into VRAM tile slots **0..255**, indexed by character code.
 
-**This font differs depending on the active language.**
+> ⛔ **Corrected 2026-09-23. This section used to claim the font DIFFERS with the
+> active language, and that it occupies slots 32-127. Both are wrong.**
+> Official source (`SysCall.txt`, `VECT_SYSFONTSET`): the call "transfers 256
+> system font characters to the front half of the character RAM
+> (0xA000-0xAFFF)". Measured by running a retail BIOS on the same ROM with the
+> console set to English and then to Japanese: **character RAM is byte-identical
+> in both cases**, and it contains ASCII *and* katakana at once.
+>
+> The practical consequence is the opposite of what this page used to say:
+> **katakana cost no extra art and no extra ROM**, and they do not require a
+> Japanese console. They are already there.
 
-### 4.1 English Mode
+### 4.1 ASCII range
 
-Slots 32-127 = ASCII glyphs `0x20-0x7F` (space, punctuation, A-Z, a-z, 0-9).
+Slots `0x20`-`0x7F` = ASCII glyphs (space, punctuation, A-Z, a-z, 0-9).
 
 The slot index equals the ASCII character code:
 
@@ -131,10 +141,10 @@ slot 97 = 'a'
 `ngpc_text_print()` writes ASCII values directly into the tilemap — this works because
 tile index == ASCII code.
 
-### 4.2 Japanese Mode
+### 4.2 Katakana range
 
-The BIOS loads a different font. Slots 32-127 contain Japanese glyphs
-(half-width Katakana) instead of full ASCII.
+Slots `0xA1`-`0xDF` = the 64 half-width Katakana, loaded by the same call, at
+the same time as the ASCII glyphs — not "instead of" them.
 
 Standard half-width Katakana encoding (JIS X 0201):
 
@@ -341,6 +351,34 @@ Use the string table pattern (§5) for anything more than a few strings.
 
 ---
 
+### 6.4 Accented and special glyphs for European languages
+
+The BIOS font has no accents. A game localised into Spanish, Portuguese and German drew its
+own: **Ñ ¿ ¡ Á É Í Ó Ú** in characters `0x18..0x1F`, then **À Â Ê Ô Ã Õ Ç** in `0x10..0x16`, all
+loaded **every time the dialogue screen opens**, after the font — during a race those same
+characters hold roadside art. Only the dialogue box uses them; the race HUD stays plain ASCII
+(a word is written without its accent there).
+
+* One table maps each character to its code, shared by the glyph generator and the text
+  generator; C literals use **octal escapes** (`"\030"`), never raw bytes.
+* ⛔ **An accent one pixel above its letter, touching it, is invisible** ("GANALE" read for
+  "GÁNALE"). Keep an empty row between accent and letter: the vowel gets 5 rows.
+* Text lives in a source file (one box per line, speaker first) and a generator writes the
+  table between markers in the C file, refusing a line whose speaker is shifted. Never edit
+  the generated table.
+* Keep the language choice in a field of the SAVE (a field in a 512-byte buffer costs no RAM),
+  offer it on a flags screen after the logo, and when the grid of flags has holes, move the
+  cursor to the **nearest lit flag**, not "same column or nothing" (one language was
+  unreachable).
+* ⛔ If the profile is reloaded after the flag screen (menu init reading the save), it
+  overwrites the choice just made: keep the choice across that load and re-apply it.
+* Benches reading text back from RAM: an empty cell and a custom glyph can both read as the
+  same filler character — strip it on both sides before comparing.
+
+**Adapting, not translating:** each line must make sense on its own in the target language;
+gender-neutral phrasing for the player where the language forces agreement (adverbs instead
+of adjectives, no inclusive "we" that genders the player).
+
 ## 7. Pitfalls and Gotchas
 
 ### Pitfall 1 — Reading HW_LANGUAGE Before ngpc_init()
@@ -407,8 +445,9 @@ described in Pitfall 1.
 | Japanese constant | `LANG_JAPANESE = 1u` | `ngpc_hw.h` |
 | Cached API | `ngpc_get_language()` | Returns cached value |
 | Cache init | `s_language = HW_LANGUAGE` in `ngpc_init()` | After runtime_bootstrap |
-| Sysfont EN | ASCII `0x20-0x7F` in tile slots 32-127 | Tile index == ASCII code |
-| Sysfont JP | Half-width Katakana `0xA1-0xDF` in slots 32-127 | JIS X 0201 |
+| Sysfont, whole set | 256 characters in tile slots 0..255 | Tile index == character code; language-independent |
+| Sysfont, ASCII | `0x20-0x7F` at the same slot numbers | Tile index == ASCII code |
+| Sysfont, katakana | `0xA1-0xDF` at the same slot numbers | JIS X 0201, loaded by the same call |
 | Japanese bytes | Use `u8[]` + `(const char *)` cast | Signed char issue in cc900 |
 | String table | `const char * const msg[2] = { "EN", "JP" };` | Index by `ngpc_get_language()` |
 | Asset table | `const u16 NGP_FAR * const tiles[2]` | NGP_FAR required for ROM data |

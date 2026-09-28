@@ -102,6 +102,9 @@ u8   ngpc_qrandom(void);         /* ultra-fast table read, returns 0..255 */
 should modulo down to `0..max`, but **on cc900 the `result % ((u32)max + 1)`
 step is broken** (u32 modulo runtime helper miscompiles). In practice the
 returned value stays in **0..32767** regardless of `max`.
+(The Toshiba manual documents that without `-A`, `u32 % u16` compiles to a narrow divide whose
+result is indeterminate when the quotient overflows — [Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md)
+§8.1f. Check the emitted asm before blaming a runtime helper.)
 
 **Consequence — hardware confirmed:**
 - `(u8)ngpc_random(6)` → value ≥ 5 in ~98% of calls (expected 2/7)
@@ -109,7 +112,9 @@ returned value stays in **0..32767** regardless of `max`.
 - Any gameplay roll using `ngpc_random(max)` with small `max` will ignore `max`
 
 **Rule: never rely on `ngpc_random(max)` for a bounded gameplay value.**
-Use `ngpc_qrandom()` + u8 modulo instead — cc900 handles u8 arithmetic cleanly:
+Use `ngpc_qrandom()` + u8 modulo instead — safe **because the dividend is a u8** (an 8-bit
+dividend cannot overflow an 8-bit quotient). ⛔ A **u16** dividend with a u8 divisor
+(`state16 % n`, the classic shuffle) is the narrow-divide trap: [Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.1f.
 
 ```c
 /* Bounded roll, correct on cc900 */

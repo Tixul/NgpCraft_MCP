@@ -123,6 +123,39 @@ In the build Makefile, debug vs release is typically controlled by passing
 
 ---
 
+## 5. Faults the emulator counts for you — `hw_safety`
+
+The three tools above run **inside** your ROM and cost it RAM and cycles. This one costs
+nothing: the NgpCraft emulator watches for a small set of conditions a real console
+punishes and most emulators never mention, and reports them with every run.
+
+```
+python ngpc_native.py run GAME.ngc --bios bios.bin --frames 600 --json
+  → "hw_safety": {"counts": {"watchdog-starved": 0,
+                             "system-stack": 0,
+                             "flash-busy-fetch": 0}}
+```
+
+| finding | what it means | why a console cares |
+|---|---|---|
+| `watchdog-starved` | the watchdog counter ran out without being refreshed | the console resets, mid-anything |
+| `system-stack` | `XSP` crossed above `0x6C00` into the BIOS's own page | documented as a restart or a power-off |
+| `flash-busy-fetch` | **the CPU fetched an instruction out of a flash chip that was programming or erasing** | that chip answers status, not memory: the CPU is running status bits (STORAGE §5.0c) |
+
+Each is **counted, never fatal**: a real console does not stop at the offending
+instruction either, it carries on into whatever follows. Each carries the **PC that
+committed it**, and `--hw-guard` turns the first two into a stop when you want the run to
+halt exactly there.
+
+`flash-busy-fetch` is the one to know about, because it is the single unambiguous
+signature of an entire family of save bug — a driver missing its `di`, a stub left in the
+cartridge instead of copied to RAM, a chip reset sent to a chip still working. All three
+kill a console and **all three pass silently on an emulator whose flash has no busy
+window**, which is most of them. A clean run here is a claim about your save path that a
+screenshot cannot make.
+
+---
+
 ## Quick Reference
 
 | Item | Details |

@@ -1,5 +1,26 @@
 # Changelog — ngpc_disasm
 
+## 2026-09-28
+
+### Fixed
+
+- **`C7` / `D7` / `E7` are the extended-register escapes, not a "broken D0..D7
+  prefix".** `D7 FA 04` was printed as `rl A,SP ; !SUSPECT` followed by an
+  unknown byte; it is `push QIZ` (and `D7 FA 05` = `pop QIZ`), emitted by cc900
+  in ordinary function prologues. The false alarm led a user to rewrite correct
+  functions. The three escapes now decode their register code (current bank,
+  previous bank `'`, absolute bank `R..n`; byte / word / Q-half / long names)
+  and hand the tail to the normal register decoder. Map checked against the
+  official assembler: `C7 31 A9` = `ld RW3,1`, `C7 F0 A9` = `ld IXL,1`,
+  `C7 E2 A9` = `ld QA,1`, `D7 30 A9` = `ldw RWA3,1`, `C7 F0 0A C0` = `div IX,0xC0`.
+- **MUL/MULS/DIV/DIVS destination at BYTE size.** The 3-bit RR field is not an
+  index: at byte size only odd codes exist (001 WA, 011 BC, 101 DE, 111 HL).
+  `CE 53` (what cc900 emits for `u16 % u8`) is `div BC,H`, not `div HL,H`;
+  `CD 08 07` is `mul DE,7`, not `mul IY,7`. Fixed in the register, immediate
+  and memory forms.
+- The `CB 0x40..0x5F` carve-out of 2026-07-08 had not reached this copy:
+  `CB 51` (`div WA,C`) is no longer flagged.
+
 ## 2026-07-08
 
 ### Fixed

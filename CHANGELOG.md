@@ -3,6 +3,36 @@
 
 ## Unreleased
 
+- **Corpus: the open-source toolchain section is current again, and carries five lessons
+  for anyone writing tools for this CPU.** It had been frozen at "two lines as of 2026-05";
+  it now shows the certified per-stage state (frontend 73/73 byte-exact, assembler 780/780
+  encodings, object reader 107/107, linker reproducing a released ROM byte for byte,
+  132/132 files ported, 1 204 tests) **and says plainly that backend byte-exactness is no
+  longer the progress metric** — the judge is whether the ROM runs on a second, independent
+  core. The new lessons are transferable, not project history: the Toshiba fascicle you will
+  find is the **900/L1** volume whose instruction set is shared but whose **cycle column is
+  not** (a contribution was once accepted on that wrong assumption); an assembler tables
+  reverse-engineered from the official one describe what it *does*, never what is *legal*,
+  so an encoding you never emit is absent from your audit rather than red; **branch
+  relaxation is a separate stage** that per-instruction gates cannot see, and it has already
+  turned a timer routine into an infinite loop; and ⛔ **a gate that runs both ROMs on the
+  same emulator is blind to anything that emulator does not do** — one ROM passed a
+  pixel-difference gate with zero deviation while executing address 0 for 71 % of its cycles.
+- **Corpus: new page — Pseudo-3D Road.** Two shipped forward-view road engines, measured
+  rather than guessed, with the track format and, most usefully, where the gameplay comes
+  from: there is no separate physics data, the bytes that draw the road are the bytes that
+  drive the car. No game is named.
+- **Emulator vendor re-synced (upstream `dc59f1a`), and the core rebuilt with it.** The
+  snapshot now carries the **cartridge-flash busy window**: a program or an erase takes
+  real time, and while it runs every read of the cart window answers STATUS instead of
+  contents. Durations are MEASURED on a 16 Mbit cartridge, not assumed -- an 8 KB block
+  erase **57.5 ms** (spread 53.0-62.5, it is not a constant), one byte programmed **33 us**,
+  a 64 KB block **441 ms**. A program that cannot succeed -- a 1 asked over a 0, which is a
+  save slot rewritten without an erase -- **never reports failure at all**: verified with
+  eight times a driver's normal timeout, ~18 seconds, and no DQ5. And `ngpc_emu_native_run`
+  gains a third hardware-safety finding, **`flash-busy-fetch`**: the CPU fetched an
+  instruction out of a chip that was working, which is the single signature of the whole
+  class of save bug that kills a console and passes in an emulator. Smoke: 21 ok / 0 failed.
 - **Corpus: announcing a token is not deciding a role** (Link-Cable §8.2). The page said
   "each console announces how long it has been searching; the longest search wins" and
   stopped there — which is the right rule and still elects **two hosts**, because a HELLO

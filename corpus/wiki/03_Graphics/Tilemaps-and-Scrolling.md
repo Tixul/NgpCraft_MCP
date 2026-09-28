@@ -54,7 +54,7 @@ HW_SCR1_MAP[2 * 32 + 5] = SCR_TILE(200, 3);
 | Tilemap size | 32 × 32 tiles |
 | Visible screen | 20 × 19 tiles (160 × 152 px) |
 | Tile slots reserved | 0..31 (hardware) |
-| BIOS system font | 32..127 (after `BIOS_SYSFONTSET`) |
+| BIOS system font | 0..255 (after `BIOS_SYSFONTSET`, see the BIOS page) |
 | Free tile slots | 128..511 |
 | Character RAM total | 512 tiles × 16 bytes = 8 KB |
 | SCR palettes | 16 palettes × 4 colors, `0x0BGR` format |
@@ -1057,7 +1057,7 @@ All helper functions use `NGP_FAR` in their signatures for ROM pointer safety.
 #include "ngpc_gfx.h"
 #include "../GraphX/intro_scene_png.h"
 
-#define INTRO_TILE_BASE 128u  /* avoid BIOS sysfont (tiles 32-127) */
+#define INTRO_TILE_BASE 128u  /* loaded AFTER the sysfont, which writes 0..255 */
 
 static void intro_init(void)
 {
@@ -1204,7 +1204,7 @@ Apply in both `ngpng_queue_plane_stream` and `ngpng_apply_plane_scroll`.
 | Scroll X/Y SCR2 | `0x8034/0x8035` | write 8-bit or 16-bit packed |
 | Tilemap entry | `SCR_ENTRY(tile, pal, hflip, vflip)` | or `SCR_TILE(tile, pal)` |
 | Tile index formula | `(u16)y * 32u + x` | cast y to u16 |
-| BIOS sysfont | tiles 32..127 | reserved after SYSFONTSET |
+| BIOS sysfont | tiles 0..255 | the call writes all 256; katakana live at 0xA1..0xDF |
 | User tile base | 128 (recommended) | avoids sysfont |
 | Transparent color | palette 0, color 0 | scroll planes only |
 | Rectangle blit stride | `BC=0x14, skip=0x18` | 20 cols in 32-col map |

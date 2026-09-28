@@ -277,6 +277,10 @@ NGPC_API void ngpc_reset(ngpc_t* h, int reset_mode) {
      * putting the cartridge back in does.) */
     m->flash_mode[0] = m->flash_mode[1] = Machine::FlashRead;
     m->flash_step[0] = m->flash_step[1] = 0;
+    /* A chip caught mid-erase by a reset is a chip that is no longer erasing: the
+     * busy window is part of the command latch, not of the contents. */
+    m->flash_busy_until[0] = m->flash_busy_until[1] = 0;
+    m->flash_after_busy[0] = m->flash_after_busy[1] = Machine::FlashRead;
 
     /* ⚡ THE LANGUAGE. `Language` (0x6F87, SDK SysWork.txt): 0 = Japanese, 1 = English,
      * read-only to the cartridge -- and READ BY 24 GAMES of the corpus. A dual-language
@@ -624,6 +628,17 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
          * when the answer CHANGED -- which for a well-behaved ROM is never. This is
          * per-instruction code in the hot loop; the readable form of the same test
          * cost 4% of the core's throughput. */
+        /* ⛔ EXECUTING OUT OF A CHIP THAT IS BUSY. See NGPC_HW_FLASH_BUSY_FETCH. Edge
+         * triggered: one finding per derailment, carrying the PC that fetched first. */
+        {
+            const bool busy_fetch = m->pc_in_busy_flash(pc_before);
+            if (busy_fetch != m->fetching_busy_flash) {
+                m->fetching_busy_flash = busy_fetch;
+                if (busy_fetch) m->note_violation(NGPC_HW_FLASH_BUSY_FETCH, pc_before,
+                                                  m->cpu.pc);
+            }
+        }
+
         const uint32_t stack_addr = m->cpu.regs[NGPC_XSP] & kAddrMask;
         const bool stack_in_system =
             (stack_addr - (kUserStackTop + 1)) <= (kSystemRamEnd - kUserStackTop - 1);
@@ -1464,6 +1479,7 @@ NGPC_API uint64_t ngpc_hw_violations(ngpc_t* h, uint32_t kind) {
     uint64_t n = 0;
     if (kind & NGPC_HW_WATCHDOG)     n += m->hw_watchdog_count;
     if (kind & NGPC_HW_SYSTEM_STACK) n += m->hw_stack_count;
+    if (kind & NGPC_HW_FLASH_BUSY_FETCH) n += m->hw_flash_fetch_count;
     return n;
 }
 
@@ -1636,6 +1652,31 @@ NGPC_API void ngpc_set_timer_base(ngpc_t* h, uint32_t cycles_per_phi_t1) {
  * regimes land within 6%, throughput -4% and the round trip -8%. See OPEN_ITEMS.md. */
 /* 33 quarts = 8,25 cycles par mot de 16 bits. Voir le bloc au point d'usage. */
 static constexpr uint32_t kSiliconFetchWaitQ4 = 33;
+
+/* ⏱️ HOW LONG THE CARTRIDGE FLASH IS BUSY, in machine cycles.
+ *
+ * A program or an erase takes real time on silicon, and during it the chip answers
+ * status instead of contents -- which is why a flash stub runs from RAM with interrupts
+ * masked. Committing inside the command's own bus cycle deletes that window and with it
+ * every defect that depends on it.
+ *
+ * `program` is per byte, `erase_per_8k` is per 8 KB of block (a 64 KB block costs eight
+ * times as much), `fail` is how long the chip tries before raising DQ5 on a program it
+ * cannot do -- a 1 asked over a 0. ALL THREE ZERO restores the synchronous chip this
+ * model was until 2026-09-10, which is what a corpus bisection needs.
+ *
+ * ⚠️ The built-in defaults are DOCUMENTED, NOT MEASURED, and our documentation
+ * disagrees with itself about the erase by a factor of a hundred -- see the constants in
+ * machine.hpp. hw_test_flash_timing (04_MY_PROJECTS) measures all three on the cartridge;
+ * this setter is where its answer goes. */
+NGPC_API void ngpc_set_flash_timing(ngpc_t* h, uint32_t program, uint32_t erase_per_8k,
+                                    uint32_t fail) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->flash_program_cycles     = program;
+    m->flash_erase_per8k_cycles = erase_per_8k;
+    m->flash_fail_cycles        = fail;
+}
 
 NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bios) {
     if (!h) return;
@@ -2310,10 +2351,19 @@ NGPC_API void ngpc_serial_state(ngpc_t* h, ngpc_serial_state_t* out) {
     /* 0xB1 as the GAME sees it, not as it sits in the I/O page. read8 forces the
      * sub-battery bit and drives bit2 -- the cable-DETECT line Card Fighters'
      * Clash gates its handshake on -- from the cable state, so dumping the raw
-     * byte here would report "no cable" on a working one. Mirrors machine.hpp. */
+     * byte here would report "no cable" on a working one.
+     *
+     * ⛔ AND IT MUST BE THE SAME RULE READ8 USES. This stayed on the OLD model
+     * (bit2 from serial_link_enabled alone) after read8 moved to the peer's RTS,
+     * so the debugger's Link tab reported `port_b1 = 0x02`, "cable detected", on
+     * an online session where the CPU was reading 0x06, "no peer" -- the exact
+     * fault that was being looked for, hidden by the instrument sent to look for
+     * it. Measured with tools/link_online_probe.py. Mirrors machine.hpp read8;
+     * change the two together. */
     out->port_b1         = uint32_t(uint8_t(
-        m.serial_link_enabled ? ((m.mem[0x0000B1] | 0x02) & ~0x04)
-                              :  (m.mem[0x0000B1] | 0x02 | 0x04)));
+        (m.serial_link_enabled && m.serial_cts_seen && !m.serial_cts_high)
+            ? ((m.mem[0x0000B1] | 0x02) & ~0x04)
+            :  (m.mem[0x0000B1] | 0x02 | 0x04)));
     out->port_b2         = m.mem[0x0000B2];
 }
 
@@ -2582,6 +2632,7 @@ NGPC_API void ngpc_get_link_state(ngpc_t* h, ngpc_link_state_t* out) {
     out->tx_shifting  = m->serial_tx_shifting ? 1 : 0;
     out->tx_byte      = m->serial_tx_byte;
     out->cts_high     = m->serial_cts_high ? 1 : 0;
+    out->cts_seen     = m->serial_cts_seen ? 1 : 0;   /* see the header: the detect line */
     out->rx_pending   = m->serial_rx_pending ? 1 : 0;
     out->rx_byte      = m->serial_rx_byte;
     out->tx_cycles    = m->serial_tx_cycles;
@@ -2627,6 +2678,7 @@ NGPC_API int ngpc_set_link_state(ngpc_t* h, const ngpc_link_state_t* in) {
     m->serial_tx_shifting  = in->tx_shifting != 0;
     m->serial_tx_byte      = in->tx_byte;
     m->serial_cts_high     = in->cts_high != 0;
+    m->serial_cts_seen     = in->cts_seen != 0;
     m->serial_rx_pending   = in->rx_pending != 0;
     m->serial_tx_buf_full    = in->tx_buf_full != 0;
     m->serial_tx_buf_byte    = in->tx_buf_byte;

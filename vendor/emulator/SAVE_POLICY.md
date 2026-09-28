@@ -69,6 +69,51 @@
 > il n'y a pas de modele de timing) ; endurance des cellules ; protection de bloc non
 > persistee (le format n'a pas de place, et aucun autre emulateur ne la garde).
 
+> ## 🔴 MISE A JOUR 2026-09-05 — « Fichier separe » ne RECHARGEAIT rien (rapport joueur)
+>
+> Reglages du joueur: horloge alignee sur le PC, **demarrage console complet**, saves
+> **en fichier separe**, reglages portables. Symptomes: le `.flash` apparait bien dans
+> `saves/`, aucun jeu ne le relit, et **le BIOS est reinitialise a chaque lancement**.
+> Confirme, puis reproduit sur sa propre sauvegarde (Bust-A-Move Pocket).
+>
+> **Une seule cause pour les deux moities: la remise a zero du hand-off BIOS -> cartouche.**
+> A la fin du demarrage console, `_bios_handoff_assist` appelait `reset(bios_handoff=True)`
+> directement -- et `reset_memory` **RECHARGE L'IMAGE VIERGE DE LA ROM**, c'est-a-dire un
+> reset d'usine de la puce flash au milieu d'un boot. Donc:
+>
+> * la sauvegarde restauree au demarrage etait effacee juste avant que le jeu parte. En
+>   mode « dans la .ngc » l'image vierge PORTE la sauvegarde, donc rien ne se voyait: le
+>   defaut n'etait visible **que** en fichier separe. Sauver marchait toujours, d'ou un
+>   fichier a jour dans `saves/` que personne ne relisait.
+> * la page de reglages du BIOS (0x6C00-0x6FFF) etait remplacee par celle de la mise sous
+>   tension, et `commit_system_ram` -- qui persiste la page VIVANTE -- la stampait sur la
+>   pile bouton en sortant. Mesure: 0x11223344 en 0x6DD8 relu a zero.
+>
+> Corrige dans `NativeSession.handoff_reset`, a cote de `reboot`, qui applique la meme
+> regle depuis toujours: **rien de la cartouche ni de la pile bouton ne change parce que
+> le CPU a ete reinitialise.**
+>
+> ⛔ **La pile bouton se repare a l'ECRITURE, pas en la reposant en RAM.** Recopier la
+> page sauvegardee par-dessus la memoire vive -- ce que fait le hand-off INSTANTANE -- a
+> **GELE LE JEU**: Bust-A-Move Pocket, 109 images distinctes tombees a 8, ecran titre sans
+> sa ligne « push a button », plus aucune touche active. Le joueur l'a rapporte dans la
+> foulee. Les deux chemins ne sont pas symetriques: cote instantane cette page est un
+> **fichier** ecrit par une session precedente, cote demarrage console c'est la **RAM de
+> travail vivante du vrai BIOS**, scratch compris, et la remise a zero vient justement de
+> semer la page a laquelle la cartouche a droit. Donc la RAM garde ce que le reset a semis,
+> et c'est `commit_system_ram` qui persiste la **pile capturee au hand-off**
+> (`cell_captured`) au lieu de relire une page qui n'est plus la reponse de la console.
+>
+> ⚠️ **Et la sauvegarde ne se recopie PAS depuis la memoire vive.** Le BIOS vient
+> d'identifier la puce, qui reste en **autoselect**: elle repond son ID et 0xFF partout
+> ailleurs. La premiere version du correctif snapshotait la memoire et remettait donc
+> 256 Kio de 0xFF a la place de la sauvegarde -- **elle detruisait exactement ce qu'elle
+> devait sauver**, et la mesure sur la ROM du joueur est la seule chose qui l'a montre.
+> On relit le FICHIER, qui est l'etat exact d'avant (rien n'ecrit la puce entre les deux).
+>
+> Tests: `tests/test_save_sidecar_mode.py`, les deux derniers -- verifies rouges sur
+> l'ancien comportement, verts sur le nouveau.
+
 ## 1. But
 
 Le projet doit gerer correctement les sauvegardes persistantes des jeux.
@@ -196,6 +241,57 @@ ailleurs et est deja en grande partie ecrite cote toolchain :
   l'image flash. Les saves in-game persistantes (separes des
   savestates) seront persistees dans `<rom>.sram` quand le HLE
   flash sera livre.
+
+## 10. Ce que le modele NE couvre PAS encore
+
+Deux aveuglements, mesures le 07/09 sur un jeu qui **s'eteignait sur console et
+passait ici sans une faute comptee**. Les deux touchent la sauvegarde, aucun ne
+touche son CONTENU : ils touchent OU on ecrit et COMBIEN DE TEMPS ca prend.
+
+### 10.1 On adopte la capacite que l'adresse du jeu rend correcte
+
+`flash_adopt_capacity_from_save` re-presente la cartouche a la capacite dans
+laquelle l'adresse de sauvegarde du jeu tombe. Un homebrew qui code `0x1FA000`
+en dur fait donc presenter la carte en 16 Mbit, **et son adresse devient juste
+par construction**, quelle que soit la puce reelle.
+
+Le circuit se referme : `0x6C58` est derive de la capacite presentee, donc un
+jeu qui lit cet octet apres nous avoir fait adopter sa propre adresse **lit sa
+propre hypothese**.
+
+L'heuristique a sa raison d'etre -- un homebrew qui pilote la puce directement ne
+passe jamais par le `swi 1`, son adresse est tout ce qu'on a. Ce qui manque n'est
+pas de la supprimer, c'est de la SIGNALER : une ROM qui ne sauvegarde que parce
+qu'on a adopte son adresse est exactement celle qui mourra sur une cartouche
+d'une autre taille, et nous sommes le seul endroit qui puisse le dire.
+
+### 10.2 L'effacement d'un bloc ne coute rien
+
+| | cycles |
+|---|---|
+| effacer 8 Kio, notre modele | **~400** |
+| effacer 8 Kio, silicium | **~6 144 000** (≈ 1 s) |
+
+La boucle d'attente du stub sort au premier tour parce que la puce se declare
+prete tout de suite. Cette seconde-la est passee **interruptions masquees** : sur
+la console, plus de VBlank, plus de chien de garde rafraichi, plus de Z80 servi.
+Chez nous l'operation est atomique, donc rien de ce qui depend du temps ne peut
+se manifester -- y compris la periode du chien de garde, qui est par ailleurs une
+hypothese non mesuree.
+
+**La marche a suivre, en quatre points, est dans `OPEN_ITEMS.md`, section du
+2026-09-07.**
+
+⚠️ **Mise a jour du 08/09 : c'est 10.2 le principal, pas 10.1.** L'adresse
+corrigee, le jeu s'eteignait encore -- il plantait sur un circuit et pas sur un
+autre, et aussi en achetant une piece au garage, donc loin de toute fin de
+course. Le seul point commun est la sauvegarde, et la seule chose qui distingue
+une sauvegarde d'une autre est son RANG : la seizieme deborde le bloc et
+declenche l'EFFACEMENT. C'est l'operation elle-meme qui tue, pas l'endroit.
+Tant que sa seconde n'est pas facturee, aucune ROM ne peut echouer ici comme
+elle echoue sur la cartouche.
+
+---
 
 Quand cette politique evolue, **mettre a jour le master strategy
 index** plutot que de dupliquer l'info ici.

@@ -58,6 +58,11 @@ Return: `u8`->`L`, `u16`->`HL`, `u32`->`XHL`. cc900 args on stack (arg0 @ `XSP+4
 Caller-saved `XWA/XBC/XDE/XHL`; callee-saved `XIX/XIY`. All ROM pointers must be FAR
 (`NGP_FAR`/`__far`). C89 only: no float/double, no `long long`, decls at block start.
 Memory-form ALU family `0x80|zz|mem` (compact compound-assign; see TLCS-900/H Reference).
+`C7`/`D7`/`E7` = extended-register escapes (byte/word/long) + an 8-bit register code:
+`D7 FA 04` = `push QIZ` (normal cc900 prologue), NOT an invalid pair. Byte `mul`/`div`
+destination = odd RR codes only (1 WA, 3 BC, 5 DE, 7 HL): `CE 53` = `div BC,H`.
+Without `-A`, `u16 % u8` / `u32 % u16` compile to a NARROW `div` — quotient overflow =
+indeterminate result on the console, usually the "right" answer on emulators (Build-Toolchain §8.1f).
 
 **Codegen must avoid** — toolchain mis-encode (NOT silicon): emitting a `D0`-prefix
 byte for a word register op (`D0..D7` is the WORD MEMORY family; use `D8` word reg-direct
@@ -71,8 +76,11 @@ uses XIY(src)/XIX(dst), not XDE/XHL.
 
 ## Input (joypad `0x6F82`, active-high)
 
-`UP=01 DOWN=02 LEFT=04 RIGHT=08 A=10 B=20 OPTION=40 POWER=80`.
+`UP=01 DOWN=02 LEFT=04 RIGHT=08 A=10 B=20 OPTION=40`; bit `80` is button D of an external
+controller, **not** the power switch (power = `0x6F85` bit 7 only).
 Edge "just pressed" = `cur & ~prev`. Read once/frame after VBlank sync; mark `volatile`.
+`0x6F82` is the BIOS copy, refreshed at VBlank one frame late. Presses made during a long
+load are lost unless the VBlank ISR latches them (Input §7.5).
 
 ## Audio
 
@@ -90,10 +98,20 @@ Open-source: `t900cc` / `t900as` / `t900ld` / `ngpc_romtool`. Runtime helpers `C
 ## Top gotchas
 
 color-0-transparent (use index 2) · forgot `NGP_FAR` on ROM data · missing watchdog kick ·
-`u8 * const` silent overflow (cast to `s16` first) · link sprites `.rel` before maps ·
+`u8 * const` silent overflow (cast to `s16` first) · `u8 + u8` is ALSO summed on 8 bits
+(cast every operand) · `int` constants are 16-bit (`512*256` = 0) · array sizes rounded to
+even · the Makefile does not track headers (stale objects, green build) ·
+link sprites `.rel` before maps ·
 nested initialized local decl miscompiles (hoist it) · `SAVE_SIZE` must be 512 (256
 unreliable) · checksum at fixed offset BEFORE terminal padding · disable the raster/Timer0
-ISR before a flash write · install VBL ISR + `ei 0` or the joypad byte never updates.
+ISR before a flash write · install VBL ISR + `ei 0` or the joypad byte never updates ·
+never erase the save block that holds the data (two-block journal, Storage §4.2b) · a save
+slot is empty only if all 512 bytes are `0xFF` · a per-line DMA table rewritten while the
+channel reads it tears — double-buffer it and swap at re-arm (DMA §5.3b) · equal sprite
+priority: the LOWEST slot number is drawn on top · I/O `0x6E` is WDMOD and `0x6F` WDCR
+(watchdog), NOT a flash /WE control · flash wrappers: `push sr / di / … / pop sr` (never a
+closing `ei`), clear the watchdog before changing its mode, return + verify the stub status
+(Storage §5.2b) · console-only failure → one frozen binary + one-byte variants (Measuring §8.1).
 
 ---
 
@@ -114,6 +132,7 @@ ISR before a flash write · install VBL ISR + `ei 0` or the joypad byte never up
 - `wiki/03_Graphics/Tilemaps-and-Scrolling.md` — SCR1/SCR2, 32x32 layout, stride blit, scroll inversion, HUD-as-tilemap.
 - `wiki/03_Graphics/Colors-and-Palettes.md` — RGB444, color-0 transparency fix, palette regions.
 - `wiki/03_Graphics/Effects-and-Raster.md` — raster/HBlank effects, palette FX, bitmap, text, one-split HUD pattern.
+- `wiki/03_Graphics/Pseudo-3D-Road.md` — forward-view racer: two measured engines, track format, corners that arrive (per-scanline look-ahead, double integration, distance blend), full hill recipe + acceptance bench, the five causes of a flickering horizon, objects on the road (1/d, priority, contact in world units), driving model, CPU budget, symptom→cause table.
 - `wiki/03_Graphics/DMA.md` — MicroDMA, raster DMA, DMAM encoding, INTTC0 auto-rearm, safe start/wait, inline-asm sequences.
 - `wiki/03_Graphics/VRAM-Queue.md` — queued VRAM updates, LDIRW CMD_COPY contract.
 
@@ -123,17 +142,17 @@ ISR before a flash write · install VBL ISR + `ei 0` or the joypad byte never up
 **Systems**
 - `wiki/05_Systems/Game-Loop.md` — main loop, VBlank sync, watchdog, frame budget, state machines, VBlank-counter roles.
 - `wiki/05_Systems/Input.md` — joypad polling, edge detection, auto-repeat.
-- `wiki/05_Systems/Link-Cable.md` — serial channel 0, 11 BIOS COM vectors, CTS/RTS handshake, cable-detect (`0xB1` bit2), symmetric loop, session handshake (initiator/responder).
-- `wiki/05_Systems/Storage-and-Saves.md` — flash save, RTC, save-struct design, flash pitfalls.
+- `wiki/05_Systems/Link-Cable.md` — serial channel 0, 11 BIOS COM vectors, CTS/RTS handshake, cable-detect (`0xB1` bit2), symmetric loop, session handshake (initiator/responder), input lockstep, state exchange for a two-player racer (timeout counted in exchanges, GO timing, pumping the cable on blocking screens).
+- `wiki/05_Systems/Storage-and-Saves.md` — flash save, RTC, save-struct design, two-block journal (sequence + CRC, never erase the live block), dirty-then-write-on-screen-change, save buffer as free RAM, low-battery shutdown bits, flash pitfalls.
 - `wiki/05_Systems/Collision.md` — AABB/tile collision, typed enable matrix, codegen pitfalls.
 - `wiki/05_Systems/Fixed-Point-Math.md` — fixed-point (8.x), LUTs, binary->BCD, compression.
 - `wiki/05_Systems/Localization.md` — BIOS language detect, bilingual ROM, string tables, system font.
 - `wiki/05_Systems/Debug-Tools.md` — on-device CPU profiler, ring-buffer log, runtime assert.
-- `wiki/05_Systems/Measuring-Performance.md` — measurement method: wait-states first (no-wait emu runs ~3.4x too fast), name the scene, A/B/A, probe traps, measured/rejected techniques, hardware traps invisible on emulator.
+- `wiki/05_Systems/Measuring-Performance.md` — measurement method: wait-states first (no-wait emu runs ~3.4x too fast), name the scene, A/B/A, probe traps, measured/rejected techniques, cycles per instruction form from the cartridge, worst-turn profiling, the equivalence gate (RAM compared loop turn by loop turn, by symbol name), stack depth by witness fill, hardware traps invisible on emulator.
 
 **Pipeline & Patterns**
 - `wiki/06_Pipeline-and-Patterns/Asset-Pipeline.md` — PNG export, compression, runtime loading, tool limits.
-- `wiki/06_Pipeline-and-Patterns/Gameplay-Patterns.md` — state machines, pacing, genre patterns (shmup/platformer/puzzle/grid/racing/adventure/roguelike-procgen), entity management.
+- `wiki/06_Pipeline-and-Patterns/Gameplay-Patterns.md` — state machines, pacing, genre patterns (shmup/platformer/puzzle/grid/racing/adventure/roguelike-procgen), imposed proportions vs random draws, difficulty quantiles, ghost car in 8 bytes/track, QR code in 16 tiles, entity management.
 
 ## Keyword router
 
@@ -145,4 +164,7 @@ VBlank/watchdog/frame budget/state machine -> Game-Loop · interrupt/timer/vecto
 benchmark/profiling/cycles/optimize/wait-states/how fast -> Measuring-Performance, TLCS900-Reference §37 ·
 opcode/encoding/ABI/register -> TLCS900-Reference, Assembly · compiler/C89/far pointer/bug -> Build-Toolchain ·
 PSG/Z80/SFX/music -> Audio · collision/AABB/tile -> Collision · fixed-point/LUT/BCD -> Fixed-Point-Math ·
-PNG/tiles/font/asset -> Asset-Pipeline · procgen/dungeon/genre -> Gameplay-Patterns.
+PNG/tiles/font/asset -> Asset-Pipeline · procgen/dungeon/genre -> Gameplay-Patterns ·
+racer/road/pseudo-3D/horizon/hill/corner/shear/rival -> Pseudo-3D-Road ·
+QR/ghost/time attack/obstacle placement -> Gameplay-Patterns · accents/glyphs -> Localization ·
+pause screen/transition/black frames -> Game-Loop.

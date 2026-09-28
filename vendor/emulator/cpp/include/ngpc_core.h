@@ -345,6 +345,12 @@ NGPC_API int  ngpc_flash_restore(ngpc_t*, uint32_t address,
  * calibrated numbers (10 / 8 as shipped); everything else is documented or derived.
  * See the definition in core.cpp for the provenance of each piece. */
 NGPC_API void ngpc_set_timing_silicon(ngpc_t*, uint32_t word_wait, uint32_t bios);
+/* Cartridge-flash busy times in cycles: per byte programmed, per 8 KB of block
+ * erased, and how long a chip tries before raising DQ5 on an impossible program
+ * (a 1 over a 0). All three zero = the synchronous chip, for bisection.
+ * Defaults are documented, not measured -- see machine.hpp. */
+NGPC_API void ngpc_set_flash_timing(ngpc_t*, uint32_t program, uint32_t erase_per_8k,
+                                    uint32_t fail);
 NGPC_API void ngpc_set_byte_extra(ngpc_t*, uint32_t pct);
 NGPC_API void ngpc_set_uart_unplugged(ngpc_t*, int on);
 NGPC_API void ngpc_set_micro_dma_states(ngpc_t* h, uint32_t eighths);
@@ -742,7 +748,23 @@ typedef struct {
     uint8_t  rx_shift_full;
     uint8_t  rx_shift_byte;
     uint8_t  rx_had_pending;
-    uint8_t  _pad_v2[3];
+    /* ⛔ THE DETECT LINE HAS TO SURVIVE A RESTORE, AND IT DID NOT.
+     *
+     * `serial_cts_seen` is what makes 0xB1 bit2 answer "a console is at the other end"
+     * -- nothing else does, since cts_high's DEFAULT means "peer ready" and cannot be
+     * told apart from a peer nobody has spoken for. It was in the Machine and in no
+     * block, so every rewind step and every save state UNPLUGGED THE CABLE as far as
+     * the cartridge could tell: a versus game restored mid-match reads "no cable" and
+     * takes whatever exit it has for that. The desktop's rewind ring runs through the
+     * same capture, and libretro netplay runs on retro_serialize.
+     *
+     * ⚡ TAKEN OUT OF THE v2 PADDING ON PURPOSE. The struct keeps its size and its
+     * version, so a state written before this change still loads -- its pad byte is 0,
+     * which reads as "nobody has spoken for the peer", exactly the behaviour that
+     * state was saved with. Bumping the version instead would have made the whole
+     * cable block refuse, throwing away the FIFOs too, to gain nothing. */
+    uint8_t  cts_seen;
+    uint8_t  _pad_v2[2];
     int32_t  tx_cycles;           /* baud-time countdowns, SIGNED      */
     int32_t  rx_cycles;
     uint32_t tx_len;              /* bytes valid in tx_fifo / rx_fifo  */
@@ -964,6 +986,19 @@ NGPC_API uint32_t ngpc_get_lost_writes(ngpc_t*, ngpc_hygiene_t* out, uint32_t n)
  * moves WHEN a starved watchdog is reported, never whether the ROM runs. */
 #define NGPC_HW_WATCHDOG     0x1u
 #define NGPC_HW_SYSTEM_STACK 0x2u
+/* ⛔ THE CARTRIDGE STOPPED BEING MEMORY AND THE CPU KEPT FETCHING FROM IT.
+ *
+ * A flash chip that is programming or erasing answers STATUS, not contents, to every read
+ * of its window -- an instruction fetch included. Executing from there is executing status
+ * bits, and it is fatal: it is why a flash stub is copied into RAM and run with interrupts
+ * masked, and it is the exact mechanism behind "the save works in the emulator and kills
+ * the console". Until the busy window was modelled (2026-09-10) this could not even
+ * happen here, so a ROM carrying it looked perfect.
+ *
+ * Recorded on the CROSSING, with the PC that first fetched out of a working chip. Counted,
+ * never fatal by itself -- a real console does not stop at that instruction either, it
+ * runs the garbage. */
+#define NGPC_HW_FLASH_BUSY_FETCH 0x4u
 
 typedef struct {
     uint32_t pc;      /* the instruction that committed it                     */

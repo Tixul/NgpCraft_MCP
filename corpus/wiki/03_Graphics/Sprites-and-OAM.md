@@ -250,6 +250,39 @@ to `0x8800` in VBlank — zero HBlank pressure, production-safe, hardware-confir
 
 ---
 
+### 3.5 Overlap priority: the group first, then the LOWEST slot number
+
+The K2GE resolves overlapping sprites in two steps: first the **priority group** (PR.C: front
+> middle > behind), then, **inside one group, the lowest OAM slot number** is drawn on top.
+Consequence for multi-layer objects: a car drawn as two layers in slots 0..11 (lights) and
+52..63 (body), with another car in 12..19, all in the front group — the second car slides
+**between** the two layers of the first, whichever is nearer.
+
+Recipe used in a racing game, decided every frame from the **displayed** bottoms (lower on
+screen = nearer):
+
+| case | other object | player object |
+|---|---|---|
+| other object further | its usual slots, **middle** group | unchanged, front |
+| other object nearer | slots **lower** than the player's, front | its first layer shifts to higher slots |
+
+Do not solve it by moving the PLAYER to the middle group: it would go behind every other
+sprite (roadside objects, dust, obstacles). The same rule fixes "roadside posts drawn in
+front of the rival": give the roadside block higher slot numbers than the rival.
+
+### 3.6 Hidden slots are not a reserve — and budget with the real module limits
+
+A slot that is hidden on one screenshot is not free: the module that owns it will take it
+back and hide it again. When budgeting a new module, start from each module's **reserved
+range in the code** and the real cell count of its art, not from an observed frame. Example
+of a full race budget (64 slots): player car two layers 24, rival 8, roadside markers 12,
+dust 4, props 8, obstacles 8 — and a 12-car pack that needs 48 slots only fits by switching
+off props, obstacles and dust for that mode. Remember one 16×16 image is **4 hardware
+sprites**, and a second colour layer doubles it.
+
+A module whose `frame()` hides the whole tail of its reservation will erase a newcomer placed
+in that tail: shrink the reservation in the code first.
+
 ## 4. Performance Checklist
 
 - **Shadow OAM:** build the full OAM state in RAM during main loop,
@@ -263,7 +296,7 @@ to `0x8800` in VBlank — zero HBlank pressure, production-safe, hardware-confir
 - **Tile upload:** only re-upload tile data when the asset changes.
   Tile RAM is persistent; avoid unnecessary re-uploads in the main loop.
 - **Tile base conflicts:** ensure sprite tile base does not overlap with
-  tilemap tile base or system font (slots 32-127). Tile VRAM is shared.
+  tilemap tile base or system font (SYSFONTSET writes slots 0..255). Tile VRAM is shared.
 - **Character Over:** if `HW_STATUS & 0x80` fires, too many sprites overlap
   on one scanline. Reduce overlap or use priority to hide lower-priority sprites.
 
@@ -695,7 +728,7 @@ Destination (NGPC OAM format):
 #include "ngpc_gfx.h"
 #include "../GraphX/my_tileset.h"
 
-#define TILE_BASE 128u   /* avoid overwriting sysfont (slots 32-127) */
+#define TILE_BASE 128u   /* loaded AFTER the sysfont, which writes 0..255 */
 
 static void scene_init(void) {
     u16 i;
@@ -761,7 +794,7 @@ If both fail, the asset itself is corrupted or video init is wrong.
 |-----------|-------|
 | Scroll plane map size | 32x32 tiles |
 | Visible screen area | 20x19 tiles (160x152 px) |
-| Free tile slots | 128-511 (0-31 reserved, 32-127 = BIOS sysfont) |
+| Free tile slots | 128-511 in practice (SYSFONTSET writes 0..255; user tiles load after) |
 | Palettes per plane | 16 palettes x 4 colors, format `0x0BGR` |
 | Palette 0, color 0 | Always transparent on scroll planes |
 | Total tile VRAM | 512 tiles (Character RAM = 8 KB) |
@@ -824,7 +857,7 @@ ngpc_gfx_set_palette(GFX_SCR1, 0u,
 - Root cause: sprite tile base overlaps with tilemap or background tile base.
   When backgrounds are re-uploaded (state transition, level load), they overwrite sprite tiles.
 - Fix: plan tile VRAM layout explicitly. Assign separate, non-overlapping ranges:
-  tile 0-31 = reserved, 32-127 = sysfont, 128-N = backgrounds, N+1..511 = sprites.
+  SYSFONTSET writes 0..255; then 128-N = backgrounds, N+1..511 = sprites.
   Regenerate all assets if the layout changes.
 
 **Sprite appears "cut in half" when H-flipped**
@@ -895,6 +928,32 @@ ngpc_gfx_set_palette(GFX_SCR1, 0u,
   Use Method B (direct VRAM blit macro) to isolate the issue.
 
 ---
+
+### Finding who owns a pixel: frame each OAM block on the capture
+
+"The rival looks glitched in the corner" was not the rival at all — its table was perfect —
+but half of the PLAYER's own car drawn black and grey: a new obstacle module had taken
+**sprite palette 5**, which was the second layer of the player's body (lights, glass). The
+car set its palette when the track loaded, the obstacle init ran after and overwrote it for
+the whole race.
+
+The method that found it in three moves: split the 64 slots into their owner BLOCKS (car
+layer 1, rival, scenery, dust, props, obstacles, car layer 2) and **draw a frame around each
+block's sprites on the capture, one colour per block**. The frame says who owns each pixel;
+the eye alone blamed the wrong module.
+
+⛔ **List palette owners by their WRITES, not their names.** Searching `#define *_PAL <n>`
+missed the body's second-layer palette, which is not named that way. `grep` the calls that
+write sprite palettes: in that game palettes 0–3 and 5–10 were taken in a race, 4 and 11–15
+free.
+
+⛔ **A dark object on dark tarmac is drawn and invisible.** A pothole was at the right place,
+in the right lane, at the right size — impossible to find by eye. Framing the sprite table on
+the capture found it; the fix was a light **outline** in the converter (whose outline colour
+had been hard-coded black, made for a white post on grass — the opposite case).
+
+⛔ **Measure objects in the TABLE, not on the screen.** A live sprite in a block may also be
+what a previous screen (a garage portrait) left there.
 
 ## 11. OAM Watermark & Dynamic Tile Upload
 
@@ -1064,7 +1123,7 @@ with a fixed sprite set, a one-time VRAM upload at level load is simpler and fas
 | Shadow OAM RAM | 320 bytes | `s_oam[256]` + `s_col[64]` |
 | OAM flush | LDIRW 128 words | in VBlank ISR only |
 | Pal idx flush | LDIRW 32 words | with OAM flush |
-| Free tile slots | 128-511 | 0-31 reserved, 32-127 sysfont |
+| Free tile slots | 128-511 | SYSFONTSET writes 0..255; user tiles load after |
 | Max sprites HW | 64 | hard limit |
 | Max visible colors / tile | 3 + transparent | 2bpp, index 0 = transparent |
 | Character Over | `HW_STATUS & 0x80` | too many sprites on one scanline |

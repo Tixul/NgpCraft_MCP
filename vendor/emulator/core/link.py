@@ -50,6 +50,49 @@ class _SerialMachine(Protocol):
 # never left stranded in the FIFO for a frame.
 _DRAIN_CHUNK = 256
 
+
+def declare_peer(machine: "_SerialMachine", present: bool) -> None:
+    """Tell the console whether there is a CONSOLE at the other end of the cable.
+
+    ⛔ THE BUG THIS ENDS, MEASURED (tools/link_online_probe.py, two consoles of
+    SNK Gals' Fighters, 400 frames):
+
+        online (TcpLink)          0xB1 = 0x06   bit2 = 1   -> "aucun pair"
+        local  (PlayPage relay)   0xB1 = 0x02   bit2 = 0   -> pair vu
+
+    0xB1 bit2 is the cable-DETECT line the games gate their versus mode on, and since
+    it was moved onto the peer's RTS (specs/LINK_CABLE.md §1, silicon 2026-08-19) the
+    core only clears it once something has SPOKEN FOR THE PEER -- `serial_cts_seen`.
+    Two places do: `InProcessLink._relay` and `PlayPage._pump_link`, both of which
+    have the other console in the same process and read its RTS pin directly. The
+    ONLINE transports have no such pin to read and nobody ever spoke for the peer, so
+    every online console read "no cable" for ever. That is Card Fighters' Clash never
+    leaving "EITHER PLAYER MUST PUSH A", Gals' Fighters / Puyo Pop / Magical Drop not
+    seeing a second player, and The Last Blade's LINK ERROR -- one cause, not five.
+
+    ⚡ WHAT IS ASSERTED HERE, AND WHY IT IS HONEST. The transports are built AFTER the
+    pairing completes, and an online session can only be opened from a console that is
+    already running the cartridge -- so "a peer is attached" and "the peer is a console
+    running a game" are the same statement on this path. The silicon distinction the
+    detect line exists to make (a peer that is merely powered, sitting in its BIOS,
+    must NOT register) is unreachable online: there is no way to join a room from the
+    BIOS. What the wire cannot tell us is the moment-to-moment RTS, so this asserts
+    the steady state -- peer present and ready -- and drops it the moment the peer goes.
+
+    ⚠️ NOT A RETURN TO THE OLD MODEL. The old one derived the bit from "the host
+    attached a cable", so it read "peer present" on a lone console with a cable armed
+    and no one at the far end (`B1=0x02` where silicon reads `0x07`). This is driven by
+    an actual paired peer, and `present=False` on loss makes the cut visible to the
+    game -- which is how Match of the Millennium raises its own LINK ERROR.
+    """
+    try:
+        machine.serial_set_cts(not present)
+    except Exception:                       # noqa: BLE001
+        # A monitor's stand-in machine, or a core too old to have the pin. A link that
+        # cannot say this must still carry bytes.
+        pass
+
+
 # ⚡ HOW OFTEN TWO CONSOLES IN ONE PROCESS MUST BE INTERLEAVED, in instructions.
 #
 # Running one console's whole frame while the other stands still puts a frame of
@@ -239,6 +282,7 @@ class TcpLink:
         # impair the outgoing one (latency/loss) to rehearse a bad connection.
         self.monitor = monitor
         self.machine.serial_set_enabled(True)
+        declare_peer(self.machine, True)
         self._rx = bytearray()
         self._out = bytearray()     # written but not yet accepted by the kernel
         self.bytes_out = 0
@@ -285,6 +329,12 @@ class TcpLink:
         """The peer is gone. Record it once and let go of the socket."""
         if self.lost is None:
             self.lost = why or "peer closed"
+        # The console must SEE the cut. Dropping the detect line is what a yanked cable
+        # does on silicon, and it is how a game raises its own link error instead of
+        # waiting for ever on a peer that has gone. (The shell also detaches the link,
+        # which disables the channel; this stands on its own so a transport that is
+        # pumped by anything else behaves the same.)
+        declare_peer(self.machine, False)
         try:
             self.sock.close()
         except OSError:

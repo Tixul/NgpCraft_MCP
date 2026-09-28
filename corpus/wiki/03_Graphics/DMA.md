@@ -407,6 +407,30 @@ NgpcDmaPingPong + ngpc_dma_pp_init() / ngpc_dma_pp_front() / ngpc_dma_pp_back() 
 
 Useful stride constant: `NGPC_DMA_PP_STRIDE_WORD152 = 0x0134`
 
+### 5.3b Ping-pong in a real game: what the second buffer breaks
+
+A per-line table re-armed from a VBlank hook is read by the channel **during the whole
+image**. If the game loop rewrites it in the same time (and a loop that takes more than one
+frame does), the lines already scanned keep the old values and the next ones get the new:
+the table is **torn**, with the seam wandering with the loop's duration — near the top of the
+screen, since it is scanned first. Measured on a racing game: 305–480 changing pixels per
+frame on the seam lines before, 28–64 after double-buffering. See
+[Pseudo-3D Road](Pseudo-3D-Road.md) §9.1.
+
+Swap the pointers in the re-arm (the only moment nobody reads or writes), and only if a
+`ready()` call said the new buffer was fully written — otherwise the channel shows the last
+COMPLETE image again. Then check three things the second buffer breaks:
+
+* **everything written ONCE** (a static HUD band, the flat table used in menus) must be
+  written into BOTH buffers;
+* **a cache** keyed on "inputs unchanged since last frame" must have **one key per buffer**,
+  or the frame after a change serves a buffer that is one frame older (and a cache
+  invalidated at every swap is dead weight);
+* any secondary table (a per-line palette channel) must be doubled and swapped with the
+  same parity.
+
+Cost: two tables of 152 words = +608 bytes of RAM, no measurable time.
+
 ### 5.4 Auto-Rearm on INTTCn
 
 Objective: when `DMACn` reaches 0, the hardware clears `DMAxV=0`. Auto-rearm immediately

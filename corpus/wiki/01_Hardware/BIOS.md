@@ -172,14 +172,26 @@ __asm(" call xix");
 ### 5.4 BIOS_SYSFONTSET (5) — Load system font
 
 ```c
-/* Loads 96 ASCII glyphs (0x20-0x7F) into tile RAM starting at slot 32 */
+/* Loads 256 font characters into tile RAM slots 0..255, indexed by code.
+ * RA3 is NOT a font selector: high nibble = transparency palette code (0-3),
+ * low nibble = font palette (0-3). SysCall.txt: "generally specify 0x03". */
 __asm("ldb ra3, 3");
 __asm("ldb rw3, " NGPC_STR(BIOS_SYSFONTSET));
 __asm("swi 1");
 ```
 
-> Tile slots 0-31 = reserved. Slots 32-127 = system font after this call.
-> Slots 128+ are free for user tiles.
+> **Measured 2026-09-23** against the official `SysCall.txt` (`VECT_SYSFONTSET`)
+> and verified by running a retail BIOS: this call transfers **256 characters**
+> into the FRONT HALF of character RAM (`0xA000-0xAFFF`), i.e. **tile slots
+> 0..255**, indexed by character code. Tile `0x41` is `A`. The **64 half-width
+> katakana** (JIS X 0201) are loaded too, at tile slots **`0xA1`..`0xDF`**.
+> This does NOT depend on the console language: an English console and a
+> Japanese one produce byte-identical character RAM.
+
+> Consequence for tile budgeting: this call writes **all of slots 0..255**, so
+> "slots 128+ are free" is wrong as stated — they are free only because user
+> tiles are normally loaded AFTER the font. Keep slots `0xA1`..`0xDF` intact if
+> you intend to print katakana.
 
 ### 5.5 BIOS_FLASHERS (8) + BIOS_FLASHWRITE (6) — Save to flash
 
@@ -428,8 +440,9 @@ for (;;) {
 | SYSFONTSET | vector 5 | SWI 1, ra3=3 |
 | FLASHWRITE | vector 6 | SWI 1 |
 | FLASHERS | vector 8 | SWI 1, ra3=0, rb3=block |
-| System font tile base | slot 32 | After SYSFONTSET call |
-| Tile slots 128+ | free | User tiles |
+| System font tile range | slots 0..255 | After SYSFONTSET; tile index == character code |
+| Katakana tiles | slots 0xA1..0xDF | JIS X 0201 half-width, loaded by the same call |
+| Tile slots 128+ | overwritten by the font | Free only if user tiles are loaded afterwards |
 | Watchdog address | `0x006F` | Write `0x4E` |
 | VBlank vector | `0x6FCC` | 32-bit ptr, mandatory |
 | Timer0 vector | `0x6FD4` | 32-bit ptr, HBlank |
