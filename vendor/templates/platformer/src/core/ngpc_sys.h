@@ -16,6 +16,7 @@ extern volatile u8 g_vb_counter;
  * - Detects mono/color mode
  * - Installs interrupt vectors (VBL mandatory)
  * - Sets viewport to 160x152
+ * - Disables BIOS inactivity shutdown; preserves battery/POWER handling
  * - Enables interrupts
  * Call this first in main(). */
 void ngpc_init(void);

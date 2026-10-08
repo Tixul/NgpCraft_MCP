@@ -1,5 +1,11 @@
 # Agent guide — how to actually use this server
 
+> **Inactivity policy (2026-10-01):** disable the BIOS ten-minute idle request
+> by clearing `User_Answer` / `HW_USR_ANSWER` (0x6F86) bit 6; keep reserved bit 5
+> clear (`HW_USR_ANSWER &= (u8)0x9F;`). Continue handling every nonzero
+> `HW_USR_SHUTDOWN` (0x6F85), including battery and POWER requests. This is a
+> precaution pending investigation, not a confirmed hardware-defect diagnosis.
+
 You are an LLM with ~40 NGPC tools. This tells you which one answers which question,
 in what order, and — just as important — what each one **cannot** tell you.
 

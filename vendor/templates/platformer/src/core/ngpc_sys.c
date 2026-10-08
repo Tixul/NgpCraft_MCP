@@ -84,11 +84,10 @@ void ngpc_init(void)
      * LANG_ENGLISH=0, LANG_JAPANESE=1. Set by BIOS at boot, read-only. */
     s_language = HW_LANGUAGE;
 
-    /* Clear bit 5 of USR_ANSWER (reserved, must be 0 per spec checklist). */
-    HW_USR_ANSWER &= ~(1 << 5);
-    /* Compatibility with classic NGPC init code:
-     * many templates set USR_ANSWER bit 6 early. */
-    HW_USR_ANSWER |= 0x40;
+    /* Keep reserved bit 5 clear and disable BIOS inactivity shutdown (bit 6).
+     * Precautionary default: idle-restart reports remain under investigation.
+     * Preserve resume/other flags; ngpc_vsync still handles shutdown requests. */
+    HW_USR_ANSWER &= (u8)0x9F;
 
 #if NGP_ENABLE_DEBUG
     /* Reset debug log ring buffer. */

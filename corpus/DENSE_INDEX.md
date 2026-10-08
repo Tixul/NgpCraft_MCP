@@ -1,5 +1,11 @@
 # NGPC Dense Index — high-density entry point
 
+> **Inactivity policy (2026-10-01):** disable the BIOS ten-minute idle request
+> by clearing `User_Answer` / `HW_USR_ANSWER` (0x6F86) bit 6; keep reserved bit 5
+> clear (`HW_USR_ANSWER &= (u8)0x9F;`). Continue handling every nonzero
+> `HW_USR_SHUTDOWN` (0x6F85), including battery and POWER requests. This is a
+> precaution pending investigation, not a confirmed hardware-defect diagnosis.
+
 Compact map + cheat-sheet of the NGPC documentation corpus, optimized for fast LLM
 loading. Inline facts are the must-knows; follow the page link for full detail. All
 addresses hex. Console: Neo Geo Pocket Color, Toshiba TLCS-900/H @ 6.144 MHz, 160x152,

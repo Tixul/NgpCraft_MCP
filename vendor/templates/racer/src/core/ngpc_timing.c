@@ -34,7 +34,8 @@ void ngpc_vsync(void)
     ngpc_vramq_clear_dropped();
 #endif
 
-    /* POWER button: BIOS requests shutdown by setting HW_USR_SHUTDOWN.
+    /* BIOS shutdown requests include low battery and POWER.
+     * Inactivity requests are disabled by ngpc_init; handle every request here.
      * Calling the BIOS shutdown vector from a normal (non-ISR) context is
      * more robust on real hardware than doing it inside the VBlank ISR. */
     if (HW_USR_SHUTDOWN)

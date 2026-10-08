@@ -129,6 +129,33 @@ Defined in `ngpc_hw.h` as `BIOS_*` constants.
 
 ## 5. BIOS Call Details
 
+### Inactivity shutdown: disabled by default (2026-10-01)
+
+NgpCraft now disables the BIOS ten-minute inactivity shutdown request at startup.
+Clear **bit 6** (`TIMER_SHUTDOWN_ANS`, mask `0x40`) of `User_Answer` /
+`HW_USR_ANSWER` at **0x6F86**. Bit 5 is reserved and must also remain zero;
+preserve the other bits, including the resume flag (bit 7):
+
+```c
+HW_USR_ANSWER &= (u8)0x9F; /* clear reserved bit 5 and inactivity-enable bit 6 */
+```
+
+This is a precautionary default while reported idle restarts on homebrew are
+investigated, not proof of a BIOS defect or a claim about all commercial games.
+The SDK documents inactivity requests after about ten minutes without input and
+recommends enabling them; NgpCraft intentionally departs from that recommendation
+for now. Source: SDK System Work Reference, `User_Shutdown` and `User_Answer`.
+
+**Keep checking every nonzero `User_Shutdown` / `HW_USR_SHUTDOWN` at 0x6F85**
+and call the BIOS shutdown routine from the main loop (`ngpc_vsync()` in the
+template). Low-battery and POWER-button handling must remain available. Do not
+clear this read-only request byte, mask away its battery bit, or replace the
+shutdown routine with a no-op. Disabling inactivity does not pause the watchdog.
+
+Older `InitNGPC()` libraries commonly enable bit 6 and handle shutdown in their
+VBlank ISR, even with `while (1);` in main. Those historical examples describe old
+behavior; new projects should use the disabled-by-default initialization above.
+
 ### 5.1 BIOS_SHUTDOWN (0) — Power off
 
 ```c

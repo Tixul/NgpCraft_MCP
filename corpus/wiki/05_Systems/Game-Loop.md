@@ -1,5 +1,11 @@
 # Game Loop
 
+> **Inactivity policy (2026-10-01):** disable the BIOS ten-minute idle request
+> by clearing `User_Answer` / `HW_USR_ANSWER` (0x6F86) bit 6; keep reserved bit 5
+> clear (`HW_USR_ANSWER &= (u8)0x9F;`). Continue handling every nonzero
+> `HW_USR_SHUTDOWN` (0x6F85), including battery and POWER requests. This is a
+> precaution pending investigation, not a confirmed hardware-defect diagnosis.
+
 VBlank sync, ISR design, watchdog, frame budget, state machine, and three reference pipeline architectures for NGPC games.
 
 > Note: All files use ASCII only (avoids encoding issues on Windows/PowerShell).

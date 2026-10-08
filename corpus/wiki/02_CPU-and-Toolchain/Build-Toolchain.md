@@ -905,6 +905,7 @@ individual opcode bans.
 - **ISR install pattern** (mandatory for input to work): install `VBL_ISR` at `0x6FCC`
   and enable with `ei 0`. Without this, the BIOS never updates the joypad byte at
   `0x6F82` and buttons stay silent (see section 4, Interrupt Functions).
+- **Current inactivity workaround:** clear `HW_USR_ANSWER` bit 6 at initialization. Never stub out `ngpc_shutdown`, because low-battery requests still need handling.
 - **Power button is BIOS-trapped** — a `ngpc_shutdown = ret` stub does NOT disable the
   hardware power button; it only suppresses `TIME_SHUTDOWN_REQ` (10-min idle) and
   `BAT_SHUTDOWN_REQ` (low battery). The power button is honored regardless.

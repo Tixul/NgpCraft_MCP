@@ -1,5 +1,11 @@
 # NgpCraft MCP
 
+> **Inactivity policy (2026-10-01):** disable the BIOS ten-minute idle request
+> by clearing `User_Answer` / `HW_USR_ANSWER` (0x6F86) bit 6; keep reserved bit 5
+> clear (`HW_USR_ANSWER &= (u8)0x9F;`). Continue handling every nonzero
+> `HW_USR_SHUTDOWN` (0x6F85), including battery and POWER requests. This is a
+> precaution pending investigation, not a confirmed hardware-defect diagnosis.
+
 **Model Context Protocol server for NgpCraft — gives any MCP-compatible LLM the hardware-validated knowledge, API, examples, and validation tooling to write working NGPC homebrew.**
 
 Install once, and every Claude Code / Cursor / Claude Desktop session gains the ability to look up real NGPC hardware facts, retrieve canonical ASM patterns, search a proven game's source by feature, and scaffold a new project — instead of hallucinating half-correct code that crashes on silicon.

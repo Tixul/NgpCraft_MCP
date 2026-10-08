@@ -1,5 +1,11 @@
 # Hardware Registers
 
+> **Inactivity policy (2026-10-01):** disable the BIOS ten-minute idle request
+> by clearing `User_Answer` / `HW_USR_ANSWER` (0x6F86) bit 6; keep reserved bit 5
+> clear (`HW_USR_ANSWER &= (u8)0x9F;`). Continue handling every nonzero
+> `HW_USR_SHUTDOWN` (0x6F85), including battery and POWER requests. This is a
+> precaution pending investigation, not a confirmed hardware-defect diagnosis.
+
 Complete hardware register documentation for the Neo Geo Pocket Color: memory map, OAM, tilemaps, palettes, audio, interrupts, and representative RAM variable maps.
 
 > Note: All content uses ASCII only (avoids encoding issues on Windows/PowerShell).
@@ -162,7 +168,7 @@ Both accept value `0x4E`. In practice use `0x006F` (SDK standard).
 | `HW_JOYPAD` | `0x6F82` | u8 | Joypad state (bits = buttons) |
 | `HW_USR_BOOT` | `0x6F84` | u8 | Boot reason (0=normal, 1=resume, 2=alarm) |
 | `HW_USR_SHUTDOWN` | `0x6F85` | u8 | OS-requested shutdown flag |
-| `HW_USR_ANSWER` | `0x6F86` | u8 | User response — bit5 must be 0 |
+| `HW_USR_ANSWER` | `0x6F86` | u8 | User response: bit 5 reserved = 0; bit 6 inactivity request = 0 by default; preserve bit 7 |
 | `HW_LANGUAGE` | `0x6F87` | u8 | System language |
 | `HW_OS_VERSION` | `0x6F91` | u8 | 0=NGP monochrome, !=0=NGPC color |
 
