@@ -2197,7 +2197,8 @@ void main(void)
 #if NGPNG_AUTORUN_SCORE_HUD
     /* Flash save: load best score if a valid save exists. */
     {
-        u8 flash_buf[8];
+        /* SAVE_SIZE, not 8: ngpc_flash_load() copies a whole record. */
+        static u8 flash_buf[SAVE_SIZE];
         ngpc_flash_init();
         if (ngpc_flash_exists()) {
             ngpc_flash_load(flash_buf);
@@ -2524,7 +2525,9 @@ void main(void)
 #if NGPNG_AUTORUN_SCORE_HUD
         if (game_over && !flash_saved) {
             if (score > best_score) {
-                u8 save_buf[8];
+                /* SAVE_SIZE, not 8: the driver writes a whole record and stamps
+                 * its journal in the last 8 bytes. */
+                static u8 save_buf[SAVE_SIZE];
                 best_score = score;
                 save_buf[0] = 0xCAu; save_buf[1] = 0xFEu;
                 save_buf[2] = 0x20u; save_buf[3] = 0x26u;

@@ -59,9 +59,23 @@ static void __interrupt isr_dummy(void) { }
  * - VBL interrupt (level 4) must never be disabled
  */
 
+/* See ngpc_set_vblank_hook() in ngpc_sys.h. */
+static NgpcVblankFn g_vb_hook;
+
+void ngpc_set_vblank_hook(NgpcVblankFn fn)
+{
+    g_vb_hook = fn;
+}
+
 static void __interrupt isr_vblank(void)
 {
     HW_WATCHDOG = WATCHDOG_CLEAR;
+
+    /* First, before the queued VRAM writes: re-arming a raster DMA must beat
+     * the beam. */
+    if (g_vb_hook) {
+        g_vb_hook();
+    }
 
     /* Reset raster per-line counter so Timer0 ISR starts at line 0. */
     ngpc_raster_vsync();
@@ -88,7 +102,7 @@ void ngpc_init(void)
     s_is_color = (HW_OS_VERSION != 0) ? 1 : 0;
 
     /* Cache system language from BIOS register (0x6F87).
-     * LANG_ENGLISH=0, LANG_JAPANESE=1. Set by BIOS at boot, read-only. */
+     * LANG_JAPANESE=0, LANG_ENGLISH=1 (SysWork.txt). Set by BIOS at boot. */
     s_language = HW_LANGUAGE;
 
     /* Keep reserved bit 5 clear and disable BIOS inactivity shutdown (bit 6).

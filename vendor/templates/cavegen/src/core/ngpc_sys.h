@@ -29,10 +29,20 @@ void ngpc_init(void);
 /* Returns 1 if running on NGPC Color, 0 if monochrome NGP. */
 u8 ngpc_is_color(void);
 
-/* Returns LANG_ENGLISH (0) or LANG_JAPANESE (1).
- * Value is read once from BIOS register 0x6F87 during ngpc_init() and cached.
- * Use this to select localized strings or assets at startup. */
+/* Returns LANG_JAPANESE (0) or LANG_ENGLISH (1), the order of SysWork.txt
+ * (0x6F87). A two-state console setting, not a language menu: a third
+ * language cannot be requested through it.
+ * Value is read once from BIOS register 0x6F87 during ngpc_init() and cached. */
 u8 ngpc_get_language(void);
+
+/* ONE HOOK, RUN AT THE TOP OF EVERY VBLANK, for work that must happen on every
+ * DISPLAYED frame rather than every frame the game manages to finish. A
+ * one-shot raster DMA is the case it exists for: re-armed from the game loop,
+ * a single missed frame draws the table from mid-screen and splits the
+ * picture in two. Keep it short -- it runs before the queued VRAM writes,
+ * with the beam about to start. Pass 0 to remove it. */
+typedef void (*NgpcVblankFn)(void);
+void ngpc_set_vblank_hook(NgpcVblankFn fn);
 
 /* Perform system shutdown via BIOS. Call when USR_SHUTDOWN is set. */
 void ngpc_shutdown(void);

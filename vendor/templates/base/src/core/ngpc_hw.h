@@ -119,8 +119,10 @@
 #define HW_USR_SHUTDOWN  (*(volatile u8  *)0x6F85)   /* Shutdown request flag  */
 #define HW_USR_ANSWER   (*(volatile u8  *)0x6F86)   /* User response flags    */
 #define HW_LANGUAGE     (*(volatile u8  *)0x6F87)   /* System language        */
-#define LANG_ENGLISH    0u                           /* HW_LANGUAGE == 0 */
-#define LANG_JAPANESE   1u                           /* HW_LANGUAGE == 1 */
+/* ZERO IS JAPANESE. SysWork.txt, "Language" at 0x6F87: "Currently, 0 is for
+ * Japanese and 1 is for English." These two were swapped until 2026-10. */
+#define LANG_JAPANESE   0u                           /* HW_LANGUAGE == 0 */
+#define LANG_ENGLISH    1u                           /* HW_LANGUAGE == 1 */
 #define HW_OS_VERSION   (*(volatile u8  *)0x6F91)   /* 0=monochrome, !=0=color */
 
 /* Joypad bit masks
@@ -132,6 +134,10 @@
 #define PAD_A           0x10
 #define PAD_B           0x20
 #define PAD_OPTION      0x40
+/* Bit 7: NO BUTTON on an NGPC, and NOT the power switch. The console only has
+ * the pad, A, B and OPTION; SysWork.txt ties bit 7 to an external NEOGEO
+ * controller, which a handheld cannot take. The power switch is only reported
+ * by HW_USR_SHUTDOWN (bit 7 of 0x6F85). Name kept so old code still builds. */
 #define PAD_POWER       0x80
 
 /* ======================================================================
@@ -232,8 +238,14 @@
 #define HW_PAL_BG       ((volatile u16 *)0x83E0)    /* Background palette     */
 #define HW_PAL_WIN      ((volatile u16 *)0x83F0)    /* Window palette         */
 
-/* 12-bit RGB color macro (4 bits per channel, 0-15) */
-#define RGB(r, g, b)    ((u16)((r) & 0xF) | (((g) & 0xF) << 4) | (((b) & 0xF) << 8))
+/* 12-bit RGB color macro (4 bits per channel, 0-15).
+ * EVERY TERM IS WIDENED BEFORE IT IS SHIFTED. Written without the casts, cc900
+ * folded the expression at 8 bits: the blue term was shifted out and the byte
+ * left was sign-extended, so RGB(1, 8, 1) reached the palette as 0xFF81
+ * (full blue). Any colour with green >= 8 was affected. */
+#define RGB(r, g, b)    ((u16)(((u16)((r) & 0xFu))         \
+                             | ((u16)((g) & 0xFu) << 4)    \
+                             | ((u16)((b) & 0xFu) << 8)))
 
 /* ======================================================================
  * SPRITE VRAM

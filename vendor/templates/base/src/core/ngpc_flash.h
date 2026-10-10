@@ -1,144 +1,147 @@
 /*
- * ngpc_flash.h - Cartridge flash save system
+ * ngpc_flash.h - Cartridge flash save system (two-bank journal)
  *
  * Part of NgpCraft_base_template (MIT License)
+ * Ported from the OVER REV v31 journal (2026-09), made game-independent.
+ * Full rationale and failure history: docs/NGPC_FLASH_SAVE_GUIDE.md.
  *
  * ═══════════════════════════════════════════════════════════════════
- * HARDWARE CONTEXT
+ * WHERE
  * ═══════════════════════════════════════════════════════════════════
  *
- * Target : block 33 (F16_B33), offset 0x1FA000, 8 KB
- *          Absolute CPU address: 0x200000 + 0x1FA000 = 0x3FA000
+ * Two 8 KB erase blocks at the top of the cartridge, found from the size
+ * the BIOS stores at 0x6C58 (1 = 4 Mbit, 2 = 8 Mbit, 3 = 16 Mbit):
  *
- * BIOS bugs confirmed on 16Mbit carts (SysCall.txt p.299):
- *   - VECT_FLASHERS cannot erase blocks 32, 33, 34.
- *   - Workaround: use CLR_FLASH_RAM (system.lib) for those blocks.
- *   - CLR_FLASH_RAM itself silently fails on its 2nd call within the
- *     same power-on session (hardware bug; no source available).
- *   - Direct writes to 0x3FA000 from user code are no-ops: the cart
- *     bus /WE line is only asserted by the BIOS / system.lib.
+ *   cart      bank A (block 33 on 16M)   bank B (block 32 on 16M)
+ *   4 Mbit    offset 0x07A000            0x078000
+ *   8 Mbit    offset 0x0FA000            0x0F8000
+ *   16 Mbit   offset 0x1FA000            0x1F8000
+ *
+ * Any other size, or a linked image reaching bank B, REFUSES every flash
+ * operation (ngpc_flash_ready() == 0). Not saving can be recovered from;
+ * erasing the wrong 8 KB cannot. The BIOS block 34 is never touched.
  *
  * ═══════════════════════════════════════════════════════════════════
- * APPEND-ONLY SLOT DESIGN  (avoids all double-erase problems)
+ * RECORD LAYOUT (SAVE_SIZE bytes, one slot)
  * ═══════════════════════════════════════════════════════════════════
  *
- * Block 33 (8 KB) is treated as an array of 32 slots × 256 bytes.
+ *   0..3            magic CA FE 20 26                (written by YOU)
+ *   4..N-9          your payload: NGPC_FLASH_PAYLOAD - 4 bytes
+ *   N-8..N-5        sequence number, u32 LE          (stamped by the driver)
+ *   N-4..N-3        CRC16-CCITT (init 0xFFFF) of bytes 0..N-5, LE
+ *   N-2             journal tag 0x4A
+ *   N-1             commit byte 0x00, programmed LAST
  *
- *   slot 0  : 0x1FA000..0x1FA0FF   (256 bytes)
- *   slot 1  : 0x1FA100..0x1FA1FF
- *   ...
- *   slot 31 : 0x1FB F00..0x1FBfFF
+ * A write cut before its last byte leaves the commit byte at 0xFF and is
+ * ignored at the next boot; the previous record is still there.
  *
- * Write  : finds the next empty slot (first byte == 0xFF) and writes
- *          there — NO erase required.
- * Read   : scans slots 31→0, returns the last slot with a valid magic.
- * Erase  : triggered only when ALL 32 slots are used (extremely rare
- *          mid-session); uses standalone AMD erase stub in ngpc_flash_asm.asm
- *          (no system.lib — at most once per session → always succeeds).
+ * ═══════════════════════════════════════════════════════════════════
+ * RULES THAT ARE NOT OPTIONAL
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * - Call only from the main loop, NEVER from an interrupt. Writes and erases
+ *   mask interrupts (`di` ... `ei 0`) and leave the machine at level 0.
+ * - Pause raster/HBlank DMA effects before calling: interrupts are off.
+ * - Save on a SCREEN CHANGE, from a RAM "dirty" flag - never once per button
+ *   press. Each bank holds 8192/SAVE_SIZE slots; a full bank rolls over to
+ *   the other one, which may need an 8 KB erase (~60 ms, interrupts off).
+ * - Keep your "dirty" flag set until ngpc_flash_save() returns 1. A return
+ *   of 0 leaves the previous record intact; retry on the next screen change,
+ *   and show the failure somewhere (a refusal looks like success until the
+ *   console is switched off).
  *
  * ═══════════════════════════════════════════════════════════════════
  * USAGE
  * ═══════════════════════════════════════════════════════════════════
  *
- * 1. Define NGP_ENABLE_FLASH_SAVE=1 in your build flags (or makefile).
+ *   typedef struct {
+ *       u8  magic[4];       // { 0xCA, 0xFE, 0x20, 0x26 }
+ *       u8  version;        // YOUR layout version, after the magic
+ *       u8  level;
+ *       u16 score;
+ *       u8  pad[NGPC_FLASH_PAYLOAD - 8];      // 8 = the fields above
+ *       u8  journal[NGPC_FLASH_TRAILER];      // stamped by the driver
+ *   } MySave;               // sizeof(MySave) MUST equal SAVE_SIZE
  *
- * 2. Nothing else to link — standalone AMD stubs in ngpc_flash_asm.asm
- *    handle all erase and write operations. No system.lib required.
- *    (system.lib remains supported as an optional override via SYSTEM_LIB=.)
+ *   static MySave save;     // static: SAVE_SIZE bytes do not belong on the stack
  *
- * 3. Your save struct MUST start with the 4 magic bytes:
+ *   ngpc_flash_init();                    // once, after ngpc_init()
+ *   if (ngpc_flash_exists()) ngpc_flash_load(&save);
+ *   ...
+ *   if (dirty && ngpc_flash_save(&save)) dirty = 0;
  *
- *       typedef struct {
- *           u8  magic[4];    // must be { 0xCA, 0xFE, 0x20, 0x26 }
- *           u8  level;
- *           u16 score;
- *           // ... up to 252 more bytes (total must fit in SAVE_SIZE)
- *       } MySaveData;
+ * Build with NGP_ENABLE_FLASH_SAVE=1 (links ngpc_flash_asm.rel).
+ * Records written by the pre-2026-10 append-only driver are not "current";
+ * a shipped game recovers them with ngpc_flash_load_legacy() (see below).
  *
- * 4. Typical save / load pattern:
- *
- *       // ── at startup ───────────────────────────────────────────
- *       ngpc_flash_init();
- *       if (ngpc_flash_exists()) {
- *           MySaveData save;
- *           ngpc_flash_load(&save);
- *           player_level = save.level;
- *           player_score = save.score;
- *       }
- *
- *       // ── when saving ──────────────────────────────────────────
- *       MySaveData save;
- *       save.magic[0] = 0xCA;  save.magic[1] = 0xFE;
- *       save.magic[2] = 0x20;  save.magic[3] = 0x26;
- *       save.level = player_level;
- *       save.score = player_score;
- *       ngpc_flash_save(&save);   // can be called multiple times
- *                                 // per session safely
- *
- * ═══════════════════════════════════════════════════════════════════
- * NGP_FAR REQUIREMENT
- * ═══════════════════════════════════════════════════════════════════
- *
- * Flash is at 0x3FA000 — outside the 16-bit near address range.
- * All internal flash pointers use NGP_FAR (__far). You do NOT need
- * NGP_FAR in your own code; the API copies to/from your normal buffers.
- *
- * ═══════════════════════════════════════════════════════════════════
+ * NGP_FAR: flash is above 0x200000; the driver uses far pointers internally,
+ * your buffers are ordinary RAM pointers.
  */
 
 #ifndef NGPC_FLASH_H
 #define NGPC_FLASH_H
 
 #include "ngpc_types.h"
+#include "ngpc_config.h"
 
-/* ── Configuration ─────────────────────────────────────────────────
- *
- * SAVE_SIZE : size of your save data, in bytes.
- *   - Minimum 4 (magic) + your data.
- *   - Must be a multiple of 256 (BIOS write granularity).
- *   - Must satisfy: NUM_SLOTS = 8192 / SAVE_SIZE >= 1.
- *   - Default 256 → 32 slots. Increase if you need more than 252
- *     bytes of payload (e.g. 512 → 16 slots, 508 bytes payload).
- *
- * SLOT_SIZE is always equal to SAVE_SIZE.
- * NUM_SLOTS = 8192 / SAVE_SIZE (computed internally in .c).
- */
-#define SAVE_SIZE   256     /* bytes per slot; must be multiple of 256 */
+/* Bytes per record. A power of two from 256 to 8192 (BIOS writes 256-byte
+ * pages, a bank is 8192 bytes). Override globally: -DSAVE_SIZE=512.
+ * 256 -> 32 slots per bank, 512 -> 16. */
+#ifndef SAVE_SIZE
+#define SAVE_SIZE   256
+#endif
 
-/* ── API ────────────────────────────────────────────────────────────
- *
- * All functions are no-ops when NGP_ENABLE_FLASH_SAVE=0.
- */
+/* Bytes the game owns, magic included. The last 8 belong to the journal. */
+#define NGPC_FLASH_TRAILER  8
+#define NGPC_FLASH_PAYLOAD  (SAVE_SIZE - NGPC_FLASH_TRAILER)
 
-/* Call once at startup before any other flash function. */
+/* Find the banks and the newest valid record. Call once, after ngpc_init(). */
 void ngpc_flash_init(void);
 
-/* Write SAVE_SIZE bytes to the next available flash slot.
- *
- * data : pointer to your save struct (first 4 bytes must be the magic).
- *
- * The function writes to the next empty slot without erasing first.
- * If all slots are full it erases the block via standalone AMD stub
- * then writes to slot 0. Erase is safe: it can happen at most once
- * per session, so the erase stub is never called twice.
- */
-void ngpc_flash_save(const void *data);
+/* 1 if the cartridge size is known and the image ends below both banks.
+ * When 0, every other call is a refusal. */
+u8 ngpc_flash_ready(void);
 
-/* Read SAVE_SIZE bytes from the last valid slot into buffer.
- * Does nothing if ngpc_flash_exists() returns 0.
- * data : receive buffer, must be >= SAVE_SIZE bytes. */
-void ngpc_flash_load(void *data);
+/* Raw BIOS cartridge size code (0x6C58): 0 none, 1 = 4M, 2 = 8M, 3 = 16M. */
+u8 ngpc_flash_cart_size(void);
 
-/* Return 1 if at least one slot with a valid magic exists, 0 otherwise.
- * Call at startup to decide whether to load or initialise defaults. */
+/* 1 if a valid record was found (or written this session). */
 u8 ngpc_flash_exists(void);
 
-/* Debug: read back the slot written by the last ngpc_flash_save() call
- * and count bytes that differ from data.
- * Returns 0  = flash matches exactly (write successful).
- * Returns >0 = that many bytes are wrong (write failed or incomplete).
- * Returns 0xFFFF if ngpc_flash_save() has not been called yet.
- * Only meaningful with NGP_ENABLE_FLASH_SAVE=1 and NGP_ENABLE_DEBUG=1. */
+/* Copy the current record (SAVE_SIZE bytes, journal included) into data. */
+void ngpc_flash_load(void *data);
+
+/* MIGRATION from the pre-2026-10 append-only driver (block 33, no journal).
+ * Copies into data the newest old-format record of bank A (magic CA FE 20 26,
+ * not a journal record) and returns 1; 0 if there is none. Only meaningful
+ * when ngpc_flash_exists() is 0. The old format has NO integrity check of its
+ * own: validate the copy with YOUR checksum before using it. The old slots are
+ * never erased while no journal record exists, and the next save goes after
+ * them. Typical use:
+ *     if (ngpc_flash_exists()) ngpc_flash_load(&s);
+ *     else if (!ngpc_flash_load_legacy(&s) || !my_save_valid(&s)) defaults();
+ * Keep your checksum away from the last NGPC_FLASH_TRAILER bytes (the
+ * journal); old records had them in the padding. */
+u8 ngpc_flash_load_legacy(void *data);
+
+/* Write a new record. data must be SAVE_SIZE bytes in RAM and start with the
+ * magic; its last NGPC_FLASH_TRAILER bytes are overwritten by the journal.
+ * Returns 1 only once the slot reads back identical to data. Returns 0 on
+ * refusal (not ready, bad magic, erase failed) or failed readback; the
+ * previous record stays current and the call can be retried. */
+u8 ngpc_flash_save(void *data);
+
+/* Bytes that differ between the slot of the last save attempt and data.
+ * 0 = identical, 0xFFFF = no attempt this session (or refused). */
 u16 ngpc_flash_verify(const void *data);
+
+/* Slots used in the bank holding the current record (0..8192/SAVE_SIZE).
+ * Occupancy, not a capacity limit: a full bank rolls over. */
+u8 ngpc_flash_slots_used(void);
+
+/* DESTRUCTIVE: erase both banks. For an explicit "erase save" screen only.
+ * A "new game" should rather save a fresh record. Returns 1 if both banks
+ * read back blank. */
+u8 ngpc_flash_erase(void);
 
 #endif /* NGPC_FLASH_H */
