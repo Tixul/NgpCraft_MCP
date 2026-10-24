@@ -6,7 +6,7 @@ export const definition = {
     "RUN the game on the native C++ core and report what happened: advance N frames with buttons held, then return the CPU registers, stop status, an optional memory read, and an optional screenshot drawn line-by-line as the beam passed. " +
     "This is the only tool that EXECUTES the machine — every other ngpc_emu_* tool inspects a static image. " +
     "Its headline use is a bug a person can reproduce but not describe: they save a state in NgpCraft Emulator (F2) one frame before the problem, hand over the .s0, and this replays it — `state_path` + `hold` + `frames` answers 'what happens if I press A here?' in one call. " +
-    "Needs the compiled core (vendor/emulator/cpp/build/) and, for most commercial games, a real bios.bin the user supplies. Backed by ngpc_native.py `run`. " +
+    "Needs the compiled core (vendor/emulator/cpp/build/). A real bios.bin is optional: without one the clean-room HLE image runs (71/73 of the commercial corpus, and homebrew). Backed by ngpc_native.py `run`. " +
     "Runs with the SILICON-CALIBRATED cartridge wait-states on (fetch = 3 cycles/byte), so it is timed like hardware rather than the ~3x-too-fast free-fetch default of the raw core; the answer says which model ran, in `timing`. " +
     "Every run also returns `hw_safety`: a starved watchdog or a stack that wandered into the BIOS page — two faults a real console punishes and most emulators never mention. And `hygiene` (not from a save state): user-RAM globals the ROM READ before ever writing them -- 0 here, garbage on a console, the classic 'works in the emulator, frozen on hardware'; named from the .map beside the ROM.",
   inputSchema: {
@@ -20,7 +20,7 @@ export const definition = {
       bios_path: {
         type: "string",
         description:
-          "Absolute path to a real bios.bin. Strongly recommended: without it the interrupt vector table is empty, so the first IRQ sends the PC to address 0 and the game dies while the screen still LOOKS plausible. A few games (Metal Slug 2nd Mission) also check that the console booted through its BIOS.",
+          "Absolute path to a real bios.bin. Without it the clean-room HLE image (hle_bios/bios_hle.bin) is used: homebrew and most commercial games run on it. A few games (Metal Slug 2nd Mission) also check that the console booted through its BIOS.",
       },
       state_path: {
         type: "string",
