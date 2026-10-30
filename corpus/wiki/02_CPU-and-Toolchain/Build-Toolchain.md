@@ -10,14 +10,21 @@ Build commands, cc900 compiler rules (C89 compliance, NGP_FAR, volatile, ISR, in
 cc900 is Toshiba's C compiler for the TLCS-900/H CPU. It is **strict C89** with
 proprietary extensions. The following restrictions apply.
 
-### 1.1 No `//` Comments
+### 1.1 `//` Comments: Accepted, but Prefer `/* */`
 
 ```c
-/* CORRECT */
+/* PREFERRED — portable C89 */
 x = 1; /* initialize x */
 
-// FORBIDDEN — cc900 rejects C++ comments
+// ACCEPTED by cc900 (Package Version 1.10, -O3 -Nb2), but not ISO C89
 ```
+
+Measured: a file using `//` comments compiles without error or warning. Use `/* */`
+anyway so the code stays valid for any strict C89 tool (linters, other compilers).
+
+The block-start rule (§1.2) applies to **every** block, including nested ones:
+`if (c) { int x = 5; ... }` is accepted, because `x` is declared at the start of
+its own block.
 
 ### 1.2 Declarations at Block Start Only
 
@@ -478,6 +485,33 @@ Fixes, by increasing locality:
 index; a `div` whose destination is one size wider than a small divisor, with a dividend that
 can be large, is the pattern. (`ngpc_bug_check` query: `modulo`.)
 
+### 8.1g A folded constant above 255 is truncated when it meets a `u8`
+
+```c
+u8 i;
+tab[10u * 32u + i] = 1;     /* WRONG: index computed as (u8)(64 + i) */
+tab[(u16)320u + i] = 1;     /* right */
+g = 248u + i * 8u;          /* WRONG: the whole sum stays on 8 bits */
+g = (u16)248u + (u16)i * 8u;   /* right */
+```
+
+`cc900 -S -O3` on that fragment:
+
+```
+    ld   A,0x40      ; 64 / 320   <- the folded constant, already truncated
+    add  A,C         ; 8-bit add with the u8 index
+    extz WA          ; widened too late
+```
+
+The same constant alone (`g = 10u * 32u;`) compiles to 320. The truncation only happens when the
+folded value is combined with an 8-bit operand — even though the constant is the **first** operand.
+So the "cast the first operand" rule of §8.1b has to be read literally: a literal above 255 does not
+widen the expression by itself, an explicit `(u16)` does.
+
+Met twice in one project: a map-row address (row 10 of a 32-wide map landed on row 2) and a 260-byte
+offset. **Rule:** write `(u16)` on any constant term that can exceed 255 in an expression that also
+contains a `u8`, or precompute the constant into a `u16` variable.
+
 ### 8.2 Linker Order: Sprites After Maps -> Wrong Bank
 
 **Symptom:** sprites are invisible (only 1 visible out of N), corrupted display for
@@ -732,7 +766,7 @@ opening for write: `open(p, "w")` truncates first, so an encoding error leaves a
 
 | Item | Value / Rule |
 |------|-------------|
-| Comments | `/* */` only — no `//` |
+| Comments | `/* */` preferred — `//` is accepted by cc900 but is not C89 (§1.1) |
 | Declarations | Block start only — no declaration after a statement |
 | Loop variable | Declare before `for` — no `for (u8 i = ...)` |
 | No 64-bit | No `long long`, no `double`, no `float` |

@@ -330,6 +330,28 @@ river crossing game (the middle bank; only the player crosses it, in pinned slot
 above a HUD, a versus split. Bullets that cross the whole screen do not fit: they need a
 64-sprite fallback (flicker) or tiles.
 
+### 3.8 Budgeting 64 sprites in a sprite-heavy game — field checklist
+
+In one port with many multi-piece actors (bosses of up to ~40 pieces of 8×8), "the 64 sprites are
+full" turned out to be the project's own waste. What helped, roughly in order of gain:
+
+- **Do not post pieces outside the view.** Test each 8×8 piece against the window before writing it;
+  an actor that is off-screen then costs nothing.
+- **Cut each image at the grid offset that gives the fewest pieces.** A 16×16 explosion cut from its
+  top-left corner gave 4 pieces; at its best (dx, dy) in 0..7 it gave 1. Trying all 64 offsets at
+  export time is cheap; store the offset with the image.
+- **Move what does not move into a plane.** The status bar's icons kept their first colour layer in
+  the second scroll plane (3 colours per tile); only the extra colours stayed in sprites: 8-19 → 4-8
+  sprites.
+- **Fixed ranges per kind of object** (player first, at its real size; then objects; then actors;
+  the bar's icons at the top end). A dump of the sprite table classified by tile range then shows
+  who consumes.
+- **Post through a macro, not a function**: one C call per piece cost ~280 cycles there (see
+  [Measuring Performance](../05_Systems/Measuring-Performance.md) §4.9).
+
+Result: worst measured scene 58 / 64, off-screen enemy indicators included
+([Gameplay Patterns](../06_Pipeline-and-Patterns/Gameplay-Patterns.md), "Off-screen enemy indicators").
+
 ## 4. Performance Checklist
 
 - **Shadow OAM:** build the full OAM state in RAM during main loop,

@@ -580,6 +580,28 @@ plain tilemap. Two opaque colours avoid any interaction with the plane behind.
   the symbol broke it).
 * Saturate the time counter instead of letting it wrap, and refuse to export a saturated time.
 
+### 5.10 Off-screen enemy indicators
+
+A game designed for a screen that showed the whole play area loses information on a smaller window.
+A small pointer on the edge of the view for each enemy that is entirely outside it may give it back:
+
+- **3 tiles and the flips give 8 directions**: one pointing right (tip on the right edge, centred
+  vertically), one pointing down, one into the bottom-right corner; H/V flips give the others. A tip
+  about 4 × 7 pixels inside the 8×8 cell, light with a dark outline, reads on light and dark floors.
+- **Position**: clamp the enemy's centre to the view; the pointer slides along the edge as the enemy
+  moves, and uses the corner tile when it is outside on both axes.
+- **Which enemies**: those that move or watch (guards, cameras…); not bosses, projectiles or
+  invisible actors. Disable them in modes with their own view (binoculars, maps).
+- **Cost**: note "no piece visible" inside the existing draw loop (compare the piece counter before
+  and after an actor), store the actor's index, and compute pointers only for those — usually 0 to 3.
+  A first version that re-tested every actor (type test, image lookup, signed 16-bit maths) made a
+  scene at its budget edge lose ~2.5× more frames than the final one (see [Measuring Performance](../05_Systems/Measuring-Performance.md) §2.9).
+- **Sprite budget**: post them last, only in the slots left — never instead of a game sprite. An
+  off-screen actor posts no pieces, so its pointer uses a slot it freed.
+- ⛔ Compute the centre in **signed** arithmetic: the image of a flying actor whose top is far above
+  its anchor went "below zero" in unsigned maths, and the pointer pointed the wrong way.
+- A run-time flag to switch them off is useful for benches, and possibly as a menu option.
+
 ## 6. Entity Management Patterns
 
 Cross-genre techniques for managing pools of game objects (enemies, bullets,

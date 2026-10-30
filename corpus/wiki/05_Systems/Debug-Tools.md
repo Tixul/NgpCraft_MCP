@@ -154,6 +154,31 @@ kill a console and **all three pass silently on an emulator whose flash has no b
 window**, which is most of them. A clean run here is a claim about your save path that a
 screenshot cannot make.
 
+## 6. Verifying a port against the original
+
+When a game is ported from another machine, an emulator of the original is the best oracle. Practices
+that held up over a complete port:
+
+- **One record per game update, taken by a breakpoint at the end of the update loop** — not by
+  sampling at a fixed interval: when the original chains updates back-to-back, sampling skips some.
+- **Compare update by update**, not frame by frame: the two machines may update at different rates.
+- **Inject the original's randomness.** If the original draws random numbers from a register (a Z80
+  `ld a,r`, for instance), log the value at each draw with a breakpoint and replay the list in the
+  port's bench build. If that code sits in a banked area, filter by context: the same address is
+  another routine in another bank.
+- **Choose the reference machine at the right refresh rate.** An emulated 50 Hz machine is fine for
+  update-by-update comparisons but wrong for any duration in seconds if the original is a 60 Hz game:
+  one port had timed a game-over screen and a door animation on the 50 Hz machine.
+- **Force state between two updates**, not at an arbitrary time (a breakpoint at the end of an
+  update), otherwise results shift by ±1 update at random.
+- **A bench that reports "identical" may be empty**: check that what is compared actually happened
+  (bullets spawned inside a wall compare equal because nothing exists).
+- **Benches compare state, not the picture**: capture the screen after each change too — an export
+  offset bug went unseen by fully identical benches.
+- **A one-update difference**: log both update counters per update before touching the code; the
+  bench may be the one out of step.
+- Keep the original's oddities when they influence play, mark them in the code and list them.
+
 ---
 
 ## Quick Reference

@@ -445,6 +445,14 @@ Sfx_Play(SFX_EXPLODE);  /* noise SFX */
 - When SFX ends: channel is silenced, BGM restore is triggered.
 - If multiple SFX requests on same channel: current SFX wins (new one dropped).
 
+### 5.4 Field report: an SFX request is not free under load
+
+Depending on the driver, requesting a sound effect may write to the Z80 at once and wait for it to
+acknowledge (and each access to the shared RAM briefly suspends the Z80). In one project with
+continuous automatic fire, the effect requests alone were enough to make a scene that was already at
+its budget edge miss a few frames. If a scene requests many effects per second, measure it; possible
+answers are at most one request per update and channel, or a queue flushed during VBlank.
+
 ---
 
 ## 6. BGM / SFX Coexistence

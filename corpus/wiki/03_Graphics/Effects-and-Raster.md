@@ -611,6 +611,66 @@ Two gotchas that cost real debug time:
   be ignored by NeoPop (works on hardware, breaks in the emulator). Driving the arm from
   the main loop after `ngpc_vsync()` works on both.
 
+### 6.7 Field report: a late frame shows the split values on the whole screen
+
+One project with a status-bar split (one Timer0 IRQ on the bar's first line, as in §6.6) showed on
+hardware, in its heaviest scenes only, a picture that looked "doubled": for one frame the whole
+playfield was drawn shifted, with the sprites displaced.
+
+**Cause.** The split ISR leaves the bar's values in the registers (scroll of both planes; in that
+project also the global sprite offset and the background colour). Only the main loop put the
+playfield values back, right after its VBlank wait. When an update overran a frame, the loop missed
+that VBlank, nothing restored the registers, and the next frame was drawn entirely with the bar's
+settings. The §6.6 recipe has the same exposure whenever an update can last longer than one frame.
+
+**Fix** — measured with an emulator that draws line by line: 424 wrong frames out of ~4 000 in the
+heaviest scene, 0 after:
+
+- restore every register the split changes **from the VBlank interrupt itself**, with the values of
+  the last *completed* frame. The template's hook (`ngpc_set_vblank_hook()`) runs inside the system
+  VBlank ISR: this is not the "custom VBlank vector" warned against in §6.6;
+- re-arm Timer0 there as well, so the split stays on its line even after a late frame;
+- a missed frame then repeats the previous picture (a stutter) instead of showing a wrong one.
+
+```c
+static volatile u8 s_view_x, s_view_y;   /* playfield scroll of the last completed frame */
+
+void hud_set_view(u8 x, u8 y)            /* call it where the main loop latches the scroll */
+{
+    s_view_x = x;
+    s_view_y = y;
+}
+
+static void hud_vblank_hook(void)        /* runs inside the system VBlank ISR */
+{
+    HW_SCR1_OFS_X = s_view_x;  HW_SCR1_OFS_Y = s_view_y;
+    HW_SCR2_OFS_X = s_view_x;  HW_SCR2_OFS_Y = s_view_y;
+    HW_SPR_OFS_Y = 0;                    /* only if the split moves the sprites */
+    HW_BG_CTL = 0x80u;                   /* only if the split changes the background colour */
+    HW_TRUN &= (u8)~0x01u;
+    HW_TREG0 = SPLIT_TREG0;              /* armed during VBlank: counts from line 0 */
+    HW_TRUN |= 0x01u;
+}
+
+/* init, after installing the split ISR */
+ngpc_set_vblank_hook(hud_vblank_hook);
+```
+
+Two more registers such a split may change, if the bar needs them:
+
+- **Background colour** — `BG_CTL` (`0x8118`): bits 7-6 = `10` enable it, the low bits select the
+  background colour entry. A playfield colour above the bar and black under it is one write in the
+  ISR and one in the hook.
+- **Global sprite offset** — `SPR_OFS_Y` (`0x8021`): shifting every sprite under the bar lets icons
+  placed at Y values that are normally off-screen appear inside the bar, while playfield sprites
+  that reach the bar line are cut there.
+
+**How to see it.** Benches that compare game state do not. Read the display registers per line
+(an emulator raster log) and flag every frame whose first lines carry the bar's values.
+
+In that project the ISR wrote six registers; whether that always fits the HBlank window on hardware
+(see the "≤ 2 register writes" gotcha in §6.6) was not specifically checked.
+
 ---
 
 ## 7. Window Animation (Optional)

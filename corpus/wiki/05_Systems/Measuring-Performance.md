@@ -141,6 +141,27 @@ this exposed a broken measurement rather than a neutral change:
 errors.** On a RAM overflow the linker aborts, the *old* ROM stays on disk, and the
 measurement cheerfully reports "+0.0 %".
 
+### 2.9 Compare on the SAME binary: switch the change at run time
+
+Code runs from the cartridge with its wait states, so adding code moves everything linked after it.
+On a scene that already sits at the edge of its budget, two builds of nearly the same source may
+differ by a few missed frames for reasons unrelated to the change. To attribute a difference:
+
+- put the change behind a global flag (`u8 g_feature = 1;`, initialised data), let the bench write
+  0 into it, and compare two runs of the **same ROM**;
+- if a small addition makes the count jump (one project: 5 → 20 missed frames out of 425 updates for
+  a few hundred cycles per update), compare the *distribution* of end-of-update lines, not only the
+  count. An unchanged average with many more misses means the scene has many updates within ~1 % of
+  the limit: the scene's budget is the problem, any addition will flip them.
+
+### 2.10 Count missed frames per update, over the whole scene
+
+- Count with a counter incremented by the VBlank wait when it arrives too late, read it at **each
+  update**, and exclude boot, loads and screens with the display off. A raw total read at the end
+  mixes all of these, and an 8-bit counter wraps.
+- Measure the **whole** duration of the scene. One scene measured ~3 % missed frames over 150 updates
+  and ~60 % over 30 seconds, once its reinforcements had arrived.
+
 ---
 
 ## 3. Writing emulator probes
@@ -472,6 +493,17 @@ A build that says nothing proves nothing (see [Build Toolchain](../02_CPU-and-To
 header changes are not tracked). Search the ROM for a string you just added (must be there)
 and one you just removed (must not be). A dead string still present = stale ROM, and every
 measurement taken on it goes in the bin.
+
+### 5.4 The stack grows down toward the initialised data — read the map's last RAM gap
+
+With cc900's sections the RAM holds the zeroed data (`f_area`), then the initialised data (`f_data`,
+copied at boot), then free space, then the stack growing down from its top. The `.map` file shows
+that free space as a `*** Gap ***` line after the last RAM section: it is all the room the stack has.
+Re-read it after every change that adds static or initialised variables.
+
+Field report: in one project the margin silently fell to ~170 bytes; the first symptom was not a
+crash but an initialised variable overwritten deep in a scene (a wrong room loaded during an intro).
+Combine with §5.2 (witness bytes) to know the real depth.
 
 ## 6. Hardware traps the emulator cannot show
 
