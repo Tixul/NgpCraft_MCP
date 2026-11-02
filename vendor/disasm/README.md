@@ -16,7 +16,7 @@ Implements the full TLCS-900/L1 instruction set from the official Toshiba TMP95C
 - **NGPC hardware register annotations** — joypad, VBlank vector, watchdog, K2GE, sprite VRAM, scroll planes, tile RAM
 - **BIOS SWI names** — `swi 1` → `BIOS_CLOCKGEARSET`, `swi 5` → `BIOS_SYSFONTSET`, etc.
 - **DMA LDC register names** — `DMAC0`, `DMAS0`, `DMAD0`, `DMAM1`…
-- **Broken opcode detection** — `D0` prefix, `CB` family (`add A, C` and friends), `LINK XIY, N≥5`, and `adc W, B` (silent wrong result when W>0) all flagged `; !BROKEN <reason — fix>` inline. The CB and `adc W, B` flags were wired up in 2026-04 to match the README's claims.
+- **Broken opcode detection** — `CB` byte-ALU sub-ops (`add A, C` and friends — but **not** the byte mul/div sub-ops `CB 0x40..0x5F`, e.g. `CB 51` = `div A, C`, which are HW-cleared per `hw_test_bytediv` 2026-07-08), `LINK XIY, N≥5`, and `adc W, B` (silent wrong result when W>0) all flagged `; !BROKEN <reason — fix>` inline. The CB and `adc W, B` flags were wired up in 2026-04 to match the README's claims. (`D0..D7` is **not** flagged: it is the word memory-addressing family plus the `D7` extended-register escape, decoded normally since 2026-11-03 — e.g. `D2 AF 4D 00 61` = `incw 1, (0x004DAF)`. The word register-direct prefix is `D8..DF`.)
 - **Two-pass label resolution** — `entry_point:`, `sub_2XXXXX:` (call targets), `loc_2XXXXX:` (jump targets) with `; -> sub_XXXXXX` cross-references on every call/jump
 - **Auto ROM header parsing** — detects title, entry point, color/mono, software ID from the 64-byte SNK header
 
@@ -102,31 +102,6 @@ All addresses accept hex with or without the `0x` prefix (`0x200040` or
 `200040`). Bad input is rejected up-front with a clear stderr message and
 a non-zero exit code: missing ROM (`1`), permission denied (`1`), bad hex
 (`2`), `--start` greater than `--end` (`2`). Successful runs exit `0`.
-
----
-
-## Companion Analysis Tools
-
-The repository also ships lightweight analysis helpers built on top of
-`decode_one()`:
-
-| Tool | Purpose |
-|------|---------|
-| `ngpc_rom_identity.py` | Quick markdown identity card for a ROM: header, function stats, opcode mix, hardware region usage, toolchain hints |
-| `ngpc_search_hw.py` | Find functions that touch a named hardware region (`oam`, `palette`, `scroll`, `z80_ram`, ...) |
-| `ngpc_call_graph.py` | Build a small callers/callees graph around a function entry point |
-| `ngpc_analysis.py` | Shared helper module used by the scripts above |
-
-Examples:
-
-```bash
-python ngpc_rom_identity.py game.ngc
-python ngpc_search_hw.py game.ngc --region oam
-python ngpc_call_graph.py game.ngc 0x200CFD --mode both --depth 2
-```
-
-These tools stay separate from `ngpc_disasm.py` so the core disassembler
-remains single-file and zero-dependency.
 
 ---
 

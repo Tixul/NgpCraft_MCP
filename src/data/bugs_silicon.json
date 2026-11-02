@@ -47,7 +47,7 @@
     "D1..D7 standalone are SAFE (CC900 uses them in production) — because they are WORD MEMORY forms, not register-direct.",
     "HW-confirmed 2026-07-03: the whole D0..D7 range is the WORD MEMORY family; there is no word register-direct form there. Word reg-direct = D8..DF, long reg-direct = E8..EF.",
     "The historic 'D0..D7 silicon-broken' label was a mis-decode/mis-emission, not a silicon defect. Fixes remain valid: never emit D0 for a word register op — use D8 (word) or E8 (long).",
-    "Disassembler re-decode of the D0..D7 memory family is in progress; the emitted `!BROKEN D0..D7` warnings reflect the current (pre-re-decode) state."
+    "Since 2026-11-03 the disassembler decodes D0..D5 as word memory forms like the emulator does (`D2 AF 4D 00 61` = `incw 1,(0x004DAF)`); no `!BROKEN D0..D7` warning is emitted any more."
    ],
    "validated_on_hw": true,
    "validation_ref": "hello_j7, j10, j11 (2026-03-22 → 2026-03-24); reclassified as mis-decode 2026-07-03"

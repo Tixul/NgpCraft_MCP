@@ -1,5 +1,40 @@
 # Changelog — ngpc_disasm
 
+## 2026-11-03
+
+### Fixed
+
+- **`D0..D5` decode as the word memory family.** The legacy "broken D0..D7
+  word-register ALU prefix" handler and the `D1` fallback caught these bytes
+  before the general memory decoder, printed `!BROKEN` and consumed the wrong
+  length, which desynced everything after them. They now go through the same
+  path as `C0..C5` / `E0..E5`: `D2 AF 4D 00 61` = `incw 1,(0x004DAF)`,
+  `D1 16 42 3F 02 00` = `cpw (0x4216),0x0002`, `D1 66 40 64` = `incw 4,(0x4066)`.
+  On SNK vs. Capcom MotM the `!BROKEN` count drops from 32 231 to 227.
+  Reported by an outside user reversing the NGPC↔Dreamcast link library.
+- **`0x58..0x5F` = `pop XWA..XSP`, `0x50..0x57` undefined.** The two rows were
+  swapped: every SNK epilogue (`5D 5C 0E` = `pop XIY / pop XIX / ret`) showed as
+  unknown bytes. Checked against asl and asm900 (`pop XWA` = `58`).
+- **Size suffix** on memory operations with no register operand: `inc`/`dec`,
+  `push`, shifts, ALU `(mem),#`, `ld (nn),(mem)`, block ops. `C1 66 40 61` =
+  `inc 1,(0x4066)`, `D1 66 40 61` = `incw 1,(0x4066)`. None of them has a long
+  form: asm900 refuses `incl`/`pushl`/`srll`/`addl (mem),#`, so `E0..E5` + those
+  sub-ops now decode as `db` (asl accepts them; asm900 is the reference).
+- **Indexed modes `(r32+r8)` / `(r32+r16)`.** The index register is an extended
+  register code, not a 3-bit index: `C3 03 EC E0` is `(XHL+A)`, was `(XHL+W)`.
+  Only mode bytes `03` / `07` are accepted; other `xxxxxx11` bytes are data.
+- **Block ops** decode only on register-indirect modes, with their real pointer
+  pair: `85 10` = `ldi (XIX+),(XIY+)`, `95 11` = `ldirw (XIX+),(XIY+)` (was
+  printed with `XDE`/`XHL`). `84 10` (legacy t900as LDIW) is kept but flagged
+  as non-standard.
+- Merged with the standalone repo (D0..D7 / CB / D8 comments, header colour
+  flag read at `0x23`): both copies are identical again, docs included.
+
+Verification: the emulator's asm900 table (`tests/data/asm900_source_memory_group.tsv`,
+930 encodings from the official assembler) now decodes 930/930 (was 500/930);
+every distinct instruction form in MotM, KoF R-2 and Bikkuriman 2000
+re-assembled with asl and decoded back.
+
 ## 2026-09-28
 
 ### Fixed
