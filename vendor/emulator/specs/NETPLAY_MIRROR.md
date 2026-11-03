@@ -281,10 +281,33 @@ transfer becomes a refusal now instead of a desync twenty seconds into the match
 
 A mismatch does not fail loudly by itself — it drifts, mid match, with no error
 anywhere. `Handshake.check` compares protocol version, BIOS hash, **core build
-fingerprint** (`native.core_fingerprint()` — the ABI number does not move for a timing
-fix, so the DLL's own bytes answer "same core?") plus the wait-state flag. Those are
-the things that decide how the code RUNS, and a mismatch in them cannot be worked
-around.
+fingerprint** (`native.core_fingerprint()`) plus the wait-state flag. Those are the
+things that decide how the code RUNS, and a mismatch in them cannot be worked around.
+
+**The core fingerprint is a behaviour probe (2026-10-21), not a file hash.** It used to
+be the SHA-1 of the DLL, which refused the same source across every pair of compilers
+(MSVC release, MinGW local, GCC Linux, clang Android). Now: 8 fixed-seed cartridges of
+random bytes run under the silicon timing model (an invalid opcode is stepped over,
+deterministically), the Z80 released on 4 KiB of its own random code, and the CPU
+registers + aux state + 48 KiB work image hashed at the end (~0.18 s, cached per
+process). The picture and the audio output are NOT hashed: they never feed back into
+the machine. Measured: MinGW, the MSVC v3.9.1 release and GCC 15 on Linux give the same
+`19:p71ed3b6b04c86e97`; one-line sabotages (32-bit parity, a NOP one state dearer, a Z80
+NOP one T-state dearer) each give a different one — and the Z80 one did NOT before the
+probe released the sound CPU. A Windows ↔ Linux match then played 1799 frames, no
+desync. `native.core_file_hash()` keeps the file hash, for the log only.
+
+**Refusals reach the other side.** Each side checks the other's hello, so most refusals
+are seen on both screens; an asymmetric one (a damaged transfer, a session-level
+reject) used to be lost: the refuser sent `_T_BYE` and closed with unread data, a TCP
+RESET, and Windows discards what the receiver had not read yet — the BYE included
+(measured, `tests/test_net_diagnostics.py`). `SocketPipe.close` now sends what is left,
+`shutdown(SHUT_WR)`, drains for up to 2 s on a thread, then closes. Mode mismatches are
+named: before any hello, an unreadable record or 20 s of silence is a CABLE-mode peer
+(`not_mirror` / `no_hello`), and the cable side recognises a mirror hello
+(`peer_mirror_mode`). `netplay.explain()` turns every code into a sentence; each step
+is logged to `logs/netplay.log` (`core/netlog.py`). The hello now also announces `os`
+(ignored by older builds), so a version refusal can name both systems.
 
 Two kinds of field are **announced rather than compared**, because they describe what
 each side IS and can simply be copied: the **cartridge** hash (the images are traded,
@@ -355,18 +378,39 @@ hands the pipe straight to the session passes `close=False`.
 
 ## 8. Limits, stated plainly
 
-Same BIOS and same build on both sides (the cartridges may differ, each player's save
-rides along inside their image, and the per-player console settings of §4.2b are copied
-rather than required to match) · **the same build means the same EXECUTABLE, and the
-fingerprint cannot check that**: `core_fingerprint()` hashes the native core, so two
-builds whose Python differs but whose DLL does not accept each other and then fail
-anyway. Compare the .exe's date, not a number in a dialog · the session starts
+Same BIOS and same release on both sides — any system (the cartridges may differ, each
+player's save rides along inside their image, and the per-player console settings of
+§4.2b are copied rather than required to match) · builds up to 3.9.1 sent the DLL hash
+and cannot play a mirror match with later ones · two builds whose PYTHON differs in how
+it drives the pair but whose core computes alike would still accept each other: the
+schedule is covered by `+ilv<slice>`, nothing else is · the session starts
 from power-on, nobody joins a match in progress · an input that has not arrived stalls
 BOTH sides for that frame (this is what a rollback layer would remove) · the local
 2-player mode gains nothing, it is already at full speed · the **console schedule is in
-the handshake fingerprint** (`+ilv<slice>`), because `core_fingerprint()` hashes the DLL
-and would not move for a change to how Python steps the pair · the lobby's `mode` field
+the handshake fingerprint** (`+ilv<slice>`), because `core_fingerprint()` probes the
+core alone and would not move for a change to how Python steps the pair · PC ↔ Android
+mirror is still not bridged (its own fingerprint and a different cartridge payload) ·
+the lobby's `mode` field
 needs the **server redeployed**; without it every room reads as a cable room.
+
+## 8b. Reset must equal fresh (2026-10-21)
+
+The mirror RESETS each player's own console when the match opens and BUILDS the other
+player's copy fresh, so `ngpc_reset` must leave nothing of what ran before. It left
+TO3's flip-flop parity (`to3_half_periods`, the sound CPU's interrupt clock) and
+`z80_int_ack`: a host that had played ~9 s desynced ~15 s into the match. Fixed in the
+core; `tests/test_reset_is_clean.py` forces every aux field and checks the reset. Found
+by the link-test robot (`ngpc_robot.py`), which plays the real shell against itself.
+
+## 8c. The router rule lives as long as the session (2026-10-22)
+
+The host opens its port by UPnP while it waits (core/upnp.py). It used to delete the TCP
+rule as soon as the peer connected; on some routers that drops the live NAT session, and
+after the hellos nothing got through: `[WinError 10054]` on both PCs ~20 s later, mid
+cartridge trade. Measured three times between this PC and a GitHub Windows machine with
+the link-test robots, then a full 90-second match once the rule was kept. The whole
+rule is now handed to the shell and released when the mirror session (or the cable)
+ends.
 
 ## 9. Validation
 

@@ -816,23 +816,101 @@ def active_timing_model() -> str:
         "NGPCRAFT_TIMING", "").strip().lower() == "legacy" else "silicon"
 
 
+def core_file_hash(path: Path | None = None) -> str:
+    """The core FILE's own bytes -- which build this is, for a log. Not an identity:
+    two compilers (MSVC on the release, MinGW here, GCC on Linux) never agree on it."""
+    import hashlib
+    try:
+        return hashlib.sha1(Path(path or _DEFAULT_DLL).read_bytes()).hexdigest()[:16]
+    except OSError:
+        return "unknown"
+
+
+# The behaviour probe (see core_fingerprint). Changing ANY of these changes every
+# fingerprint, i.e. refuses every older build: do it on purpose or not at all.
+PROBE_SEEDS = 8
+PROBE_ROM_BYTES = 0x20000
+PROBE_BUDGET = 60_000           # instructions per seed
+PROBE_MAX_FRAMES = 120
+_probe_cache: dict = {}
+
+
+def _probe_rom(seed: int) -> bytes:
+    import random
+    rom = bytearray(random.Random(seed).randbytes(PROBE_ROM_BYTES))
+    rom[0:28] = b" LICENSED BY SNK CORPORATION"
+    rom[0x1C:0x20] = (0x200040).to_bytes(4, "little")
+    rom[0x23] = 0x10
+    return bytes(rom)
+
+
 def core_fingerprint(path: Path | None = None) -> str:
-    """Identify THIS BUILD of the core, for anything that compares two of them.
+    """WHAT THE CORE COMPUTES, for anything that must agree with another copy of it.
 
     Mirror netplay (core/netplay.py) simulates the same two consoles on two PCs and
-    relies on them agreeing bit for bit, so a core built with different timing at the
-    other end is a desync waiting to happen -- and one that shows up mid-match as
-    drift, not as an error. The ABI number does not move for a timing fix, so the
-    file's own bytes are what answers "is that the same core as mine".
+    relies on them agreeing bit for bit, so a core that computes differently at the
+    other end is a desync waiting to happen -- one that shows up mid-match as drift,
+    not as an error.
+
+    ⛔ THIS USED TO HASH THE DLL FILE, which answered a narrower question: "same
+    compiler, same flags, same OS?". The release is built by MSVC, a local build by
+    MinGW, Linux by GCC, Android by clang -- so the SAME source refused itself across
+    every pair of systems, and a player saw `[WinError 10054]` (2026-10-21). The bench
+    had already measured that it did not need to: a Windows MinGW core against a Linux
+    GCC one played 3599 frames with 0 desync.
+
+    So the core is asked to DO something, and the answer is compared. Eight fixed-seed
+    cartridges of random bytes are run under the silicon timing model; an invalid
+    opcode is stepped over (as deterministic as anything else), so the CPU walks
+    hundreds of thousands of instructions through every family, the I/O page, the
+    timers, DMA and the video chip; the sound CPU is released on random code of its
+    own (~1.2 million Z80 instructions). The CPU registers, the machine-state
+    block and the whole 48 KiB work image are hashed at the end of each. ~0.2 s, once
+    per process. Measured: the v3.9.1 release core (MSVC) and a MinGW build of the same
+    source give the SAME answer; three one-line sabotages -- 32-bit parity flipped, a
+    NOP one state dearer, a Z80 NOP one T-state dearer -- each give a different one
+    (tests/test_core_fingerprint.py).
+
+    The picture and the audio output are deliberately NOT hashed: neither feeds back
+    into the machine, and a renderer or mixer difference must not refuse a match.
     """
     import hashlib
-
-    dll = path or _DEFAULT_DLL
+    key = (str(path or _DEFAULT_DLL), active_timing_model())
+    if key in _probe_cache:
+        return _probe_cache[key]
+    h = hashlib.sha1()
     try:
-        digest = hashlib.sha1(Path(dll).read_bytes()).hexdigest()[:16]
-    except OSError:
-        digest = "unknown"
-    return f"{ABI_VERSION}:{digest}"
+        for seed in range(PROBE_SEEDS):
+            m = NativeMachine(_probe_rom(seed), dll=path)
+            try:
+                m.set_timing_silicon()
+                m.reset(bios_handoff=True)
+                # ...and the SOUND CPU, which a random cartridge almost never releases:
+                # 4 KiB of its own random code in shared RAM, then 0x55 to its run
+                # register. Without this a Z80 timing change went unnoticed (measured).
+                import random
+                m.write(0x7000, random.Random(1000 + seed).randbytes(0x1000))
+                m.write(0x00B9, b"U")
+                budget, frames = PROBE_BUDGET, 0
+                while budget > 0 and frames < PROBE_MAX_FRAMES:
+                    s = m.run_frames(1, max_instrs=min(budget, 50_000))
+                    budget -= max(1, s.executed)
+                    if s.stop_status in (STATUS_OK, STATUS_COUNT_REACHED, STATUS_HALTED):
+                        frames += 1
+                    else:                       # an opcode the CPU traps on: step past
+                        c = m.cpu()
+                        c.pc = (c.pc + 1) & 0xFFFFFF
+                        m.set_cpu(c)
+                h.update(bytes(m.cpu()))
+                h.update(bytes(m.aux_state()))
+                h.update(m.read(0, 0xC000))
+            finally:
+                m.close()
+        digest = "p" + h.hexdigest()[:16]
+    except Exception:  # noqa: BLE001 -- no answer is a different answer, never a crash
+        digest = "unprobed-" + core_file_hash(path)
+    _probe_cache[key] = f"{ABI_VERSION}:{digest}"
+    return _probe_cache[key]
 
 
 def _buf(data: bytes) -> "ctypes.Array[c_uint8]":

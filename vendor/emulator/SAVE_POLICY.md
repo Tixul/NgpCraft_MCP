@@ -295,3 +295,13 @@ elle echoue sur la cartouche.
 
 Quand cette politique evolue, **mettre a jour le master strategy
 index** plutot que de dupliquer l'info ici.
+
+## 11. Jeu patché à la volée (IPS/BPS, 2026-10-21)
+
+Un `Jeu.ips` / `Jeu.bps` posé à côté de la ROM est appliqué EN MÉMOIRE au chargement
+(`core/softpatch.py`, réglage `general/soft_patching`). ⛔ La sauvegarde « dans la ROM »
+écrirait alors l'image PATCHÉE par-dessus le dump propre : un jeu patché est donc traité
+comme une archive (`LoadedRom.read_only` → `from_archive`), et sa sauvegarde va dans le
+`.flash` séparé. Ce fichier ne contient que les blocs écrits par le jeu, donc la même
+sauvegarde suit le jeu patché ou non. Tests : `tests/test_softpatch.py`
+(`test_patched_session_never_writes_into_the_rom_file`).

@@ -98,20 +98,30 @@ void ngpc_qrandom_init(void);    /* shuffle pre-built table (call after rng_seed
 u8   ngpc_qrandom(void);         /* ultra-fast table read, returns 0..255 */
 ```
 
-`ngpc_random()` is a u32 LCG. It extracts bits 16-30 of the state → result
-should modulo down to `0..max`, but **on cc900 the `result % ((u32)max + 1)`
-step is broken** (u32 modulo runtime helper miscompiles). In practice the
-returned value stays in **0..32767** regardless of `max`.
-(The Toshiba manual documents that without `-A`, `u32 % u16` compiles to a narrow divide whose
-result is indeterminate when the quotient overflows — [Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md)
-§8.1f. Check the emitted asm before blaming a runtime helper.)
+`ngpc_random()` is a u32 LCG (bits 16-30 of the state, then `% ((u32)max + 1)`). It returns
+`0..max` **once the template's runtime bridge is fixed (2026-11-03)**.
 
-**Consequence — hardware confirmed:**
+**Root cause of the old failure — not the compiler, the template runtime.** cc900 calls its
+32-bit helpers (`C9H_mullu`, `C9H_divlu`, `C9H_remlu`) with the left operand in **XWA**, the
+right one in **XBC**, and expects the result in **XHL**; Toshiba's own helpers only touch
+XWA/XBC/XDE/XHL. The template's `src/core/ngpc_runtime_alias.asm` used to `jp` straight into the
+C versions of `ngpc_runtime.c`, which read their arguments from the **stack** (and may use
+XIX/XIY): every non-reduced u32 `*`, `/`, `%` computed on the return address. Proof: the
+official Toshiba build gave `0x12345678 * 155 = E1056A00` (right: `05B05AA8`). The fixed
+alias bridges each helper: save XIX/XIY, push XBC then XWA, `cal` the C helper, drop the
+8 bytes, restore.
+(Separate trap, still true: the Toshiba manual documents that without `-A`, `u32 % u16`
+compiles to a narrow divide whose result is indeterminate when the quotient overflows —
+[Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.1f. Check the emitted asm.)
+
+**Old symptoms, before the fix — hardware confirmed:**
 - `(u8)ngpc_random(6)` → value ≥ 5 in ~98% of calls (expected 2/7)
 - `(u8)ngpc_random(1)` → random 0..255 instead of 0..1
 - Any gameplay roll using `ngpc_random(max)` with small `max` will ignore `max`
 
-**Rule: never rely on `ngpc_random(max)` for a bounded gameplay value.**
+**Rule:** a project created **before 2026-11-03** still has the old alias — copy
+`src/core/ngpc_runtime_alias.asm` from the current template, or keep bounded rolls on
+`ngpc_qrandom()` as below.
 Use `ngpc_qrandom()` + u8 modulo instead — safe **because the dividend is a u8** (an 8-bit
 dividend cannot overflow an 8-bit quotient). ⛔ A **u16** dividend with a u8 divisor
 (`state16 % n`, the classic shuffle) is the narrow-divide trap: [Build Toolchain](../02_CPU-and-Toolchain/Build-Toolchain.md) §8.1f.

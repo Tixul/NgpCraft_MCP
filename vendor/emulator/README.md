@@ -38,6 +38,9 @@ Android sources are maintained separately; this repository contains its installa
   with a direction toggle), **favourites** ★ and a **never-played** filter. Play count,
   playtime and last-played are tracked per game. Covers are rendered from the game itself,
   or [pick your own](#your-own-cover-art) — one that updates never overwrite.
+- **Updates from inside the app** — *Settings ▸ General ▸ Check for updates*, plus a quiet
+  check at startup. On Windows and Linux one click downloads the new release, installs it
+  and restarts; see [Staying up to date](#staying-up-to-date).
 - **No BIOS needed** — the built-in clean-room HLE image runs the games, **and drives the
   saves, the link cable and the clock**. A real dump stays optional, for the boot animation,
   the console's setup screens, and certainty — see [Games & BIOS](#games--bios).
@@ -62,9 +65,26 @@ Android sources are maintained separately; this repository contains its installa
 - **In-game saves** — the game's own flash save, stored in the ROM, a separate file, or both.
 - **A console that remembers** — the coin cell keeps its BIOS settings *and* its clock, so
   the date is still right next time. The **RTC alarm** works too, and goes off on time.
+- **One window** — double-clicking a ROM while the emulator is already open plays it in
+  that window instead of starting a second emulator (asked first if a link match is on).
+  Start with `--new-instance` when you do want two.
 - **Speed control** — fast-forward (hold `Tab`) and 0.25×…4× (`[` / `]` or the toolbar).
+- **Run-ahead (optional, off by default)** — *Settings ▸ General ▸ Run-ahead*: shows the
+  picture the game will draw 1 or 2 frames from now, with the buttons you are holding,
+  which takes the delay built into the game itself off the screen. Measured on *Sonic*:
+  the screen answers a jump 6 frames after the press without it, 5 / 4 with 1 / 2 frames.
+  It is computed on a **separate hidden console**, so your game, its save, rewind, cheats,
+  recordings and the debugger never see a thrown-away frame. Off during link-cable and
+  online play, fast-forward and slow motion; paused for half a second while the game
+  saves; and it switches itself off for a game whose future it cannot predict exactly.
 - **Rewind** — hold `,` (or the ⏪ toolbar button) to run the game backward; release to
   resume. `.` steps one frame forward. Buffer length configurable (Off / 10 / 20 / 30 s).
+- **Video recording with sound** — the ⏺ button beside GIF records an **MP4** (640 × 608,
+  pixels kept sharp, the game's music and effects included) until you click it again, up
+  to ten minutes. It is recorded in game time, so fast-forward and slow motion still give
+  a real-speed video, and the sound stays on the picture. Needs
+  [ffmpeg](https://ffmpeg.org) on the `PATH`; without it, the sound alone is saved as a
+  `.wav`. Files go to the screenshot folder.
 - **Screenshots** (`F12`, folder configurable), **FPS overlay**, and a **player toolbar**
   that can auto-hide when the mouse goes still and reappear on the next move (optional).
 - **Controller support (beta, not yet hardware-tested)** — cross-platform game pads via
@@ -107,6 +127,13 @@ Android sources are maintained separately; this repository contains its installa
     *are* the text, shown decoded on both sides.
 
   Every result shows its ROM file offset (`address − 0x200000`).
+- **Patches applied on load (IPS / BPS)** — put `Game.ips` or `Game.bps` next to
+  `Game.ngc` (for a game inside an archive: next to the archive, named after the game)
+  and the fan translation or hack is applied in memory as the game loads. The ROM file is
+  never touched, and the game's save goes to the separate `.flash` file so the clean dump
+  stays clean. A `.bps` made for another dump is refused and the reason is shown; an
+  `.ips` carries no checksum, so the name of the patch in use is shown at every launch.
+  *Settings ▸ General* can turn it off.
 - **ROM analysis** — right-click a game to boot it, drive it, and report what is wrong
   with it. See [ROM analysis](#rom-analysis).
 - **Crash reports** — a ROM fault writes a detailed `crashes/*.txt` (reason, PC, opcode,
@@ -116,8 +143,8 @@ Android sources are maintained separately; this repository contains its installa
   starve. The core counts them while the ROM runs — it does not halt, because neither
   halts a real console either — and the analysis names the code that did it. See [the
   hardware-safety contract](specs/HARDWARE_SAFETY.md).
-- **Translated interface** — English, French, Japanese (日本語) and Portuguese,
-  switchable live, no restart. One JSON file per language in [`lang/`](lang), so adding one
+- **Translated interface** — English, French, Japanese (日本語), Portuguese (Portugal),
+  Simplified Chinese (简体中文) and Traditional Chinese (繁體中文), switchable live, no restart. One JSON file per language in [`lang/`](lang), so adding one
   is adding a file and needs no code: see [TRANSLATING.md](TRANSLATING.md). Contributions
   welcome — including corrections to a language already there.
 
@@ -146,8 +173,67 @@ test suite on all three and packages one archive per platform. PyInstaller canno
 cross-compile, so every build is made on its own machine — which is the whole reason that
 workflow exists.
 
-> The macOS app is **not code-signed**, so Gatekeeper warns the first time: right-click ▸
-> **Open** to run it anyway.
+### macOS application bundle and upgrades
+
+Keep the complete **`NgpCraftEmulator.app`** bundle together; do not move only its
+executable out of `Contents/MacOS`. macOS builds use PyInstaller's **onedir** layout
+inside the app, avoiding onefile's dependency extraction on every launch. The bundle
+icon reuses the existing official artwork. Windows and Linux remain onefile builds.
+
+**Before replacing an existing macOS application, preserve the old `.app` and back up
+its user data.** Saves, save states, covers, library history and portable settings may
+live inside `NgpCraftEmulator.app/Contents/MacOS`; replacing the whole bundle can discard
+them. Also back up external ROMs: the default in-game save mode writes saves into the
+ROM itself. Keep the old application and backups until games, saves and settings have
+been checked. Application Support migration and safe upgrade handling are not yet
+implemented, so do not treat a new bundle as a safe drop-in replacement.
+
+This packaging change preserves existing data paths; it does not resolve read-only
+installations, App Translocation or writing user data inside a signed bundle.
+PyInstaller applies **ad-hoc signing**, but Developer ID signing and notarization are
+not configured. Initial signature validation does not establish that these remaining
+installation and persistence issues are solved.
+
+### Opening ROMs on macOS
+
+NgpCraft registers `.ngp` and `.ngc` as **Alternate** document viewers. Choose the
+app with Finder's **Open With**, double-click a ROM when NgpCraft is your chosen
+default, or drop a ROM on the app's Dock icon. Requests received during startup are
+queued until the window is ready; later requests use the existing window and ask
+before interrupting a link session. Registration does not explicitly change your
+default emulator. macOS supplies the folded-page NGP/NGC icons using the bundle's
+application artwork; correcting the upstream bundle artwork is separate work
+tracked in [PR #32](https://github.com/Tixul/Ngpcraft_emulator/pull/32).
+
+This integration does not implement safe data migration. Legacy data may be inside
+the `.app`, and the default save mode may write into ROM files. Preserve the old
+application and related data before replacing an existing installation.
+
+### Staying up to date
+
+No need to come back to the Releases page: **Settings ▸ General ▸ Check for updates**
+asks GitHub for the latest release and tells you whether there is a newer one.
+
+- **Windows and Linux**: *Install and restart* downloads that release's archive, replaces
+  the program and starts the new version. Saying *no* to the restart is fine: the update is
+  then installed when you close the emulator.
+- **macOS**: the button opens the download page instead of replacing the application.
+  Follow the [macOS backup precautions](#macos-application-bundle-and-upgrades) before
+  changing an existing installation.
+- **At startup** the emulator checks by itself, at most once a day, and never opens a window
+  over a game you are playing (the Settings page says it instead). Untick *Check for
+  updates at startup* to turn this off; *Skip this version* silences one release.
+- **Windows/Linux in-app updates keep your data**: only the program file is replaced.
+  Saves, save states, settings, covers and the library sit in folders next to it and
+  are not touched.
+- If the emulator is installed in a folder it cannot write to (`Program Files`), it says so
+  and opens the download page instead.
+
+This works from **v3.10.0** on: older versions do not know their own number, so updating
+*to* 3.10.0 is still a manual download, the last one. A build made from source or with
+`build_exe.bat` reports itself as `dev` and never offers to replace itself; only the
+tagged builds made by the CI carry a version number (written by `build.yml` before
+packaging, into `ngpc_version.py`).
 
 To build it yourself on the platform you are on:
 
@@ -200,9 +286,9 @@ so games run, save and link out of the box.
 what the hardware runs, so anything a game does — including things no test of ours predicted
 — behaves as it does on the console. The clean-room image reproduces the documented
 *contract*, not SNK's internal state, and its coverage is measured rather than guaranteed:
-where a game pokes at BIOS internals instead of calling the API, it sees our layout. Two known
-consequences are in [Known issues](#known-issues) (*Metal Slug — 2nd Mission* refuses to fire
-or jump under the HLE image, and the mono NGP needs its own dump to boot as itself).
+where a game pokes at BIOS internals instead of calling the API, it sees our layout.
+For an authentic monochrome console boot, the mono NGP still needs its own BIOS dump;
+see [Known issues](#known-issues) for remaining limitations.
 
 So: **start with the HLE image**, and reach for a real dump when you want the boot animation,
 the console's own setup screens, or certainty on a game that misbehaves.
@@ -287,11 +373,11 @@ starts that over.
 > and a first boot re-ran the setup wizard for ever. Both are fixed: the BIOS page of the
 > coin cell is persisted as the BIOS left it.
 
-> **One commercial game we know of wants a real `bios.bin`.** *Metal Slug — 2nd Mission*
-> checks that the console really booted through its BIOS, and quietly disables **fire and
-> jump** when it decides it did not. With the real BIOS both start modes satisfy the check.
-> Under the HLE BIOS the game still runs and looks perfect; you simply can never shoot or
-> jump. This is the shape of what "certainty" buys you — one game, found by playing it.
+> **Metal Slug — 2nd Mission and the HLE BIOS.** The game checks for a fingerprint
+> of the retail BIOS's boot-time character RAM and previously disabled **fire and jump**
+> when it was missing. On a fresh hand-off start, the emulator now restores that fingerprint
+> from the player's own cartridge, without shipping SNK data. An old save state may still
+> restore the broken state — see [Known issues](#known-issues).
 
 ### Two ways to start a game
 
@@ -342,9 +428,11 @@ empty.)
 
 To use your own image instead, right-click a game ▸ **Choose cover image…**. The file is
 copied into **`covers/`** — a folder the emulator only ever *reads*. Nothing regenerates
-it, no update replaces it, and overwriting the install to upgrade keeps it, because
-`covers/` is your data and ships in no archive. Right-click ▸ **Back to the auto cover**
-undoes it.
+it, and it is not included in release archives. Windows/Linux in-app updates replace
+only the program file and keep it. On macOS, `covers/` may be inside the application
+bundle: preserve it before replacing the app, as described in the
+[macOS upgrade precautions](#macos-application-bundle-and-upgrades).
+Right-click ▸ **Back to the auto cover** undoes it.
 
 You can also drop files in yourself: `covers/<ROM file name>.png` (also `.jpg`, `.bmp`,
 `.gif`, `.webp`) — e.g. `covers/Faselei! (Europe).png`. Any size works; it is scaled to
@@ -449,7 +537,7 @@ Takes effect the next time a game is started.
 > **What is *not* modelled.** This is a K2GE restricted to K1GE behaviour, not a separate
 > K1GE implementation: the console-type byte, the missing colour palette and the grey
 > resolution are modelled, but the machine still answers as a K2GE anywhere a game probes
-> the video chip itself, and the **NEG** (inverted display) bit is not applied on the mono
+> the video chip itself. The **NEG** (inverted display) bit is applied on the mono
 > path. Mono-console behaviour has been checked on a handful of games, not the whole corpus
 > — reports welcome.
 
@@ -622,8 +710,11 @@ player toolbar's **🔗** button:
   already taken, a firewall — instead of an error number.
 
   🔓 **The emulator opens the port on your router by itself (UPnP)** while you host — TCP,
-  and UDP for mirror play — and the host panel tells you whether it could. The rules are
-  removed again once the other player is in (UDP: when the mirror match ends). On a box
+  and UDP for mirror play — and the host panel tells you whether it could. The rules stay
+  for as long as the match or the cable does, and are removed when it ends — TCP
+  included: some boxes cut the live connection when its rule is deleted, which is what
+  made hosting fail with `[WinError 10054]` about 20 seconds in, during the cartridge
+  trade (fixed in 3.10). On a box
   without UPnP, or with it switched off, forward the port by hand as the panel explains
   (TCP **and** UDP, same number). Measured on a common ISP router: a hand-made forward let
   nothing in, the same port opened by UPnP carried a five-minute match. Set
@@ -645,10 +736,11 @@ player toolbar's **🔗** button:
   may hold **different games and different saves**, exactly like two people with two
   cartridges. Your own settings travel with your console too (cartridge language, NGP or
   NGPC, flash size), so the other PC mirrors *your* machine rather than rebuilding it from
-  theirs. What must match is the **BIOS and the emulator build**, because those
-  decide how the code runs; it refuses to start otherwise, since a mismatch does not
-  fail loudly, it drifts. Savestates, rewind and reset are refused during a mirror match
-  for the same reason.
+  theirs. What must match is the **BIOS, the emulator version and the "Cartridge flash
+  timing" setting**, because those decide how the code runs; it refuses to start
+  otherwise, since a mismatch does not fail loudly, it drifts. The **system does not
+  matter**: Windows and Linux play together (measured: a 30-second match, no desync).
+  Savestates, rewind and reset are refused during a mirror match for the same reason.
 
   📡 **On a connection that loses packets**, mirror play also sends your last 16 inputs in
   a small UDP packet every frame, next to the normal connection: a lost packet is covered
@@ -657,9 +749,24 @@ player toolbar's **🔗** button:
   6-16 per 2½ minutes to none on the host's side. If UDP cannot get through (a firewall,
   an older version on the other PC, the lobby), the match simply plays as before.
 
-  ⚠️ **"Same build" means the same .exe on both PCs** — compare the file's date, not a
-  version shown anywhere. The check behind it inspects the emulation core, and two builds
-  can share a core while differing elsewhere: they will accept each other and fail anyway.
+  🔎 **How "same version" is checked.** Each emulator runs its core for a fifth of a
+  second on a fixed test sequence when the match opens and compares the result with the
+  other PC's. So the check is about what the core *computes*, not about the file: the
+  release (built with MSVC), a Linux build (GCC) and a local MinGW build of the same
+  source agree, and a core that computes differently — even by one cycle on one
+  instruction — is refused. ⚠️ Versions up to 3.9.1 compared the core *file* instead, so
+  they cannot play a mirror match with this one: both players need the same release.
+
+  💬 **When it does not work, it says why — on both screens.** The likely causes are
+  named in plain words: the other player picked the other mode (cable vs. mirror — each
+  side now recognises it), a different emulator version (with both systems named), a
+  different BIOS, a different "Cartridge flash timing" setting, a damaged cartridge
+  transfer. A refusal used to be lost on the way: the side that refused hung up at once,
+  and on Windows that discards what the other PC had not read yet — the reason included —
+  leaving only `[WinError 10054]`. It now finishes saying it before hanging up.
+  Every step of an online attempt is also written to **`logs/netplay.log`** next to the
+  emulator (what each side announced, the refusal, the raw system error); attach it when
+  reporting a link problem.
 
 Both players must run a **compatible game** (same title), exactly like real hardware.
 
@@ -1326,8 +1433,9 @@ tool, not a deterministic TAS engine.
 - **The monochrome NGP is a restricted K2GE, not a K1GE.** The console-type byte, the absent
   colour palette and the eight-grey resolution are modelled, and games that check the machine
   behave as they do on hardware — but a game that probes the video chip itself still finds a
-  K2GE, and the **NEG** (inverted display) bit is not applied on that path. Checked on a
-  handful of titles, not the whole corpus.
+  K2GE. (The **NEG** inverted-display bit *is* applied on the mono console:
+  `tests/test_render_native.py` pins it.) Checked on a handful of titles, not the whole
+  corpus.
 - **Cool Boarders Pocket freezes on the end-of-race *REWARD* screen** when **Cart flash size**
   is **Auto**. That screen saves, and this is a genuine 8 Mbit cartridge that saves in *its
   own* top block — but Auto presents any under-filled cart as 16 Mbit, which changes the

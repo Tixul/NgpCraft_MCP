@@ -298,3 +298,16 @@ These remain intentionally out of scope until the corresponding subsystem is fir
 - timer reload internals
 - BIOS scratchpad state the emulator does not yet model
 - any additional data required for a cycle-exact reload
+
+## 11. Line 0 after a restore (2026-10-21)
+
+The video registers line 0 is drawn with are latched into `raster_log[0]` as the
+PREVIOUS frame wraps, and the raster log is not part of any state. Before this fix the
+first frame after a restore (F4, rewind, libretro, the run-ahead ghost) drew its top line
+with the registers of whatever ran before — display only, one line, one frame.
+`ngpc_set_aux_state` now re-latches line 0 from the restored image when `scanline == 0`:
+exact, because a frame-boundary state is taken right after the instruction that crossed
+the wrap, so the latch and the image hold the same 0x8000..0x803F. No format change; the
+image must be written BEFORE the aux block, as already required. Test:
+`tests/test_restore_line0.py` (uses a scroll register — the WINDOW registers are read
+live, and a test built on them passed with the fix sabotaged).

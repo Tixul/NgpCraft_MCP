@@ -274,6 +274,16 @@ NGPC_API void ngpc_reset(ngpc_t* h, int reset_mode) {
     m->adc_cycles_remaining = 0;
     for (unsigned i = 0; i < 4; ++i) { m->timer_count[i] = 0; m->timer_clock[i] = 0; }
     m->ti0_pending_pulses = 0;
+    /* ⛔ THESE TWO SURVIVED A RESET (found 2026-10-21 by the link-test robots). TO3's
+     * flip-flop is what clocks the sound CPU's interrupt, so its PARITY decides on
+     * which edge the Z80 is interrupted: a console that had played a few seconds and
+     * was then reset kept whatever parity it had, while a freshly built one starts at
+     * 0. Mirror netplay resets the local console and builds the peer's copy fresh --
+     * so the two copies of ONE console differed from frame 0 and the RAM parted at
+     * frame ~912 of Fatal Fury (a desync whenever the host had played ~9 s before the
+     * match). The timer flip-flops come out of RESET low on the TMP95C061. */
+    m->to3_half_periods = 0;
+    m->z80_int_ack = 0;
     m->z80.running = false;      /* held in reset until the main CPU writes 0x55 to 0xB8 */
     m->z80.reset();
     m->z80_port_writes = 0;
@@ -2640,6 +2650,19 @@ NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
     m->frame_count        = in->frame_count;
     m->cycle_residue      = in->cycle_residue;
     m->biu_debt           = int32_t(in->biu_debt);
+    /* 🖼️ LINE 0's VIDEO REGISTERS. They are latched into `raster_log[0]` as the PREVIOUS
+     * frame wraps (advance_raster), and the log is not in a snapshot -- so the first
+     * frame after any restore drew its top line with the registers of whatever ran
+     * before: the rewound-from future, the run-ahead ghost's last guess, the frame the
+     * state was loaded over. Display only, one line, one frame; found by run-ahead's
+     * self-check on Sonic (2026-10-21).
+     *
+     * No new field is needed. A snapshot at scanline 0 is taken right after the
+     * instruction that crossed the wrap -- run_frames stops there -- so the latch and
+     * the restored image hold the same 0x8000..0x803F, and re-latching from the image
+     * gives back exactly what the log held. That is why the image must be written
+     * FIRST, as the contract above already demands. */
+    if (m->scanline == 0) m->snapshot_raster_line(0);
     return 0;
 }
 
@@ -2732,7 +2755,25 @@ NGPC_API int ngpc_set_link_state(ngpc_t* h, const ngpc_link_state_t* in) {
 NGPC_API int ngpc_read_mem(ngpc_t* h, uint32_t addr, uint8_t* out, uint32_t n) {
     if (!h || !out) return -1;
     Machine* m = reinterpret_cast<Machine*>(h);
+    /* ⛔ A HOST READ MUST NOT CONSUME THE BYTE THE CABLE JUST DELIVERED.
+     *
+     * read8 is the CPU's read, and the CPU reading SC0BUF (0x50) clears the "new
+     * data" flag -- that is the register's job. The host reading the same address
+     * (debugger view, rewind capture, run-ahead, libretro serialize: all of them read
+     * from 0) is not the game, and used to take that flag away from it.
+     *
+     * MEASURED 2026-10-24, mirror netplay, Dynamite Slugger "Man against Man": the
+     * rewind history captures OUR console every frame and never the mirror copy, so
+     * each PC ate received bytes on a different console. RX ring 0x6CC0 parted at
+     * frame 1076, checksum desync at 1080 on both PCs; the match never linked. Same
+     * on Neo Geo Cup '98 Plus (frame 2940). Read from 0x100 instead: no divergence.
+     * (Pocket Tennis did not diverge in the same test -- whether a byte is pending
+     * at the frame boundary depends on the game's protocol.) */
+    const bool rx_pending = m->serial_rx_pending;
+    const uint32_t rx_reads = m->serial_rx_read_count;
     for (uint32_t i = 0; i < n; ++i) out[i] = m->read8(addr + i);
+    m->serial_rx_pending = rx_pending;
+    m->serial_rx_read_count = rx_reads;
     return 0;
 }
 

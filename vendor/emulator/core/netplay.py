@@ -50,15 +50,19 @@ tests drive it with a pair of lists.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import platform
 import socket
+import threading
 import struct
 import time
 import zlib
 from collections import deque
 from typing import Protocol
 
+from core import netlog
 from core.link import run_two_consoles_interleaved
 
 # 2 : le message d'empreinte porte desormais l'horodatage et l'echo (mesure de
@@ -103,6 +107,10 @@ _HDR = struct.Struct("<BI")
 # How far ahead inputs are scheduled when nothing better is known. Three frames covers
 # a ~50 ms round trip; the host puts its own choice in the handshake.
 DEFAULT_DELAY = 3
+# Seconds a connected peer has to say hello before it is taken for a CABLE-mode peer.
+# A hello is the first thing a mirror side sends, so a few seconds is generous even on
+# a bad line; it is long only so a peer still clicking through a dialog is not refused.
+HELLO_TIMEOUT = 20.0
 CHECK_EVERY = 60            # frames between desync checksums (~1 s)
 
 # ⚡ THE DELAY FOLLOWS THE LINE, ON EACH SIDE, WHILE THE MATCH RUNS.
@@ -188,6 +196,49 @@ def plain_network_error(why: str) -> str:
         if code in text:
             return f"{word} ({text})"
     return text
+
+
+def explain(why: str, hs: "Handshake | None" = None) -> tuple[str, dict]:
+    """(translation key, its fields) for an online failure, most likely cause first.
+
+    The codes are what the two ends say to each other and what the log keeps; the
+    player gets a sentence that says what to change. `hs` lets a "core_version" name
+    both systems -- not because the system is the cause any more (the core is now
+    identified by what it computes, native.core_fingerprint, and Windows/Linux play
+    together), but because "you are on two different installs" is the useful hint.
+    """
+    text = str(why or "")
+    inner = text.split("peer_refused:", 1)[1].strip() if "peer_refused:" in text else text
+    code = inner.split(" ", 1)[0].split("(", 1)[0].strip()
+    if code == "core_version":
+        ours = (hs.os if hs is not None else "") or "?"
+        theirs = str((hs.peer_info or {}).get("os", "")) if hs is not None else ""
+        if theirs and theirs != ours:
+            return "net_why_os", {"theirs": theirs, "ours": ours}
+        return "net_why_core", {}
+    simple = {
+        "bios": "net_why_bios",
+        "timing_model": "net_why_timing",
+        "input_delay": "net_why_delay",
+        "protocol_version": "net_why_core",
+        "not_mirror": "net_why_not_mirror",
+        "no_hello": "net_why_not_mirror",
+        "unreadable_hello": "net_why_not_mirror",
+        "peer_mirror_mode": "net_why_peer_mirror",
+        "cartridge_transfer_mismatch": "net_why_transfer",
+        "desync": "mirror_desync",
+    }
+    if code in simple:
+        return simple[code], {}
+    if code.startswith("corrupt_transfer"):
+        return "net_why_transfer", {}
+    if "peer_closed" in text:
+        return "net_why_reset", {}
+    if "peer closed the connection" in text:
+        return "net_why_closed", {}
+    if "no_answer" in text:
+        return "net_why_timeout", {}
+    return "net_why_other", {"raw": text}
 
 
 class ListPipe:
@@ -334,6 +385,9 @@ def open_udp(tcp_sock, host: bool) -> "UdpSide | None":
     return UdpSide(u, peer_ip=peer_ip)
 
 
+_SEND_LATER = {errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS}
+
+
 class SocketPipe:
     """A TCP socket as a Pipe. Non-blocking, and it never loses a byte.
 
@@ -352,12 +406,36 @@ class SocketPipe:
         self.udp = udp              # optional companion for the inputs (see UdpSide)
 
     def close(self) -> None:
-        for thing in (self.sock, self.udp):
-            if thing is not None:
-                try:
-                    thing.close()
-                except OSError:
-                    pass
+        """Hang up WITHOUT a reset, so the last thing we said still arrives.
+
+        THE 10054 THIS ENDS. Closing a TCP socket that still has unread data in its
+        receive buffer sends a RESET, and on the receiving PC a reset DISCARDS what
+        that PC had received but not yet read -- the refusal record we had just sent
+        included. A player was left with `[WinError 10054]` "every time", the reason
+        on the other screen. So: say the rest, shut our sending side (a FIN, which
+        arrives AFTER our data), read and drop what the peer still sends until it
+        hangs up too or a moment passes, and only then close. Off the caller's thread:
+        a match ending must not freeze the window for that moment.
+        """
+        if self.udp is not None:
+            try:
+                self.udp.close()
+            except OSError:
+                pass
+        sock, self.lost = self.sock, self.lost or "closed"
+        try:
+            if self._out:
+                sock.setblocking(True)
+                sock.settimeout(0.5)
+                sock.sendall(bytes(self._out))
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+        threading.Thread(target=_linger_then_close, args=(sock,), daemon=True).start()
 
     @property
     def pending(self) -> int:
@@ -379,6 +457,13 @@ class SocketPipe:
         except (BlockingIOError, InterruptedError):
             pass                                    # buffer full: keep it, try again
         except OSError as e:
+            # ⛔ macOS SAYS "BUFFER FULL" ANOTHER WAY TOO. A non-blocking send there can
+            # raise ENOBUFS (errno 55) instead of EAGAIN when the socket's buffers are
+            # momentarily exhausted -- loopback especially. Read as a lost link, it
+            # killed the cartridge trade of the two-robot test on the macOS CI only
+            # (2026-10-22, run 50: `trade_failed`, Windows and Linux green).
+            if e.errno in _SEND_LATER:
+                return
             self._lose(str(e))
 
     def send(self, data: bytes) -> None:
@@ -407,8 +492,38 @@ class SocketPipe:
     def _lose(self, why: str) -> None:
         if self.lost is None:
             self.lost = plain_network_error(why)
+            netlog.log("socket_lost", why=why)
         try:
             self.sock.close()
+        except OSError:
+            pass
+
+
+def _core_file() -> str:
+    """Which compiled core this is -- for the log only; identity is the probe."""
+    try:
+        from core import native
+        return native.core_file_hash()
+    except Exception:  # noqa: BLE001 -- a log detail must never cost a session
+        return "?"
+
+
+def _linger_then_close(sock, seconds: float = 2.0) -> None:
+    """Drain until the peer hangs up too (or `seconds` pass), then close: no reset."""
+    deadline = time.monotonic() + seconds
+    try:
+        sock.settimeout(0.2)
+        while time.monotonic() < deadline:
+            try:
+                if not sock.recv(65536):
+                    break                   # the peer's FIN: both sides are done
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+    finally:
+        try:
+            sock.close()
         except OSError:
             pass
 
@@ -477,12 +592,16 @@ class Handshake:
         # delay is baked into simulated frames and can no longer be reconciled, only
         # refused. See check().
         self.locked = False
+        # Which system this emulator runs on. Never compared: it is what turns a bare
+        # "core_version" refusal into "the other player is on Linux" (explain()).
+        self.os = platform.system()
+        self.peer_info: dict = {}
 
     def payload(self) -> bytes:
         return json.dumps({
             "v": PROTOCOL_VERSION, "rom": self.rom_hash, "bios": self.bios_hash,
             "core": self.core_version, "delay": self.delay, "cons": self.console,
-            "timing": self.timing,
+            "timing": self.timing, "os": self.os,
             **({"udp": self.udp_info} if self.udp_info else {}),
         }, sort_keys=True).encode("utf-8")
 
@@ -498,6 +617,9 @@ class Handshake:
         # (Reported by Blueteemo, Tixul/Ngpcraft_emulator PR #26.)
         if not isinstance(them, dict):
             return "unreadable_hello"
+        self.peer_info = them
+        netlog.log("hello_received", **{k: them.get(k) for k in
+                   ("v", "core", "bios", "timing", "delay", "os") if k in them})
         if type(them.get("v")) is not int or them["v"] != PROTOCOL_VERSION:
             return "protocol_version"
         self.peer_rom_hash = them.get("rom")     # what their image must hash to
@@ -592,6 +714,10 @@ class CartExchange:
         js = self.hs.payload()
         self.pipe.send(_HDR.pack(_T_HELLO, 0) + struct.pack("<H", len(js)) + js)
         self.pipe.send(_HDR.pack(_T_CART, len(self._out)))
+        self._t0 = time.monotonic()
+        netlog.log("mirror_hello_sent", host=self.hs.host, core=self.hs.core_version,
+                   bios=self.hs.bios_hash, timing=self.hs.timing, delay=self.hs.delay,
+                   os=self.hs.os, cart_bytes=len(image), core_file=_core_file())
 
     @property
     def done(self) -> bool:
@@ -624,6 +750,17 @@ class CartExchange:
         lost = getattr(self.pipe, "lost", None)
         if lost:
             self.failed = str(lost)
+            netlog.log("mirror_trade_lost", greeted=self.greeted, why=self.failed,
+                       sent=self._sent, of=len(self._out), pending=_pending(self.pipe),
+                       received=len(self._in), want=self._want,
+                       after_s=round(time.monotonic() - self._t0, 1))
+            return
+        # CONNECTED, BUT NOBODY SPEAKS MIRROR AT THE OTHER END. A peer that chose the
+        # CABLE mode relays serial bytes only when its game sends some -- on a menu that
+        # is never -- so this side used to sit at "trading 0 %" for ever.
+        if not self.greeted and time.monotonic() - self._t0 > HELLO_TIMEOUT:
+            self.failed = "no_hello"
+            netlog.log("mirror_no_hello", after_s=HELLO_TIMEOUT)
             return
         # Retry whatever the transport still owes BEFORE cutting a new chunk: this is
         # the only thing that moves the tail once the last chunk has been queued.
@@ -658,13 +795,21 @@ class CartExchange:
                     return
                 why = bytes(self._rx[_HDR.size + 2:_HDR.size + 2 + ln])
                 self.failed = "peer_refused: " + why.decode("utf-8", "replace")
+                netlog.log("mirror_peer_refused", why=self.failed)
                 return
             if kind == _T_CART:
                 del self._rx[:_HDR.size]
                 self._want = int(n)
                 continue
             if kind != _T_CHUNK:
-                self.failed = "unexpected_record"
+                # Before any hello, a record we cannot read is not a damaged mirror
+                # stream: it is somebody else's protocol -- a peer in CABLE mode
+                # relaying its game's serial bytes.
+                netlog.log("mirror_bad_record", kind=kind, greeted=self.greeted)
+                if self.greeted:
+                    self.failed = "unexpected_record"
+                else:
+                    self._refuse("not_mirror")
                 return
             if len(self._rx) < _HDR.size + n:
                 return
@@ -684,6 +829,7 @@ class CartExchange:
         player looking for it is at the other one.
         """
         self.failed = why
+        netlog.log("mirror_refuse", why=why)
         try:
             msg = why.encode("utf-8")[:512]
             self.pipe.send(_HDR.pack(_T_BYE, 0) + struct.pack("<H", len(msg)) + msg)
@@ -789,6 +935,7 @@ class MirrorSession:
         if self.rejected is not None:
             return
         self.rejected = why
+        netlog.log("mirror_session_reject", why=why)
         try:
             msg = why.encode("utf-8")[:512]
             self._send(_T_BYE, 0, struct.pack("<H", len(msg)) + msg)
@@ -970,8 +1117,11 @@ class MirrorSession:
                        _CHECK_BODY.pack(self._mine[self.frame], self._now_ms(),
                                         self._echo()))
         for f in sorted(set(self._mine) & set(self._checks)):
-            if self._mine.pop(f) != self._checks.pop(f) and self.desync_at is None:
+            mine, theirs = self._mine.pop(f), self._checks.pop(f)
+            if mine != theirs and self.desync_at is None:
                 self.desync_at = f
+                netlog.log("mirror_desync", frame=f, mine=f"{mine:08X}",
+                           theirs=f"{theirs:08X}", delay=self.delay)
         # A checksum whose partner never turns up (a peer that stopped sending them)
         # must not accumulate for the length of the session. Keep a few rounds' worth --
         # enough to cover any round trip -- and forget the rest.

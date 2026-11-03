@@ -33,7 +33,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # What counts as a raw NGPC ROM, whether loose or inside an archive.
@@ -64,6 +64,13 @@ class LoadedRom:
     name: str            # the ROM's own file name (inner name for archives)
     source: Path         # the path the user actually opened
     from_archive: bool   # True -> the source is read-only, saves go to a sidecar
+    patch: Path | None = None        # the IPS/BPS applied in memory, see core.softpatch
+    patch_error: str | None = None   # a patch was found and REFUSED -- the clean ROM loaded
+
+    @property
+    def read_only(self) -> bool:
+        """The bytes are not the file's: never write a save back into the source."""
+        return self.from_archive or self.patch is not None
 
 
 def split_member(path: str | Path) -> tuple[Path, str | None]:
@@ -95,12 +102,45 @@ def list_roms(path: str | Path) -> list[str]:
     return sorted(names, key=str.casefold)
 
 
-def load(path: str | Path) -> LoadedRom:
+def load(path: str | Path, softpatch: bool = False) -> LoadedRom:
     """Return the ROM bytes for `path`, transparently unpacking a zip / 7z.
 
     `path` may be an archive (one member is chosen, see `_pick_entry`) or a virtual
     `archive/member` path, which loads exactly that member.
+
+    `softpatch` applies the `.bps`/`.ips` found beside the ROM (core.softpatch). Off by
+    default: only the player asks for it -- thumbnails and the ROM analysis describe
+    the dump that is on disk.
     """
+    loaded = _load_raw(path)
+    if not softpatch:
+        return loaded
+    from core import softpatch as sp
+    patch_path = sp.find_patch(path)
+    if patch_path is None:
+        return loaded
+    try:
+        data = sp.apply(loaded.data, patch_path.read_bytes())
+    except (sp.PatchError, OSError) as exc:
+        return replace(loaded, patch_error=f"{patch_path.name}: {exc}")
+    return replace(loaded, data=data, patch=patch_path)
+
+
+# ROMs that exist only in memory, by the name the rest of the emulator will use as their
+# path. The link-test robot on a remote machine receives the cartridge over the network
+# and must never write it to that machine's disk (ngpc_robot.py).
+_MEMORY_ROMS: dict[str, bytes] = {}
+
+
+def register_memory_rom(path: str | Path, data: bytes) -> None:
+    _MEMORY_ROMS[str(Path(path))] = bytes(data)
+
+
+def _load_raw(path: str | Path) -> LoadedRom:
+    held = _MEMORY_ROMS.get(str(Path(path)))
+    if held is not None:
+        p = Path(path)
+        return LoadedRom(held, p.name, p, True)      # read-only: nothing to save into
     archive, member = split_member(path)
     ext = archive.suffix.lower()
     if ext == ".zip":

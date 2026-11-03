@@ -1813,20 +1813,21 @@ struct Machine {
     static constexpr uint64_t kFlashProgramCycles    = 203;      /* 33.0 us per byte */
     static constexpr uint64_t kFlashErasePer8KCycles = 353389;   /* 57.5 ms per 8 KB */
 
-    /* ⛔ AND A PROGRAM THAT CANNOT SUCCEED NEVER SAYS SO. This cartridge was asked to put
-     * 0xFF back over a 0x5A -- a NOR cell pulled back up, which no erase-less write can do
-     * -- and it did NOT raise DQ5 in 262 143 turns of the poll: 2.45 SECONDS. The stub
-     * escaped on its own iteration ceiling, not on anything the chip said.
+    /* ✅ A PROGRAM THAT CANNOT SUCCEED COMPLETES ANYWAY, AND LEAVES THE AND. Measured
+     * 2026-10-22 (hw_test_flash_violation, emulator issue #27): 0x55 over 0xAA answers
+     * status for one ordinary program time (3 poll turns, DQ6 toggling), then reads 0x00;
+     * 0xFF over 0x5A is done within two reads and reads 0x5A. No DQ5, ever. That is what
+     * the retail BIOS counts on: its boot test (0xFF3013) writes 0xAA, then 0x55, and
+     * waits WITHOUT A CEILING for 0x00.
      *
-     * That is the opposite of what an AMD datasheet describes, and it is the measurement
-     * that matters most here, because it is the mechanism: two and a half seconds spent
-     * INTERRUPTS MASKED, no V-blank, no watchdog refresh from the game's handler, a
-     * micro-DMA still reading a cartridge that has stopped being memory. A save that
-     * "works" in an emulator and takes the console down.
+     * ⛔ THE 2026-09 READING THAT SAID "BUSY FOR EVER" WAS AMBIGUOUS. Its stub waited for
+     * the cell to read the TARGET (0xFF); a chip that had finished and left 0x5A (bit 5
+     * clear) spins that loop to its ceiling exactly the same. The 2.45 s -- and the 18 s
+     * with eight times the rope -- were the DRIVER's, interrupts masked: still the reason
+     * a slot rewritten without an erase hangs a game, but the chip is not the one hanging.
      *
-     * So the default is kFlashNever: the chip stays busy, DQ5 stays clear, and only a
-     * reset command gets it back. The DQ5 path below stays reachable for a part that does
-     * behave the way the datasheets say -- but not this one, and not by default. */
+     * So the default is kFlashNever: the chip never fails. The DQ5 path stays reachable,
+     * through a finite `flash_fail_cycles`, for a part that behaves like the datasheets. */
     static constexpr uint64_t kFlashNever = ~uint64_t(0);
 
     /* The dial. 0 = the old synchronous chip, kept so a corpus run can be bisected
@@ -1885,6 +1886,9 @@ struct Machine {
 
     inline uint8_t read8(uint32_t a) const {
         a &= kAddrMask;
+        // RAS.H: upper eight bits of the 515-clock subtraction counter
+        // (K2GE Technical Reference, section 4-8). Reuse the live line phase.
+        if (a == 0x008008) return uint8_t((kCyclesPerScanline - cycle_residue) >> 2);
         /* A flash chip in autoselect mode stops being memory: it answers its ID.
          * The check is two comparisons on the hot path and is worth it -- without
          * it the BIOS cannot identify the cartridge and refuses to boot it. */
