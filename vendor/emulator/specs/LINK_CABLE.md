@@ -655,7 +655,7 @@ its DLL. **There is a second tree**, and it is the one Android and RetroArch bui
 | tree | path | consumers |
 |---|---|---|
 | desktop | `cpp/src/` | the Python shell (ctypes DLL) |
-| libretro | `Ngpcraft_emulator_lirbreto/core/src/` | **Android** (`ngpcraft.coreDir`) and RetroArch |
+| libretro | `NGPC_RAG/04_MY_PROJECTS/Ngpcraft_emulator_lirbreto/core/src/` | **Android** (`ngpcraft.coreDir`) and RetroArch |
 
 They had drifted **in both directions**, silently. Both were wrong about something:
 
