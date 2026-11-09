@@ -59,10 +59,19 @@ void ngpc_raster_clear_scroll(void);
 
 /* ---- Callback mode ---- */
 
-/* Register a callback to be called at a specific scanline.
- * line: scanline number (0-151)
- * cb: function to call (must be VERY fast, ~10 instructions max)
- * Returns slot index or 0xFF if no slot free. */
+/* Register a callback for a scanline.
+ * line: scanline number (0-151) whose drawing the callback prepares: it is
+ *       called from the H-int that precedes that line (during line-1), so a
+ *       register it writes is in place for `line` -- IF it writes in time.
+ * cb: function to call (must be VERY fast, ~10 instructions max).
+ * TIMING (campagne 2026-11-08, emulation): the ISR looks the callback up
+ * straight from RAS_V; a one-store callback writes ~360 cycles after the
+ * H-int, inside the 515-cycle line -> lands on ITS line (gfx_raster ph4).
+ * Budget left for the callback body: ~150 cycles (~10 short instructions,
+ * code in cart ROM). Longer -> its write lands one line late. Several
+ * callbacks on the SAME line run one after the other (later ones late).
+ * For long splits prefer a scroll table or ngpc_dma_raster.
+ * Returns slot index, or 0xFF if no slot is free or line >= 152. */
 u8 ngpc_raster_set_callback(u8 line, RasterCallback cb);
 
 /* Remove all callbacks. */

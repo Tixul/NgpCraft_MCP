@@ -76,11 +76,13 @@ typedef struct {
 void ngpc_mspr_anim_start(MsprAnimator *a, const MsprAnimFrame *anim,
                            u8 count, u8 loop);
 
-/* Tick the animator (call once per frame).
- * Returns: pointer to the current metasprite definition. */
+/* Tick the animator (call once per frame, before drawing).
+ * Returns: pointer to the metasprite to draw this frame; each frame of the
+ * table is returned exactly `duration` times. */
 const NgpcMetasprite *ngpc_mspr_anim_update(MsprAnimator *a);
 
-/* Check if a non-looping animation has finished. */
+/* Check if a non-looping animation has finished: 1 once update() has
+ * returned the last tick of the last frame (call it after update + draw). */
 u8 ngpc_mspr_anim_done(const MsprAnimator *a);
 
 #endif /* NGPC_METASPRITE_H */

@@ -306,6 +306,10 @@ static u8 s_sfx_noise_burst_off;
 
 static u8 s_buf_count;
 static u8 s_sfx_active_mask;
+/* corrigé campagne 2026-11-08 : 1 = SFX lancé depuis le dernier envoi ;
+ * Sfx_Update saute cette image, sinon la commande de départ était écrasée
+ * avant d'être envoyée (frames=N sonnait N-1 images, frames=1 jamais). */
+static u8 s_sfx_fresh[4];
 static u16 s_sound_drops;
 static u8 s_sound_fault;
 static u8 s_sound_last_sfx;
@@ -874,7 +878,9 @@ static void BgmVoice_StartEx(BgmVoice *v, const u8 *stream, u16 loop_offset)
     v->start = stream;
     v->ptr = stream;
     v->loop = (stream && loop_offset) ? (stream + loop_offset) : stream;
-    v->next_frame = s_bgm_song_frame;
+    /* corrigé campagne 2026-11-08 : Bgm_Update incrémente song_frame AVANT
+     * de lire le flux ; démarrer à song_frame raccourcissait la 1re note d'1 image. */
+    v->next_frame = s_bgm_song_frame + 1;
     v->enabled = (stream != 0);
     v->inst_id = (v->freq_base == 0xE0 && s_bgm_instrument_count > 1) ? 1 : 0;
     BgmVoice_ResetFx(v);
@@ -1831,6 +1837,7 @@ void Sounds_ResetState(void)
     s_sfx_noise_burst_counter = 0;
     s_sfx_noise_burst_off = 0;
     s_sfx_active_mask = 0;
+    s_sfx_fresh[0] = 0; s_sfx_fresh[1] = 0; s_sfx_fresh[2] = 0; s_sfx_fresh[3] = 0;
     s_bgm_note_table = NOTE_TABLE;
     s_bgm_v0.freq_base = 0x80;
     s_bgm_v0.attn_base = 0x90;
@@ -1910,6 +1917,10 @@ void Sfx_Update(void)
         return;
     }
     for (ch = 0; ch < 3; ch++) {
+        if (s_sfx_fresh[ch]) {
+            s_sfx_fresh[ch] = 0;
+            continue;
+        }
         if (s_sfxTimer[ch] > 0) {
             u8 dirty = 0;
             if (s_sfx_tone_sw_on[ch]) {
@@ -1973,7 +1984,9 @@ void Sfx_Update(void)
             }
         }
     }
-    if (s_sfxTimer[3] > 0) {
+    if (s_sfx_fresh[3]) {
+        s_sfx_fresh[3] = 0;
+    } else if (s_sfxTimer[3] > 0) {
         u8 dirty = 0;
         if (s_sfx_noise_env_on) {
             if (s_sfx_noise_env_counter == 0) {
@@ -2074,6 +2087,7 @@ void Sfx_PlayToneCh(u8 ch, u16 divider, u8 attn, u8 frames)
     s_sfxTimer[ch] = frames;
     if (frames > 0) {
         s_sfx_active_mask |= (u8)(1u << ch);
+        s_sfx_fresh[ch] = 1;
         s_sfx_end_pending[ch] = 0;
         s_bgm_ch_used_by_sfx[ch] = 1;
         s_bgm_restore_ch[ch] = 0;
@@ -2131,6 +2145,7 @@ void Sfx_PlayToneEx(u8 ch, u16 divider, u8 attn, u8 frames,
     s_sfxTimer[ch] = frames;
     if (frames > 0) {
         s_sfx_active_mask |= (u8)(1u << ch);
+        s_sfx_fresh[ch] = 1;
         s_sfx_end_pending[ch] = 0;
         s_bgm_ch_used_by_sfx[ch] = 1;
         s_bgm_restore_ch[ch] = 0;
@@ -2159,6 +2174,7 @@ void Sfx_PlayNoise(u8 noise_val, u8 attn, u8 frames)
     s_sfxTimer[3] = frames;
     if (frames > 0) {
         s_sfx_active_mask |= (u8)(1u << 3);
+        s_sfx_fresh[3] = 1;
         s_sfx_end_pending[3] = 0;
         s_bgm_ch_used_by_sfx[3] = 1;
         s_bgm_restore_ch[3] = 0;
@@ -2206,6 +2222,7 @@ void Sfx_PlayNoiseEx(u8 rate, u8 type, u8 attn, u8 frames,
     s_sfxTimer[3] = frames;
     if (s_sfxTimer[3] > 0) {
         s_sfx_active_mask |= (u8)(1u << 3);
+        s_sfx_fresh[3] = 1;
         s_sfx_end_pending[3] = 0;
         s_bgm_ch_used_by_sfx[3] = 1;
         s_bgm_restore_ch[3] = 0;
@@ -2237,6 +2254,7 @@ void Sfx_Stop(void)
     s_sfx_noise_burst_off = 0;
     s_sfx_noise_burst_counter = 0;
     s_sfx_active_mask = 0;
+    s_sfx_fresh[0] = 0; s_sfx_fresh[1] = 0; s_sfx_fresh[2] = 0; s_sfx_fresh[3] = 0;
 }
 
 static void Bgm_ResetFadeState(void)

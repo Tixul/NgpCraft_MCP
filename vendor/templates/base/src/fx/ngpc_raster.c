@@ -26,59 +26,132 @@ static const u8 *s_scroll_x;
 static const u8 *s_scroll_y;
 static u8        s_scroll_plane;
 
-/* Per-line callbacks. */
-typedef struct {
-    u8              line;
-    RasterCallback  cb;
-} RasterCbEntry;
-
-static RasterCbEntry s_callbacks[RASTER_MAX_CB];
-static u8            s_cb_count;
+/* Per-line callbacks (parallel arrays: no multiply in the ISR). */
+static u8             s_cb_line[RASTER_MAX_CB];
+static RasterCallback s_cb_fn[RASTER_MAX_CB];
+static u8             s_cb_count;
+/* Dispatch map indexed DIRECTLY by RAS_V at the H-int (0..198): slot+1 of
+ * the first callback for the line that H-int announces (RAS_V+1, and line 0
+ * for RAS_V 198), 0 = none. s_cb_next chains several callbacks on one line.
+ * No index arithmetic, no search in the ISR: the user's write must land
+ * before the next line is latched (see isr_cb). 199 + 8 bytes of RAM. */
+#define RASTER_HINT_LINES 199u
+static u8             s_cb_map[RASTER_HINT_LINES];
+static u8             s_cb_next[RASTER_MAX_CB];
 
 /* Parallax scroll buffer (filled by ngpc_raster_parallax). */
 static u8 s_parallax_buf[152];
 static u8 s_parallax_active;
 
-/* ---- HBlank ISR ---- */
+/* What the ISRs actually use (set by raster_select()). */
+static const u8 *s_tab_x;
+static const u8 *s_tab_y;
+static volatile u8 *s_reg_x;
+static volatile u8 *s_reg_y;
 
-static void __interrupt isr_hblank(void)
+/* ---- HBlank ISRs ----
+ *
+ * Corrige campagne 2026-11-08 :
+ * 1. LIGNE : the H-int seen with RAS_V = N fires at the START of line N and
+ *    announces line N+1 (ngpcspec: "signal generation begins 1 H before";
+ *    no H-int at line 151, the one for line 0 comes at line 198). A write
+ *    made during line N only shows from line N+1. The old ISR wrote
+ *    table[RAS_V] -> every line got its neighbour's value and line 0 was
+ *    never served. Each ISR now prepares the NEXT line.
+ * 2. DUREE : the old all-in-one C ISR took ~543 cycles in emulation, more
+ *    than a line (515): 145 IRQs/frame instead of 152, lines skipped,
+ *    callbacks at some lines never called. One small ISR per mode is now
+ *    installed by raster_select(); the generic one (with callbacks) is only
+ *    used when callbacks are registered. Keep callbacks few (1-2). */
+
+#define RASTER_NEXT(v) ((u8)(((v) == 198u) ? 0u : (u8)((v) + 1u)))
+
+static void __interrupt isr_idle(void) { }
+
+static void __interrupt isr_x(void)
 {
-    u8 line = HW_RAS_V;
+    u8 l = HW_RAS_V;
+    l = RASTER_NEXT(l);
+    if (l < 152u) *s_reg_x = s_tab_x[l];
+}
 
-    /* Safety: only process visible lines. */
-    if (line >= 152) return;
+static void __interrupt isr_y(void)
+{
+    u8 l = HW_RAS_V;
+    l = RASTER_NEXT(l);
+    if (l < 152u) *s_reg_y = s_tab_y[l];
+}
 
-    /* Scroll table mode: write scroll registers for this line. */
-    if (s_scroll_x || s_scroll_y || s_parallax_active) {
-        if (s_parallax_active) {
-            if (s_scroll_plane == GFX_SCR1)
-                HW_SCR1_OFS_X = s_parallax_buf[line];
-            else
-                HW_SCR2_OFS_X = s_parallax_buf[line];
-        } else {
-            if (s_scroll_x) {
-                if (s_scroll_plane == GFX_SCR1)
-                    HW_SCR1_OFS_X = s_scroll_x[line];
-                else
-                    HW_SCR2_OFS_X = s_scroll_x[line];
-            }
-            if (s_scroll_y) {
-                if (s_scroll_plane == GFX_SCR1)
-                    HW_SCR1_OFS_Y = s_scroll_y[line];
-                else
-                    HW_SCR2_OFS_Y = s_scroll_y[line];
-            }
-        }
+static void __interrupt isr_xy(void)
+{
+    u8 l = HW_RAS_V;
+    l = RASTER_NEXT(l);
+    if (l < 152u) {
+        *s_reg_x = s_tab_x[l];
+        *s_reg_y = s_tab_y[l];
     }
+}
 
-    /* Callback mode: check if any callback is registered for this line. */
-    if (s_cb_count > 0) {
-        u8 i;
-        for (i = 0; i < s_cb_count; i++) {
-            if (s_callbacks[i].line == line)
-                s_callbacks[i].cb(line);
-        }
+static void __interrupt isr_generic(void)
+{
+    u8 i;
+    u8 v = HW_RAS_V;
+    u8 l = RASTER_NEXT(v);
+    if (l >= 152u) return;
+    if (s_tab_x) *s_reg_x = s_tab_x[l];
+    if (s_tab_y) *s_reg_y = s_tab_y[l];
+    /* A callback registered for line L runs during line L-1, so what it
+     * writes is in place when line L is drawn. */
+    i = s_cb_map[v];
+    while (i) {
+        s_cb_fn[i - 1u](l);
+        i = s_cb_next[i - 1u];
     }
+}
+
+static void cb_reset(void)
+{
+    u8 i;
+    s_cb_count = 0;
+    for (i = 0; i < RASTER_HINT_LINES; i++) s_cb_map[i] = 0;
+}
+
+/* Callbacks only (no table): the shortest path to the user's write.
+ * Lookup straight from RAS_V, then the call. TIMING: from the H-int (start
+ * of line L-1) to the callback's register write there is one line (515
+ * cycles at 6.144 MHz) minus the ISR entry; measured in emulation with a
+ * one-store callback: see gfx_raster ph4. A long callback writes late. */
+static void __interrupt isr_cb(void)
+{
+    u8 k = s_cb_map[HW_RAS_V];
+    while (k) {
+        s_cb_fn[k - 1u](s_cb_line[k - 1u]);
+        k = s_cb_next[k - 1u];
+    }
+}
+
+/* Pick the smallest ISR for the current state and install it. */
+static void raster_select(void)
+{
+    /* Idle first: an HBlank between two pointer updates must not use a
+     * half-updated state. */
+    HW_INT_TIM0 = (IntHandler *)isr_idle;
+    if (s_parallax_active) {
+        s_tab_x = s_parallax_buf;
+        s_tab_y = 0;
+    } else {
+        s_tab_x = s_scroll_x;
+        s_tab_y = s_scroll_y;
+    }
+    s_reg_x = (s_scroll_plane == GFX_SCR1) ? &HW_SCR1_OFS_X : &HW_SCR2_OFS_X;
+    s_reg_y = (s_scroll_plane == GFX_SCR1) ? &HW_SCR1_OFS_Y : &HW_SCR2_OFS_Y;
+
+    if (s_cb_count > 0 && !s_tab_x && !s_tab_y) HW_INT_TIM0 = (IntHandler *)isr_cb;
+    else if (s_cb_count > 0)       HW_INT_TIM0 = (IntHandler *)isr_generic;
+    else if (s_tab_x && s_tab_y)   HW_INT_TIM0 = (IntHandler *)isr_xy;
+    else if (s_tab_x)              HW_INT_TIM0 = (IntHandler *)isr_x;
+    else if (s_tab_y)              HW_INT_TIM0 = (IntHandler *)isr_y;
+    else                           HW_INT_TIM0 = (IntHandler *)isr_idle;
 }
 
 /* ---- Public API ---- */
@@ -89,11 +162,11 @@ void ngpc_raster_init(void)
     s_scroll_x = 0;
     s_scroll_y = 0;
     s_scroll_plane = GFX_SCR1;
-    s_cb_count = 0;
+    cb_reset();
     s_parallax_active = 0;
 
-    /* Install HBlank interrupt handler. */
-    HW_INT_TIM0 = (IntHandler *)isr_hblank;
+    /* Install HBlank interrupt handler (the one matching the state). */
+    raster_select();
 
     /*
      * Configure Timer 0 for HBlank:
@@ -131,8 +204,9 @@ void ngpc_raster_disable(void)
 
     s_scroll_x = 0;
     s_scroll_y = 0;
-    s_cb_count = 0;
+    cb_reset();
     s_parallax_active = 0;
+    raster_select();   /* idle ISR: a pending request is harmless */
 }
 
 void ngpc_raster_set_scroll_table(u8 plane, const u8 *table_x, const u8 *table_y)
@@ -141,6 +215,7 @@ void ngpc_raster_set_scroll_table(u8 plane, const u8 *table_x, const u8 *table_y
     s_scroll_x = table_x;
     s_scroll_y = table_y;
     s_parallax_active = 0;
+    raster_select();
 }
 
 void ngpc_raster_clear_scroll(void)
@@ -148,22 +223,38 @@ void ngpc_raster_clear_scroll(void)
     s_scroll_x = 0;
     s_scroll_y = 0;
     s_parallax_active = 0;
+    raster_select();
 }
 
 u8 ngpc_raster_set_callback(u8 line, RasterCallback cb)
 {
     if (s_cb_count >= RASTER_MAX_CB) return 0xFF;
 
-    s_callbacks[s_cb_count].line = line;
-    s_callbacks[s_cb_count].cb   = cb;
+    if (line >= 152) return 0xFF;
+    s_cb_line[s_cb_count] = line;
+    s_cb_fn[s_cb_count]   = cb;
+    s_cb_next[s_cb_count] = 0;
+    {
+        /* H-int that announces `line`: RAS_V = line-1, or 198 for line 0. */
+        u8 v = (line == 0u) ? (u8)(RASTER_HINT_LINES - 1u) : (u8)(line - 1u);
+        if (s_cb_map[v] == 0u) {
+            s_cb_map[v] = (u8)(s_cb_count + 1u);
+        } else {                           /* append to that line's chain */
+            u8 k = s_cb_map[v];
+            while (s_cb_next[k - 1u]) k = s_cb_next[k - 1u];
+            s_cb_next[k - 1u] = (u8)(s_cb_count + 1u);
+        }
+    }
     s_cb_count++;
+    raster_select();
 
     return s_cb_count - 1;
 }
 
 void ngpc_raster_clear_callbacks(void)
 {
-    s_cb_count = 0;
+    cb_reset();
+    raster_select();
 }
 
 void ngpc_raster_parallax(u8 plane, const RasterBand *bands,
@@ -185,4 +276,5 @@ void ngpc_raster_parallax(u8 plane, const RasterBand *bands,
         for (line = start; line < end; line++)
             s_parallax_buf[line] = sx;
     }
+    raster_select();
 }

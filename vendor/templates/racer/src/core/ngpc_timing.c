@@ -73,15 +73,21 @@ void ngpc_cpu_speed(u8 divider)
     /* BIOS system call: VECT_CLOCKGEARSET.
      * ngpcspec.txt: CPU clock divider 0=6MHz, 1=3MHz, 2=1.5MHz, 3=768KHz, 4=384KHz.
      * Pass divider in RB3 and joypad-speedup flag in RC3. */
+    /* corrigé campagne 2026-11-08 (repris de src/core/ngpc_timing.c du
+     * template) : XIX est sauvé (cc900 le croit conservé par l'appelé) et la
+     * banque 3 est posée AVANT de charger B/C (avant, `ld b,e` visait la
+     * banque de l'appelant). */
     (void)divider;
-    __asm("ld rw3, " NGPC_STR(BIOS_CLOCKGEARSET));
-    __asm("ld xde, (xsp+4)");    /* get divider argument */
+    __asm("push xix");
+    __asm("ldf 3");
+    __asm("ld w, " NGPC_STR(BIOS_CLOCKGEARSET));
+    __asm("ld xde, (xsp+8)");    /* divider (pile : +4 pour le push xix) */
     __asm("ld b, e");            /* RB3 = divider */
     __asm("ld c, 0");            /* RC3 = no auto speed-up on joypad */
-    __asm("ldf 3");
     __asm("add w, w");
     __asm("add w, w");
     __asm("ld xix, 0xfffe00");
     __asm("ld xix, (xix+w)");
     __asm("call xix");
+    __asm("pop xix");
 }

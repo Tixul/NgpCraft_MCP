@@ -74,3 +74,47 @@ unsigned long C9H_remlu(unsigned long dividend, unsigned long divisor)
     return rem;
 }
 
+
+/*
+ * Signed 32-bit helpers (campagne de test 2026-11-08) : sans eux, toute
+ * division / modulo / produit `long` signe non reduit ne se lie pas
+ * (TULINK-Error-209 "C9H_divls"), FX_DIV de ngpc_fixed compris.
+ * Construits sur les versions non signees (logique de NGPC_FidelitySuite) :
+ *   - quotient tronque vers zero, signe = XOR des signes ;
+ *   - reste du signe du dividende (C99) ;
+ *   - produit : les 32 bits bas du produit signe = ceux du produit non signe.
+ */
+long C9H_mulls(long a, long b)
+{
+    return (long)C9H_mullu((unsigned long)a, (unsigned long)b);
+}
+
+long C9H_divls(long dividend, long divisor)
+{
+    unsigned long ua;
+    unsigned long ub;
+    long result;
+
+    ua = (dividend < 0L) ? (0UL - (unsigned long)dividend) : (unsigned long)dividend;
+    ub = (divisor  < 0L) ? (0UL - (unsigned long)divisor)  : (unsigned long)divisor;
+    result = (long)C9H_divlu(ua, ub);
+    if ((dividend < 0L) != (divisor < 0L)) {
+        result = -result;
+    }
+    return result;
+}
+
+long C9H_remls(long dividend, long divisor)
+{
+    unsigned long ua;
+    unsigned long ub;
+    long result;
+
+    ua = (dividend < 0L) ? (0UL - (unsigned long)dividend) : (unsigned long)dividend;
+    ub = (divisor  < 0L) ? (0UL - (unsigned long)divisor)  : (unsigned long)divisor;
+    result = (long)C9H_remlu(ua, ub);
+    if (dividend < 0L) {
+        result = -result;
+    }
+    return result;
+}

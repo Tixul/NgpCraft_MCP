@@ -26,6 +26,7 @@
 #define NGP_ENABLE_DMA          0
 #endif
 
+/* Module abandonné (ROADMAP.md) : 1 = erreur explicite du makefile. */
 #ifndef NGP_ENABLE_SPRMUX
 #define NGP_ENABLE_SPRMUX       0
 #endif

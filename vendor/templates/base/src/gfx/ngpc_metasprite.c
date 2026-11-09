@@ -79,7 +79,10 @@ void ngpc_mspr_anim_start(MsprAnimator *a, const MsprAnimFrame *anim,
     a->anim = anim;
     a->frame_count = count;
     a->current = 0;
-    a->timer = anim[0].duration;
+    /* Corrige campagne 2026-11-08 : the first update() decrements before the
+     * frame is shown, so frame 0 lasted duration-1 frames (and was skipped
+     * when duration == 1). One extra tick for the very first frame only. */
+    a->timer = (u8)(anim[0].duration + ((anim[0].duration < 255u) ? 1u : 0u));
     a->loop = loop;
 }
 
@@ -105,6 +108,9 @@ const NgpcMetasprite *ngpc_mspr_anim_update(MsprAnimator *a)
 
 u8 ngpc_mspr_anim_done(const MsprAnimator *a)
 {
-    return (!a->loop && a->current >= a->frame_count - 1 && a->timer == 0)
+    /* Corrige campagne 2026-11-08 : true as soon as update() has returned
+     * the LAST tick of the last frame (timer 1), so "draw then test done()"
+     * shows that frame exactly `duration` times. */
+    return (!a->loop && a->current >= a->frame_count - 1 && a->timer <= 1)
            ? 1 : 0;
 }

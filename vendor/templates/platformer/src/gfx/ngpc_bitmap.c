@@ -93,8 +93,9 @@ void ngpc_bmp_hline(u8 x, u8 y, u8 w, u8 color)
     u8 end, i;
 
     if (y >= BMP_H) return;
-    end = x + w;
-    if (end > BMP_W) end = BMP_W;
+    /* Corrige campagne 2026-11-08 : x + w computed in u8 wrapped past 255
+     * (hline(100, y, 200) drew nothing). Clip in 16 bits. */
+    end = ((u16)x + w > BMP_W) ? (u8)BMP_W : (u8)(x + w);
 
     for (i = x; i < end; i++)
         ngpc_bmp_pixel(i, y, color);
@@ -105,8 +106,7 @@ void ngpc_bmp_vline(u8 x, u8 y, u8 h, u8 color)
     u8 end, j;
 
     if (x >= BMP_W) return;
-    end = y + h;
-    if (end > BMP_H) end = BMP_H;
+    end = ((u16)y + h > BMP_H) ? (u8)BMP_H : (u8)(y + h);   /* 16-bit clip (campagne 2026-11-08) */
 
     for (j = y; j < end; j++)
         ngpc_bmp_pixel(x, j, color);
@@ -160,8 +160,7 @@ void ngpc_bmp_fill_rect(u8 x, u8 y, u8 w, u8 h, u8 color)
 {
     u8 j, end;
 
-    end = y + h;
-    if (end > BMP_H) end = BMP_H;
+    end = ((u16)y + h > BMP_H) ? (u8)BMP_H : (u8)(y + h);   /* 16-bit clip (campagne 2026-11-08) */
 
     for (j = y; j < end; j++)
         ngpc_bmp_hline(x, j, w, color);

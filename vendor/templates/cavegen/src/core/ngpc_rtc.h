@@ -42,7 +42,12 @@ void ngpc_rtc_get(NgpcTime *t);
 
 /* Set an alarm that fires while the game is running.
  * The RTC alarm interrupt (0x6FC8) will be triggered.
- * Install a handler with ngpc_rtc_set_alarm_handler() first. */
+ * Install a handler with ngpc_rtc_set_alarm_handler() first.
+ * NOT VALIDATED (campagne 2026-11-08): the alarm is programmed (verified in
+ * emulation) but its interrupt was never delivered there: the INT0/alarm
+ * level (INTE0AD 0x0070, low nibble) reads 0 and neither ngpc_init nor this
+ * call sets it. No shipped game (Over Rev, StarGunner) uses it. To confirm
+ * on hardware before relying on it. */
 void ngpc_rtc_set_alarm(NgpcAlarm *a);
 
 /* Set a wake-up alarm (powers on the NGPC at the given time).

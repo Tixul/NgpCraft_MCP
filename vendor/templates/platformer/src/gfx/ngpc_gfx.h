@@ -123,7 +123,8 @@ void ngpc_gfx_sprite_offset(u8 dx, u8 dy);
 void ngpc_gfx_lcd_invert(u8 enable);
 
 /* Set the color shown outside the viewport window (letterbox bars).
- * Uses background palette entries. pal_index: 0-7. */
+ * Uses the WINDOW colour palette at 0x83F0 (HW_PAL_WIN), not the
+ * background one (doc corrigee campagne 2026-11-08). pal_index: 0-7. */
 void ngpc_gfx_set_outside_color(u8 pal_index);
 
 /* Check if Character Over occurred this frame.

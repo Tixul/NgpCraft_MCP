@@ -79,25 +79,22 @@ u16 ngpc_lz_decompress(u8 *dst, const u8 *src, u16 src_len)
 /* ---- Convenience ---- */
 
 /*
- * Temporary RAM buffer for decompression.
- * Max size: limited by available RAM. 2KB covers ~128 tiles.
- * For larger tilesets, decompress in chunks.
+ * Corrige campagne 2026-11-08 : decompress STRAIGHT into Character RAM.
+ * The old 2 KB static buffer (s_decomp_buf) was linked into every ROM
+ * (ngpc_lz.rel is always built: 17 % of the 12 KB RAM, used or not) and
+ * *_to_tiles() overflowed it without a check above 2048 bytes. Tile RAM is
+ * byte-addressable and readable, so the LZ back-references can read it, and
+ * the byte order is the one ngpc_gfx_load_tiles_at() wrote anyway.
+ * Same rule as any VRAM write: do it with the screen off or in VBlank.
  */
-#define DECOMP_BUF_SIZE  2048
-static u8 s_decomp_buf[DECOMP_BUF_SIZE];
+#define LZ_TILE_RAM(tile) ((u8 *)(0xA000u + (u16)((tile) * 16u)))
 
 void ngpc_rle_to_tiles(const u8 *src, u16 src_len, u16 tile_offset)
 {
-    u16 out_len = ngpc_rle_decompress(s_decomp_buf, src, src_len);
-    u16 word_count = out_len / 2;   /* Tile data is u16 words */
-
-    ngpc_gfx_load_tiles_at((const u16 *)s_decomp_buf, word_count, tile_offset);
+    (void)ngpc_rle_decompress(LZ_TILE_RAM(tile_offset), src, src_len);
 }
 
 void ngpc_lz_to_tiles(const u8 *src, u16 src_len, u16 tile_offset)
 {
-    u16 out_len = ngpc_lz_decompress(s_decomp_buf, src, src_len);
-    u16 word_count = out_len / 2;
-
-    ngpc_gfx_load_tiles_at((const u16 *)s_decomp_buf, word_count, tile_offset);
+    (void)ngpc_lz_decompress(LZ_TILE_RAM(tile_offset), src, src_len);
 }

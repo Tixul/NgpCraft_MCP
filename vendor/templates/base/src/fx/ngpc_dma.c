@@ -16,6 +16,10 @@
 static FuncPtr s_done_cb[4];
 static volatile u8 s_done_flag[4];
 static volatile u8 s_was_active[4];
+/* Stale-request purge (see dma_purge_request). */
+static u8 s_purge_byte;
+/* 1 = the next INTTCn of this channel is the purge transfer's: ignore it. */
+static volatile u8 s_ignore_tc[4];
 
 /* Auto-rearm configuration (installed on INTTCn / HW_INT_DMA*). */
 static volatile u8 s_rearm_enabled[4];
@@ -210,6 +214,7 @@ static void dma_rearm_in_isr(u8 channel)
 
 static void __interrupt isr_dma0_inttc(void)
 {
+    if (s_ignore_tc[0]) { s_ignore_tc[0] = 0; return; }
     if (NGP_DMA_INSTALL_DONE_ISR) {
         s_done_flag[0] = 1;
     }
@@ -221,6 +226,7 @@ static void __interrupt isr_dma0_inttc(void)
 
 static void __interrupt isr_dma1_inttc(void)
 {
+    if (s_ignore_tc[1]) { s_ignore_tc[1] = 0; return; }
     if (NGP_DMA_INSTALL_DONE_ISR) {
         s_done_flag[1] = 1;
     }
@@ -232,6 +238,7 @@ static void __interrupt isr_dma1_inttc(void)
 
 static void __interrupt isr_dma2_inttc(void)
 {
+    if (s_ignore_tc[2]) { s_ignore_tc[2] = 0; return; }
     if (NGP_DMA_INSTALL_DONE_ISR) {
         s_done_flag[2] = 1;
     }
@@ -243,6 +250,7 @@ static void __interrupt isr_dma2_inttc(void)
 
 static void __interrupt isr_dma3_inttc(void)
 {
+    if (s_ignore_tc[3]) { s_ignore_tc[3] = 0; return; }
     if (NGP_DMA_INSTALL_DONE_ISR) {
         s_done_flag[3] = 1;
     }
@@ -250,6 +258,45 @@ static void __interrupt isr_dma3_inttc(void)
     if (NGP_DMA_INSTALL_DONE_ISR) {
         if (s_done_cb[3]) s_done_cb[3]();
     }
+}
+
+/* Corrige campagne 2026-11-08 : drop a STALE request of the start source
+ * before arming. Timer0/1 keep ticking while no channel is armed (timer
+ * started before the first re-arm, or the H-int that follows the end of the
+ * table); INTT0/1 sit at level 0, so the CPU never takes that request and it
+ * stays pending. Re-arming then fired one transfer AT ONCE, in VBlank:
+ * table[0] was lost and line N was drawn with table[N+1] (measured in
+ * emulation, every mode). Two steps:
+ *  1. clear the request flag in its INTE register (TMP95C061: writing 0 to
+ *     the IxxC bit clears it, writing 1 leaves it) ;
+ *  2. let a 1-byte transfer into a dummy byte consume a request that would
+ *     still be pending (the emulator does not model step 1), then disarm.
+ * Must run outside the visible lines (re-arm in VBlank, as documented):
+ * there is no H-int between line 152 and line 198. */
+
+static void dma_purge_request(u8 channel, u8 start_vector)
+{
+    switch (start_vector) {
+    case NGPC_DMA_VEC_TIMER0: *(volatile u8 *)0x0073 = (u8)(*(volatile u8 *)0x0073 & 0xF7u) | 0x80u; break;
+    case NGPC_DMA_VEC_TIMER1: *(volatile u8 *)0x0073 = (u8)(*(volatile u8 *)0x0073 & 0x7Fu) | 0x08u; break;
+    case NGPC_DMA_VEC_TIMER2: *(volatile u8 *)0x0074 = (u8)(*(volatile u8 *)0x0074 & 0xF7u) | 0x80u; break;
+    case NGPC_DMA_VEC_TIMER3: return;   /* Z80 heartbeat: never touch */
+    default: return;
+    }
+    switch (channel) {
+    case NGPC_DMA_CH0: dma0_program(&s_purge_byte, &s_purge_byte, 1); break;
+    case NGPC_DMA_CH1: dma1_program(&s_purge_byte, &s_purge_byte, 1); break;
+    case NGPC_DMA_CH2: dma2_program(&s_purge_byte, &s_purge_byte, 1); break;
+    case NGPC_DMA_CH3: dma3_program(&s_purge_byte, &s_purge_byte, 1); break;
+    }
+    /* Set BEFORE arming: from main code the end interrupt can be taken
+     * right after the dummy transfer, before the next C statement. */
+    s_ignore_tc[channel] = 1;
+    dma_set_start_vector(channel, start_vector);   /* a pending request fires here */
+    dma_set_start_vector(channel, 0);
+    if (ngpc_dma_remaining(channel) != 0)
+        s_ignore_tc[channel] = 0;   /* nothing was pending: no end interrupt will come */
+    s_done_flag[channel] = 0;
 }
 
 typedef enum {
@@ -275,6 +322,7 @@ static void dma_start_common(u8 channel,
     s_done_flag[channel] = 0;
     s_was_active[channel] = 1;
     dma_set_start_vector(channel, 0);
+    dma_purge_request(channel, start_vector);
 
     switch (elem) {
     case DMA_ELEM_U8:
@@ -316,6 +364,7 @@ void ngpc_dma_init(void)
         s_done_cb[i] = (FuncPtr)0;
         s_done_flag[i] = 0;
         s_was_active[i] = 0;
+        s_ignore_tc[i] = 0;
         s_rearm_enabled[i] = 0;
         s_rearm_elem[i] = 0;
         s_rearm_vector[i] = 0;
@@ -332,7 +381,8 @@ void ngpc_dma_init(void)
 
         /* Enable INTTC0..3 at a low interrupt level (1).
          * Bit layout (INTETC01/23): enable+level for INTTC0/2 (low nibble) and INTTC1/3 (high nibble).
-         * 0x99 = enable both + level=1 for each. */
+         * 0x99 = level 1 for each (bits 2-0 / 6-4); bit 3 / bit 7 is the
+         * request flag (write 1 = no change), not an "enable". */
         HW_INTETC01 = 0x99;
         HW_INTETC23 = 0x99;
     }

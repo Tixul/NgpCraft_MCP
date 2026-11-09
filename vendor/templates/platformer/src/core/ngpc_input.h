@@ -24,7 +24,10 @@ extern u8 ngpc_pad_released;
 /* Buttons auto-repeated this frame (menu-style repeat). */
 extern u8 ngpc_pad_repeat;
 
-/* Configure auto-repeat timing (frames). */
+/* Configure auto-repeat timing (frames).
+ * Measured (campagne 2026-11-08): the first repeat fires delay+1 frames after
+ * the press, then every rate+1 frames. Default (15, 4) -> frames 16, 21, 26...
+ * rate 0 = every frame. */
 void ngpc_input_set_repeat(u8 delay, u8 rate);
 
 /* Read joypad and compute edges. Call once per frame. */

@@ -19,7 +19,7 @@
 /* Compute the angle from (0,0) to (dx,dy) in 0-255 format.
  * dx, dy: signed 8-bit deltas (-128 to 127).
  * Returns: angle 0-255 (0=right, 64=down, 128=left, 192=up).
- * Uses a 32x32 octant lookup table (256 bytes ROM). */
+ * Uses a 32-entry octant table (32 bytes ROM), error <= ~2/256. */
 u8 ngpc_lut_atan2(s8 dx, s8 dy);
 
 /* ---- Square root ---- */
@@ -40,10 +40,9 @@ u16 ngpc_lut_dist(s16 dx, s16 dy);
 
 /* ---- Division ---- */
 
-/* Fast divide by small constants (0-255).
- * Returns: n / divisor (truncated).
- * Uses reciprocal multiplication: (n * recip[d]) >> 16.
- * Only accurate for n < 4096. */
+/* Divide by a small divisor (1-255).
+ * Returns: n / divisor (truncated), exact for every n. divisor 0 -> 0xFFFF.
+ * (Kept for compatibility: it is a plain u16/u16 hardware DIV.) */
 u16 ngpc_lut_div(u16 n, u8 divisor);
 
 #endif /* NGPC_LUT_H */

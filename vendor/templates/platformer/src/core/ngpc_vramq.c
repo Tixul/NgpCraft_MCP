@@ -39,7 +39,10 @@ static u8 dst_range_ok(volatile u16 *dst, u16 len_words)
     if (!dst || len_words == 0)
         return 0;
 
-    start = (u32)(u16)(u32)dst;
+    /* corrigé campagne 2026-11-08 : l'adresse complète est testée ; tronquée
+     * à 16 bits, 0x208000 (ROM) passait pour 0x8000 et la file écrivait dans
+     * les registres K2GE (VBlank coupé). */
+    start = (u32)dst;
     bytes = (u32)len_words << 1;
     end = start + bytes - 1;
 

@@ -89,8 +89,11 @@ ifneq ($(strip $(NGP_ENABLE_PROFILER)),0)
 OBJS += $(OBJ_DIR)/src/fx/ngpc_debug.rel
 endif
 
+# corrigé campagne 2026-11-08 : ngpc_sprmux est abandonné (ROADMAP.md), sa
+# source n'existe plus ; l'option échoue avec un message au lieu de
+# "No rule to make target ngpc_sprmux.rel". Pour >64 sprites : optional/ngpc_soam.
 ifneq ($(strip $(NGP_ENABLE_SPRMUX)),0)
-OBJS += $(OBJ_DIR)/src/fx/ngpc_sprmux.rel
+$(error NGP_ENABLE_SPRMUX=1 : module ngpc_sprmux abandonne (voir ROADMAP.md), source absente. Utiliser optional/ngpc_soam ou laisser NGP_ENABLE_SPRMUX=0)
 endif
 
 ifneq ($(strip $(NGP_ENABLE_DMA)),0)

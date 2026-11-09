@@ -1049,8 +1049,9 @@ python tools/ngpc_tilemap.py assets/title.png -o GraphX/title_intro.c -n title_i
 ```
 
 Generated symbols:
-- `<name>_tiles[]`, `<name>_tiles_count`
-- Optional with `--emit-u8-tiles`: `<name>_tiles_u8[]`, `<name>_tile_count`
+- `<name>_tiles[]`, `<name>_tiles_count` (u16 words)
+- With `--emit-u8-tiles`, INSTEAD of the two above: `<name>_tiles_u8[]`, `<name>_tile_count` (tiles);
+  same bytes, so the `NGP_TILEMAP_LOAD_TILES_VRAM`/`BLIT` macros do not apply — use `ngpc_gfx_load_tiles_u8_at(...)`
 - `<name>_map_tiles[]`, `<name>_map_pals[]`, `<name>_map_w`, `<name>_map_h`
 - `<name>_palettes[]`, `<name>_palette_count`
 - Optional `--tiles-bin`: raw tile words for compression pipeline (`ngpc_compress.py`).
@@ -1060,8 +1061,9 @@ Practical notes:
 - For fixed full-screen images (20x19), prefer `--emit-u8-tiles --no-dedupe` and load with `ngpc_gfx_load_tiles_u8_at(...)`.
 
 Constraints (strict):
-- Input image must be tile-aligned: width and height are multiples of 8.
-- Tilemap size must fit one NGPC scroll plane: max `32x32` tiles (`256x256` px).
+- Input image should be tile-aligned (multiples of 8); otherwise it is padded with transparent pixels (warning).
+- Tilemap size should fit one NGPC scroll plane: max `32x32` tiles (`256x256` px); larger maps only get a
+  warning and need streaming at runtime (the blit macros skip cells beyond 32x32).
 - Unique tile count after dedupe must be `<= 512` (NGPC tile VRAM limit).
 - Template palette policy is fixed: index `0` is reserved for transparency.
 - Each `8x8` tile can use at most **3 visible colors** (`indices 1..3`) + transparency (`index 0`).

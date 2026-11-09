@@ -13,6 +13,7 @@
  */
 
 #include "ngpc_hw.h"
+#include "ngpc_sys.h"     /* g_vb_counter */
 #include "ngpc_gfx.h"
 #include "ngpc_text.h"
 #include "ngpc_debug.h"
@@ -22,42 +23,73 @@
 /* ---- State ---- */
 
 static u8 s_start_line;    /* Raster line at begin() */
+static u8 s_start_vb;      /* g_vb_counter at begin() */
+static u8 s_fps_vb;        /* g_vb_counter when the FPS window opened */
 static u8 s_used_lines;    /* Lines consumed last frame */
 static u8 s_pct;           /* Percentage of frame budget used */
 static u8 s_frame_count;   /* Frames counted this second */
 static u8 s_fps;           /* FPS from last second */
-static u8 s_fps_timer;     /* VBlank counter for FPS calculation */
 
 /* Budget: visible area = 152 lines. */
 #define FRAME_BUDGET 152
 
 /* ---- Public API ---- */
 
+/* Corrige campagne 2026-11-08 : positions are counted in lines since the
+ * start of VBlank (line 152, where g_vb_counter is incremented), plus 199
+ * lines per VBlank between begin() and end(). The old code only compared
+ * two RAS_V values: a frame longer than one refresh was measured as a few
+ * lines (green bar), and the wrap used 198 lines instead of 199. */
+#define LINES_PER_FRAME 199u
+
+/* Read (VBlank count, line) as one coherent pair. */
+static void read_pos(u8 *vb, u8 *line)
+{
+    u8 v1, l, v2;
+    for (;;) {
+        v1 = g_vb_counter;
+        l  = HW_RAS_V;
+        v2 = g_vb_counter;
+        if (v1 != v2) continue;
+        if (l == 152u) { while (HW_RAS_V == 152u) ; continue; }  /* ISR may not have run yet */
+        break;
+    }
+    *vb = v1;
+    *line = l;
+}
+
+/* Lines elapsed since the last VBlank start. */
+static u8 rel_line(u8 l)
+{
+    return (u8)((l >= 152u) ? (u8)(l - 152u) : (u8)(l + (LINES_PER_FRAME - 152u)));
+}
+
 void ngpc_debug_begin(void)
 {
-    s_start_line = HW_RAS_V;
+    read_pos(&s_start_vb, &s_start_line);
 }
 
 void ngpc_debug_end(void)
 {
-    u8 end_line = HW_RAS_V;
+    u8 end_vb, end_line, frames;
+    u16 used;
 
-    /* Handle wrap-around (if begin was in VBlank, end in active). */
-    if (end_line >= s_start_line)
-        s_used_lines = end_line - s_start_line;
-    else
-        s_used_lines = (198 - s_start_line) + end_line;
+    read_pos(&end_vb, &end_line);
+    frames = (u8)(end_vb - s_start_vb);
+    used = (u16)((u16)frames * LINES_PER_FRAME + rel_line(end_line)) - rel_line(s_start_line);
+    s_used_lines = (used > 255u) ? 255u : (u8)used;
 
     /* Calculate percentage: (lines / 152) * 100 */
     s_pct = (u8)(((u16)s_used_lines * 100) / FRAME_BUDGET);
 
-    /* FPS counter: count frames over 60 VBlanks (= 1 second). */
+    /* FPS (corrige campagne 2026-11-08) : end() calls per 60 REAL VBlanks.
+     * The old counter counted end() calls as VBlanks, so it always said 60. */
     s_frame_count++;
-    s_fps_timer++;
-    if (s_fps_timer >= 60) {
-        s_fps = s_frame_count;
+    frames = (u8)(end_vb - s_fps_vb);
+    if (frames >= 60u) {
+        s_fps = (u8)(((u16)s_frame_count * 60u) / frames);
         s_frame_count = 0;
-        s_fps_timer = 0;
+        s_fps_vb = end_vb;
     }
 }
 
@@ -71,7 +103,12 @@ void ngpc_debug_draw_bar(u8 plane, u8 pal_ok, u8 pal_warn, u8 pal_over)
     u8 bar_len;
     u8 pal;
     u8 i;
-    u16 solid_tile = 0; /* Use tile 0 as solid block (or any filled tile) */
+    u16 solid_tile = (u16)NGP_PROFILER_TILE;
+
+    /* Load the solid block (8 rows, colour 3 everywhere). Done every call:
+     * 8 word writes, and it survives a game that reloads its tiles. */
+    for (i = 0; i < TILE_WORDS; i++)
+        HW_TILE_DATA[(u16)(solid_tile * TILE_WORDS) + i] = 0xFFFFu;
 
     /* Calculate bar length in tiles (0-20). */
     bar_len = (u8)(((u16)s_used_lines * SCREEN_TW) / FRAME_BUDGET);

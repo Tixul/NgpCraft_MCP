@@ -27,19 +27,21 @@ void ngpc_rtc_get(NgpcTime *t)
      * Input:  XHL3 = pointer to TIME struct (7 bytes)
      * Output: struct filled with BCD values.
      *
-     * The parameter is passed by loading the pointer from the stack
-     * into XDE, then moving it to XHL3 before the BIOS call.
+     * The pointer is read from the stack straight into XHL3 once bank 3
+     * is selected.
      */
-    __asm(" ld rw3, " NGPC_STR(BIOS_RTCGET));
-    __asm(" ld xde, (xsp+4)");     /* get NgpcTime* from stack */
-    __asm(" ld xhl3, xde");        /* pass pointer in XHL3 */
-
+    /* corrigé campagne 2026-11-08 : XIX sauvé (cc900 le croit conservé par
+     * l'appelé) ; arguments lus apres `ldf 3` (la pile ne depend pas de la banque). */
+    __asm(" push xix");
     __asm(" ldf 3");                /* switch to register bank 3 */
+    __asm(" ld w, " NGPC_STR(BIOS_RTCGET));
+    __asm(" ld xhl, (xsp+8)");     /* NgpcTime* -> XHL3 (+4 : push xix) */
     __asm(" add w, w");             /* w *= 2 */
     __asm(" add w, w");             /* w *= 2 (total: w *= 4) */
     __asm(" ld xix, 0xfffe00");    /* BIOS vector table base */
     __asm(" ld xix, (xix+w)");     /* load function address */
     __asm(" call xix");             /* call BIOS */
+    __asm(" pop xix");
 }
 
 void ngpc_rtc_set_alarm(NgpcAlarm *a)
@@ -49,10 +51,12 @@ void ngpc_rtc_set_alarm(NgpcAlarm *a)
      * Input: QC3 = day, B3 = hour, C3 = minute
      * Triggers RTC alarm interrupt at 0x6FC8.
      */
-    __asm(" ld rw3, " NGPC_STR(BIOS_ALARMSET));
-    __asm(" ld xiy, (xsp+4)");     /* get NgpcAlarm* from stack */
-
+    /* corrigé campagne 2026-11-08 : XIX/XIY sauvés (voir ngpc_rtc_get). */
+    __asm(" push xix");
+    __asm(" push xiy");
     __asm(" ldf 3");                /* switch to register bank 3 */
+    __asm(" ld w, " NGPC_STR(BIOS_ALARMSET));
+    __asm(" ld xiy, (xsp+12)");    /* NgpcAlarm* (+8 : 2 push) */
     __asm(" ld h, (xiy +)");       /* day */
     __asm(" ld qc, h");            /* day -> QC register */
     __asm(" ld b, (xiy +)");       /* hour */
@@ -63,6 +67,8 @@ void ngpc_rtc_set_alarm(NgpcAlarm *a)
     __asm(" ld xix, 0xfffe00");
     __asm(" ld xix, (xix+w)");
     __asm(" call xix");
+    __asm(" pop xiy");
+    __asm(" pop xix");
 }
 
 void ngpc_rtc_set_wake(NgpcAlarm *a)
@@ -73,10 +79,12 @@ void ngpc_rtc_set_wake(NgpcAlarm *a)
      * This will power on the console at the given date/time,
      * even if it's currently off.
      */
-    __asm(" ld rw3, " NGPC_STR(BIOS_ALARMDOWNSET));
-    __asm(" ld xiy, (xsp+4)");     /* get NgpcAlarm* from stack */
-
+    /* corrigé campagne 2026-11-08 : XIX/XIY sauvés (voir ngpc_rtc_get). */
+    __asm(" push xix");
+    __asm(" push xiy");
     __asm(" ldf 3");
+    __asm(" ld w, " NGPC_STR(BIOS_ALARMDOWNSET));
+    __asm(" ld xiy, (xsp+12)");    /* NgpcAlarm* (+8 : 2 push) */
     __asm(" ld h, (xiy +)");       /* day */
     __asm(" ld qc, h");
     __asm(" ld b, (xiy +)");       /* hour */
@@ -87,6 +95,8 @@ void ngpc_rtc_set_wake(NgpcAlarm *a)
     __asm(" ld xix, 0xfffe00");
     __asm(" ld xix, (xix+w)");
     __asm(" call xix");
+    __asm(" pop xiy");
+    __asm(" pop xix");
 }
 
 void ngpc_rtc_set_alarm_handler(void (*handler)(void))

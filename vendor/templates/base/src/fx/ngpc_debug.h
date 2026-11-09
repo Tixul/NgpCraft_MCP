@@ -27,6 +27,18 @@
 
 #if NGPC_DEBUG
 
+/* Tile index the profiler bar uses. ngpc_debug_draw_bar() writes a SOLID
+ * tile (all pixels colour 3) there on every call, so that tile is reserved
+ * while the bar is shown. Default 511 = the last tile: outside the BIOS
+ * font (tiles 0-255, loaded by ngpc_load_sysfont) and above where assets
+ * usually start (128 / 256 upward). Override with -DNGP_PROFILER_TILE=n in
+ * the makefile CDEFS if your game uses tile 511.
+ * (Ajout campagne 2026-11-08 : the bar used tile 0, which ngpc_init()
+ * clears -> the bar was invisible.) */
+#ifndef NGP_PROFILER_TILE
+#define NGP_PROFILER_TILE 511
+#endif
+
 /* Call at the START of your frame logic (after vsync + input update). */
 void ngpc_debug_begin(void);
 
@@ -38,7 +50,7 @@ void ngpc_debug_end(void);
  * pal_ok: palette for green (budget OK)
  * pal_warn: palette for yellow (> 80% budget)
  * pal_over: palette for red (overflowed into VBlank)
- * Requires 1 tile slot for the bar block. */
+ * Uses tile NGP_PROFILER_TILE (loaded solid by this call). */
 void ngpc_debug_draw_bar(u8 plane, u8 pal_ok, u8 pal_warn, u8 pal_over);
 
 /* Print CPU usage as "XX%" at the given position. */

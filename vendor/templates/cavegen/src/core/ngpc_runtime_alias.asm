@@ -13,7 +13,9 @@ $MAXIMUM
         module  ngpc_runtime_alias
 
         public  C9H_mullu, C9H_divlu, C9H_remlu
+        public  C9H_mulls, C9H_divls, C9H_remls
         extern  large _C9H_mullu, _C9H_divlu, _C9H_remlu
+        extern  large _C9H_mulls, _C9H_divls, _C9H_remls
 
 ALIAS   section code large
 
@@ -45,6 +47,39 @@ C9H_remlu:
         push    XBC
         push    XWA
         cal     _C9H_remlu
+        lda     XSP,XSP+8
+        pop     XIY
+        pop     XIX
+        ret
+
+C9H_mulls:
+        push    XIX
+        push    XIY
+        push    XBC
+        push    XWA
+        cal     _C9H_mulls
+        lda     XSP,XSP+8
+        pop     XIY
+        pop     XIX
+        ret
+
+C9H_divls:
+        push    XIX
+        push    XIY
+        push    XBC
+        push    XWA
+        cal     _C9H_divls
+        lda     XSP,XSP+8
+        pop     XIY
+        pop     XIX
+        ret
+
+C9H_remls:
+        push    XIX
+        push    XIY
+        push    XBC
+        push    XWA
+        cal     _C9H_remls
         lda     XSP,XSP+8
         pop     XIY
         pop     XIX

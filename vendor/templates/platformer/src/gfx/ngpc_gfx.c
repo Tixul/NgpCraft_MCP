@@ -275,7 +275,8 @@ void ngpc_gfx_set_outside_color(u8 pal_index)
     /* ngpcspec.txt "2D Control Register" 0x8012:
      * Bits 2-0 OOWC = outside-window color palette index.
      * Colors the area outside the viewport (letterbox bars).
-     * Uses background color palette at 0x83E0. */
+     * Uses the WINDOW colour palette at 0x83F0 (checked on screen,
+     * campagne 2026-11-08), not the background one at 0x83E0. */
     HW_LCD_CTL = (HW_LCD_CTL & 0xF8) | (pal_index & 0x07);
 }
 

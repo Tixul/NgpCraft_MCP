@@ -127,8 +127,10 @@ typedef struct {
 
 /* Example table (data-driven presets):
  * static const SfxPreset kSfxTable[] = {
- *   { SFX_PRESET_TONE,  { .tone  = {0, 240, 2, 6, 280, 2, 1, 0, 1, 1, 2} } },
- *   { SFX_PRESET_NOISE, { .noise = {1, 1, 6, 8, 0, 1, 0, 1, 2} } },
+ *   { SFX_PRESET_TONE, { { 0, 240, 2, 6, 280, 2, 1, 0, 1, 1, 2, 2 } } },
+ *   -- cc900 (C89) refuse `.tone =` / `.noise =` (corrigé campagne 2026-11-08) :
+ *     seul le 1er membre de l'union (tone) s'initialise en statique ; un preset
+ *     bruit se remplit a l'execution : p.kind = SFX_PRESET_NOISE; p.u.noise.rate = 1; ...
  * };
  * Sfx_PlayPresetTable(kSfxTable, sizeof(kSfxTable)/sizeof(kSfxTable[0]), id);
  */

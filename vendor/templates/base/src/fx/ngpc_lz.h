@@ -50,7 +50,7 @@ u16 ngpc_rle_decompress(u8 *dst, const u8 *src, u16 src_len);
  *       If bit = 1: match follows (2 bytes):
  *         Byte 0: offset high 4 bits (4) + length - 3 (4)
  *         Byte 1: offset low 8 bits
- *         => offset = ((b0 >> 4) << 8) | b1  (12-bit, 1-4096)
+ *         => offset = ((b0 >> 4) << 8) | b1  (12-bit, 1-4095)
  *         => length = (b0 & 0x0F) + 3        (3-18 bytes)
  *         Copy 'length' bytes from (dst_pos - offset) to dst_pos.
  *

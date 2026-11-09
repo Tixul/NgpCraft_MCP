@@ -32,8 +32,10 @@ static u8 s_count;
 static void copy_fixed(char *dst, const char *src, u8 len)
 {
     u8 i;
-    for (i = 0; i < len; i++) {
-        char c = (src && src[i]) ? src[i] : ' ';
+    /* corrigé campagne 2026-11-08 : arrêt au zéro final (avant, "AB" lisait
+     * les octets suivants et affichait "AB Z"). */
+    for (i = 0; i < len && src && src[i]; i++) {
+        char c = src[i];
         if ((u8)c < 0x20 || (u8)c > 0x7E)
             c = ' ';
         dst[i] = c;
